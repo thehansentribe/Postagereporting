@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Parent / child accounts</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="header header-with-nav">
+      <a class="btn btn-nav" href="{{ url_for('index') }}">&#8592; Dashboard</a>
+      <h1>Parent / child accounts</h1>
+    </header>
+
+    <p class="hierarchy-intro">
+      Parent accounts can be expanded to show child accounts. Standalone accounts have no parent and are not
+      parent companies themselves (parent firms appear only in the first list).
+    </p>
+
+    <div id="hierarchyError" class="error-banner hidden" role="alert"></div>
+
+    <section class="panel hierarchy-section">
+      <h2>Parent accounts</h2>
+      <ul id="parentList" class="hierarchy-list"></ul>
+    </section>
+
+    <section class="panel hierarchy-section">
+      <h2>Standalone accounts</h2>
+      <p id="standaloneEmpty" class="empty-state hidden">No standalone accounts.</p>
+      <ul id="standaloneList" class="hierarchy-list hierarchy-flat"></ul>
+    </section>
+  </div>
+  <script src="{{ url_for('static', filename='customers.js') }}"></script>
+</body>
+</html>

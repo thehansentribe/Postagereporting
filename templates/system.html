@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>System</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="header header-with-nav">
+      <a class="btn btn-nav" href="{{ url_for('index') }}">&#8592; Dashboard</a>
+      <h1>System</h1>
+    </header>
+
+    <div id="systemBanner" class="system-banner hidden" role="status"></div>
+    <div id="systemError" class="error-banner hidden" role="alert"></div>
+
+    <section class="panel">
+      <div class="system-actions">
+        <button type="button" class="btn btn-run" id="btnSeedFlatsRetail">System Update (seed flats retail)</button>
+        <button type="button" class="btn btn-primary" id="btnSaveFlatsRetail">Save flats retail</button>
+      </div>
+      <h2 class="system-section-title">Flats retail cost</h2>
+      <p class="system-hint">
+        Edit the Retail value for each weight tier (oz). This updates <code>flat_rate_costs.rate_retail</code>.
+      </p>
+      <div class="table-wrap">
+        <div class="table-scroll">
+          <div id="flatsRetailTable"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script src="{{ url_for('static', filename='system.js') }}"></script>
+</body>
+</html>
+

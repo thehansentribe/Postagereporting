@@ -1,0 +1,214 @@
+run_id,mail_date,mail_id,customer_code,customer_name,profile_name,rate_type,postage_claimed,postage_applied,num_pieces,pcs_accepted,pcs_rejected,cost_per_piece
+1,2026-04-06,040626_F,000035,Americo,000035 Americo Metered Flats .970,MXD ADC Auto,37.075,24.25,25,25,0,0.97
+1,2026-04-06,040626_F,000035,Americo,000035 Americo Metered Flats .970,Single Piece,1.63,0.97,1,1,1,0.97
+1,2026-04-06,040626_F,000079,Multi Service,000079 Multi Service Metered Flats .970,ADC Auto,1.326,0.97,1,1,0,0.97
+1,2026-04-06,040626_F,000079,Multi Service,000079 Multi Service Metered Flats .970,MXD ADC Auto,19.279,12.61,13,13,0,0.97
+1,2026-04-06,040626_F,000158,Thomas McGee,000158 Risk Strategies Metered Flats .,ADC Auto,3.978,2.91,3,3,0,0.97
+1,2026-04-06,040626_F,000158,Thomas McGee,000158 Risk Strategies Metered Flats .,MXD ADC Auto,2.966,1.94,2,2,0,0.97
+1,2026-04-06,040626_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ThreeDigitAuto,221.4,174.6,180,180,0,0.97
+1,2026-04-06,040626_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ADC Auto,151.164,110.58,114,114,0,0.97
+1,2026-04-06,040626_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ADC Auto,163.098,119.31,123,123,0,0.97
+1,2026-04-06,040626_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,MXD ADC Auto,71.184,46.56,48,48,0,0.97
+1,2026-04-06,040626_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,Single Piece,16.3,9.7,10,10,10,0.97
+1,2026-04-06,040626_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ThreeDigitAuto,44.28,34.92,36,36,0,0.97
+1,2026-04-06,040626_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ADC Auto,26.52,19.4,20,20,0,0.97
+1,2026-04-06,040626_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ADC Auto,34.476,25.22,26,26,0,0.97
+1,2026-04-06,040626_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,MXD ADC Auto,23.728,15.52,16,16,0,0.97
+1,2026-04-06,040626_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,Single Piece,63.57,37.83,39,39,39,0.97
+1,2026-04-06,040626_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,ThreeDigitAuto,4.92,3.88,4,4,0,0.97
+1,2026-04-06,040626_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,ADC Auto,6.63,4.85,5,5,0,0.97
+1,2026-04-06,040626_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,ADC Auto,127.296,93.12,96,96,0,0.97
+1,2026-04-06,040626_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,MXD ADC Auto,750.398,490.82,506,506,0,0.97
+1,2026-04-06,040626_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,Single Piece,11.41,6.79,7,7,7,0.97
+1,2026-04-06,040626_F,301012,Lineage Mailing Service,301012 Western Resources Title Flats .,MXD ADC Auto,77.116,50.44,52,52,0,0.97
+1,2026-04-06,040626_F,301012,Lineage Mailing Service,301012 Western Resources Title Flats .,Single Piece,4.89,2.91,3,3,3,0.97
+1,2026-04-06,040626_F,301023,Lineage Mailing Service,301023 City of Topeka .970,ADC Auto,2.652,1.94,2,2,0,0.97
+1,2026-04-06,040626_F,301023,Lineage Mailing Service,301023 City of Topeka .970,MXD ADC Auto,1.483,0.97,1,1,0,0.97
+1,2026-04-06,040626_F,301032,Lineage Mailing Service,301032 Essity .970,MXD ADC Auto,1.483,0.97,1,1,0,0.97
+1,2026-04-06,040626_F,301036,Lineage Mailing Service,301036 Berlin-Wheeler Inc .970,ADC Auto,3.978,2.91,3,3,0,0.97
+1,2026-04-06,040626_F,301036,Lineage Mailing Service,301036 Berlin-Wheeler Inc .970,Single Piece,1.63,0.97,1,1,1,0.97
+1,2026-04-06,040626_F,301041,Lineage Mailing Service,301041 Stormont Vail Health Care .970,ADC Auto,3.978,2.91,3,3,0,0.97
+1,2026-04-06,040626_F,301041,Lineage Mailing Service,301041 Stormont Vail Health Care .970,ADC Auto,3.978,2.91,3,3,0,0.97
+1,2026-04-06,040626_F,301041,Lineage Mailing Service,301041 Stormont Vail Health Care .970,MXD ADC Auto,28.177,18.43,19,19,0,0.97
+1,2026-04-06,040626_F,301051,Lineage Mailing Service,301051 Apria Healthcare .970,MXD ADC Auto,4.449,2.91,3,3,0,0.97
+1,2026-04-06,040626_F,301051,Lineage Mailing Service,301051 Apria Healthcare .970,Single Piece,1.63,0.97,1,1,1,0.97
+1,2026-04-06,040626_F,301058,Lineage Mailing Service,301058 Metropolitan Community College,ADC Auto,26.52,19.4,20,20,0,0.97
+1,2026-04-06,040626_F,301058,Lineage Mailing Service,301058 Metropolitan Community College,ADC Auto,1.326,0.97,1,1,0,0.97
+1,2026-04-06,040626_F,301058,Lineage Mailing Service,301058 Metropolitan Community College,MXD ADC Auto,1.483,0.97,1,1,0,0.97
+1,2026-04-06,040626_F,301058,Lineage Mailing Service,301058 Metropolitan Community College,Single Piece,1.63,0.97,1,1,1,0.97
+1,2026-04-06,040626_F,301064,Lineage Mailing Service,301064 HCA MidAmerican Divison .97,ADC Auto,1.326,0.97,1,1,0,0.97
+1,2026-04-06,040626_F,301064,Lineage Mailing Service,301064 HCA MidAmerican Divison .97,ADC Auto,21.216,15.52,16,16,0,0.97
+1,2026-04-06,040626_F,301064,Lineage Mailing Service,301064 HCA MidAmerican Divison .97,MXD ADC Auto,8.898,5.82,6,6,0,0.97
+1,2026-04-06,040626_F,301064,Lineage Mailing Service,301064 HCA MidAmerican Divison .97,Single Piece,3.26,1.94,2,2,2,0.97
+1,2026-04-06,040626_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ThreeDigitAuto,67.65,53.35,55,55,0,0.97
+1,2026-04-06,040626_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ADC Auto,1097.928,803.16,828,828,0,0.97
+1,2026-04-06,040626_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ADC Auto,27.846,20.37,21,21,0,0.97
+1,2026-04-06,040626_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,MXD ADC Auto,3532.506,2310.54,2382,2382,0,0.97
+1,2026-04-06,040626_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,Single Piece,215.16,128.04,132,132,132,0.97
+1,2026-04-06,040626_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ThreeDigitAuto,104.55,82.45,85,85,0,0.97
+1,2026-04-06,040626_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ADC Auto,30.498,22.31,23,23,0,0.97
+1,2026-04-06,040626_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ADC Auto,99.45,72.75,75,75,0,0.97
+1,2026-04-06,040626_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,MXD ADC Auto,134.953,88.27,91,91,0,0.97
+1,2026-04-06,040626_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,Single Piece,11.41,6.79,7,7,7,0.97
+2,2026-04-07,040726_F,000015,Unified Government of,000015 Unified Government Metered,ADC Auto,2.652,1.94,2,2,0,0.97
+2,2026-04-07,040726_F,000035,Americo,000035 Americo Metered Flats .970,ADC Auto,1.326,0.97,1,1,0,0.97
+2,2026-04-07,040726_F,000035,Americo,000035 Americo Metered Flats .970,MXD ADC Auto,148.3,97.0,100,100,0,0.97
+2,2026-04-07,040726_F,000035,Americo,000035 Americo Metered Flats .970,Single Piece,180.93,107.67,111,111,111,0.97
+2,2026-04-07,040726_F,000052,City of Kansas City,000052 KCMO Metered Flats .970,ADC Auto,2.652,1.94,2,2,0,0.97
+2,2026-04-07,040726_F,000052,City of Kansas City,000052 KCMO Metered Flats .970,Single Piece,1.63,0.97,1,1,1,0.97
+2,2026-04-07,040726_F,000055,Lockton,000055 Lockton Metered Flats .970,ThreeDigitAuto,268.14,211.46,218,218,0,0.97
+2,2026-04-07,040726_F,000055,Lockton,000055 Lockton Metered Flats .970,ThreeDigitAuto,4.92,3.88,4,4,0,0.97
+2,2026-04-07,040726_F,000055,Lockton,000055 Lockton Metered Flats .970,ADC Auto,94.146,68.87,71,71,0,0.97
+2,2026-04-07,040726_F,000055,Lockton,000055 Lockton Metered Flats .970,MXD ADC Auto,480.492,314.28,324,324,0,0.97
+2,2026-04-07,040726_F,000055,Lockton,000055 Lockton Metered Flats .970,Single Piece,40.75,24.25,25,25,25,0.97
+2,2026-04-07,040726_F,000079,Multi Service,000079 Multi Service Metered Flats .970,MXD ADC Auto,23.728,15.52,16,16,0,0.97
+2,2026-04-07,040726_F,000079,Multi Service,000079 Multi Service Metered Flats .970,Single Piece,1.63,0.97,1,1,1,0.97
+2,2026-04-07,040726_F,000158,Thomas McGee,000158 Risk Strategies Metered Flats .,ADC Auto,2.652,1.94,2,2,0,0.97
+2,2026-04-07,040726_F,000158,Thomas McGee,000158 Risk Strategies Metered Flats .,MXD ADC Auto,7.415,4.85,5,5,0,0.97
+2,2026-04-07,040726_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ThreeDigitAuto,51.66,40.74,42,42,0,0.97
+2,2026-04-07,040726_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ADC Auto,57.018,41.71,43,43,0,0.97
+2,2026-04-07,040726_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ADC Auto,114.036,83.42,86,86,0,0.97
+2,2026-04-07,040726_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,MXD ADC Auto,81.565,53.35,55,55,0,0.97
+2,2026-04-07,040726_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,Single Piece,21.19,12.61,13,13,13,0.97
+2,2026-04-07,040726_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ThreeDigitAuto,13.53,10.67,11,11,0,0.97
+2,2026-04-07,040726_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ADC Auto,22.542,16.49,17,17,0,0.97
+2,2026-04-07,040726_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ADC Auto,19.89,14.55,15,15,0,0.97
+2,2026-04-07,040726_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,MXD ADC Auto,5.932,3.88,4,4,0,0.97
+2,2026-04-07,040726_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,Single Piece,42.38,25.22,26,26,26,0.97
+2,2026-04-07,040726_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,ThreeDigitAuto,3.69,2.91,3,3,0,0.97
+2,2026-04-07,040726_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,ADC Auto,92.82,67.9,70,70,0,0.97
+2,2026-04-07,040726_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,ADC Auto,6.63,4.85,5,5,0,0.97
+2,2026-04-07,040726_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,MXD ADC Auto,1003.991,656.69,677,677,0,0.97
+2,2026-04-07,040726_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,Single Piece,,,-7,-7,-7,
+2,2026-04-07,040726_F,301012,Lineage Mailing Service,301012 Western Resources Title Flats .,MXD ADC Auto,22.245,14.55,15,15,0,0.97
+2,2026-04-07,040726_F,301016,Lineage Mailing Service,301016 Advent Health System .970,ADC Auto,2.652,1.94,2,2,0,0.97
+2,2026-04-07,040726_F,301016,Lineage Mailing Service,301016 Advent Health System .970,MXD ADC Auto,14.83,9.7,10,10,0,0.97
+2,2026-04-07,040726_F,301031,Lineage Mailing Service,301031 Kansas Fair Plan .970,ThreeDigitAuto,3.69,2.91,3,3,0,0.97
+2,2026-04-07,040726_F,301031,Lineage Mailing Service,301031 Kansas Fair Plan .970,MXD ADC Auto,7.415,4.85,5,5,0,0.97
+2,2026-04-07,040726_F,301041,Lineage Mailing Service,301041 Stormont Vail Health Care .970,MXD ADC Auto,4.449,2.91,3,3,0,0.97
+2,2026-04-07,040726_F,301051,Lineage Mailing Service,301051 Apria Healthcare .970,MXD ADC Auto,7.415,4.85,5,5,0,0.97
+2,2026-04-07,040726_F,301051,Lineage Mailing Service,301051 Apria Healthcare .970,Single Piece,3.26,1.94,2,2,2,0.97
+2,2026-04-07,040726_F,301064,Lineage Mailing Service,301064 HCA MidAmerican Divison .97,ADC Auto,6.63,4.85,5,5,0,0.97
+2,2026-04-07,040726_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ThreeDigitAuto,15.99,12.61,13,13,0,0.97
+2,2026-04-07,040726_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ThreeDigitAuto,20.91,16.49,17,17,0,0.97
+2,2026-04-07,040726_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ADC Auto,19.89,14.55,15,15,0,0.97
+2,2026-04-07,040726_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ADC Auto,237.354,173.63,179,179,0,0.97
+2,2026-04-07,040726_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,MXD ADC Auto,1904.172,1245.48,1284,1284,0,0.97
+2,2026-04-07,040726_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,Single Piece,24.45,14.55,15,15,15,0.97
+2,2026-04-07,040726_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ThreeDigitAuto,127.92,100.88,104,104,0,0.97
+2,2026-04-07,040726_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ADC Auto,49.062,35.89,37,37,0,0.97
+2,2026-04-07,040726_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ADC Auto,159.12,116.4,120,120,0,0.97
+2,2026-04-07,040726_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,MXD ADC Auto,66.735,43.65,45,45,0,0.97
+2,2026-04-07,040726_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,Single Piece,8.15,4.85,5,5,5,0.97
+2,2026-04-07,040726_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,ADC Auto,34.476,25.22,26,26,0,0.97
+2,2026-04-07,040726_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,ADC Auto,34.476,25.22,26,26,0,0.97
+2,2026-04-07,040726_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,MXD ADC Auto,180.926,118.34,122,122,0,0.97
+2,2026-04-07,040726_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,Single Piece,6.52,3.88,4,4,4,0.97
+3,2026-04-08,040826_F,000035,Americo,000035 Americo Metered Flats .970,ADC Auto,19.89,14.55,15,15,0,0.97
+3,2026-04-08,040826_F,000035,Americo,000035 Americo Metered Flats .970,MXD ADC Auto,102.327,66.93,69,69,0,0.97
+3,2026-04-08,040826_F,000035,Americo,000035 Americo Metered Flats .970,Single Piece,3.26,1.94,2,2,2,0.97
+3,2026-04-08,040826_F,000055,Lockton,000055 Lockton Metered Flats .970,ThreeDigitAuto,110.7,87.3,90,90,0,0.97
+3,2026-04-08,040826_F,000055,Lockton,000055 Lockton Metered Flats .970,ADC Auto,25.194,18.43,19,19,0,0.97
+3,2026-04-08,040826_F,000055,Lockton,000055 Lockton Metered Flats .970,MXD ADC Auto,180.926,118.34,122,122,0,0.97
+3,2026-04-08,040826_F,000055,Lockton,000055 Lockton Metered Flats .970,Single Piece,11.41,6.79,7,7,7,0.97
+3,2026-04-08,040826_F,000079,Multi Service,000079 Multi Service Metered Flats .970,MXD ADC Auto,7.415,4.85,5,5,0,0.97
+3,2026-04-08,040826_F,000158,Thomas McGee,000158 Risk Strategies Metered Flats .,ADC Auto,3.978,2.91,3,3,0,0.97
+3,2026-04-08,040826_F,000158,Thomas McGee,000158 Risk Strategies Metered Flats .,ADC Auto,1.326,0.97,1,1,0,0.97
+3,2026-04-08,040826_F,000158,Thomas McGee,000158 Risk Strategies Metered Flats .,MXD ADC Auto,5.932,3.88,4,4,0,0.97
+3,2026-04-08,040826_F,000242,Ferrell Gas,000242 Ferrell Gas Metered Flats .970,MXD ADC Auto,8.898,5.82,6,6,0,0.97
+3,2026-04-08,040826_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ThreeDigitAuto,500.61,394.79,407,407,0,0.97
+3,2026-04-08,040826_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ThreeDigitAuto,260.76,205.64,212,212,0,0.97
+3,2026-04-08,040826_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ADC Auto,74.256,54.32,56,56,0,0.97
+3,2026-04-08,040826_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ADC Auto,185.64,135.8,140,140,0,0.97
+3,2026-04-08,040826_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,MXD ADC Auto,96.395,63.05,65,65,0,0.97
+3,2026-04-08,040826_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,Single Piece,40.75,24.25,25,25,25,0.97
+3,2026-04-08,040826_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ThreeDigitAuto,44.28,34.92,36,36,0,0.97
+3,2026-04-08,040826_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ThreeDigitAuto,40.59,32.01,33,33,0,0.97
+3,2026-04-08,040826_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ADC Auto,3.978,2.91,3,3,0,0.97
+3,2026-04-08,040826_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ADC Auto,19.89,14.55,15,15,0,0.97
+3,2026-04-08,040826_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,MXD ADC Auto,10.381,6.79,7,7,0,0.97
+3,2026-04-08,040826_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,Single Piece,52.16,31.04,32,32,32,0.97
+3,2026-04-08,040826_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,ThreeDigitAuto,11.07,8.73,9,9,0,0.97
+3,2026-04-08,040826_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,ThreeDigitAuto,23.37,18.43,19,19,0,0.97
+3,2026-04-08,040826_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,ADC Auto,383.214,280.33,289,289,0,0.97
+3,2026-04-08,040826_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,ADC Auto,2.652,1.94,2,2,0,0.97
+3,2026-04-08,040826_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,MXD ADC Auto,1551.218,1014.62,1046,1046,0,0.97
+3,2026-04-08,040826_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,Single Piece,26.08,15.52,16,16,16,0.97
+3,2026-04-08,040826_F,301031,Lineage Mailing Service,301031 Kansas Fair Plan .970,ThreeDigitAuto,4.92,3.88,4,4,0,0.97
+3,2026-04-08,040826_F,301031,Lineage Mailing Service,301031 Kansas Fair Plan .970,ADC Auto,5.304,3.88,4,4,0,0.97
+3,2026-04-08,040826_F,301031,Lineage Mailing Service,301031 Kansas Fair Plan .970,MXD ADC Auto,1.483,0.97,1,1,0,0.97
+3,2026-04-08,040826_F,301032,Lineage Mailing Service,301032 Essity .970,MXD ADC Auto,5.932,3.88,4,4,0,0.97
+3,2026-04-08,040826_F,301051,Lineage Mailing Service,301051 Apria Healthcare .970,ADC Auto,1.326,0.97,1,1,0,0.97
+3,2026-04-08,040826_F,301051,Lineage Mailing Service,301051 Apria Healthcare .970,MXD ADC Auto,22.245,14.55,15,15,0,0.97
+3,2026-04-08,040826_F,301051,Lineage Mailing Service,301051 Apria Healthcare .970,Single Piece,4.89,2.91,3,3,3,0.97
+3,2026-04-08,040826_F,301064,Lineage Mailing Service,301064 HCA MidAmerican Divison .97,Single Piece,3.26,1.94,2,2,2,0.97
+3,2026-04-08,040826_F,301077,Lineage Mailing Service,301077 GEHA - EFD .970,ThreeDigitAuto,1.23,0.97,1,1,0,0.97
+3,2026-04-08,040826_F,301077,Lineage Mailing Service,301077 GEHA - EFD .970,ADC Auto,1.326,0.97,1,1,0,0.97
+3,2026-04-08,040826_F,301077,Lineage Mailing Service,301077 GEHA - EFD .970,ADC Auto,2.652,1.94,2,2,0,0.97
+3,2026-04-08,040826_F,301077,Lineage Mailing Service,301077 GEHA - EFD .970,MXD ADC Auto,20.762,13.58,14,14,0,0.97
+3,2026-04-08,040826_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ThreeDigitAuto,19.68,15.52,16,16,0,0.97
+3,2026-04-08,040826_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ThreeDigitAuto,30.75,24.25,25,25,0,0.97
+3,2026-04-08,040826_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ADC Auto,5.304,3.88,4,4,0,0.97
+3,2026-04-08,040826_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ADC Auto,625.872,457.84,472,472,0,0.97
+3,2026-04-08,040826_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,MXD ADC Auto,1812.226,1185.34,1222,1222,0,0.97
+3,2026-04-08,040826_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,Single Piece,255.91,152.29,157,157,157,0.97
+3,2026-04-08,040826_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ThreeDigitAuto,253.38,199.82,206,206,0,0.97
+3,2026-04-08,040826_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ThreeDigitAuto,103.32,81.48,84,84,0,0.97
+3,2026-04-08,040826_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ADC Auto,50.388,36.86,38,38,0,0.97
+3,2026-04-08,040826_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ADC Auto,303.654,222.13,229,229,0,0.97
+3,2026-04-08,040826_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,MXD ADC Auto,846.793,553.87,571,571,0,0.97
+3,2026-04-08,040826_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,Single Piece,26.08,15.52,16,16,16,0.97
+3,2026-04-08,040826_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,ThreeDigitAuto,9.84,7.76,8,8,0,0.97
+3,2026-04-08,040826_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,ADC Auto,90.168,65.96,68,68,0,0.97
+3,2026-04-08,040826_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,ADC Auto,5.304,3.88,4,4,0,0.97
+3,2026-04-08,040826_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,MXD ADC Auto,91.946,60.14,62,62,0,0.97
+3,2026-04-08,040826_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,Single Piece,79.87,47.53,49,49,49,0.97
+4,2026-04-09,040926_F,000015,Unified Government of,000015 Unified Government Metered,ADC Auto,2.652,1.94,2,2,0,0.97
+4,2026-04-09,040926_F,000015,Unified Government of,000015 Unified Government Metered,MXD ADC Auto,1.483,0.97,1,1,0,0.97
+4,2026-04-09,040926_F,000035,Americo,000035 Americo Metered Flats .970,MXD ADC Auto,100.844,65.96,68,68,0,0.97
+4,2026-04-09,040926_F,000035,Americo,000035 Americo Metered Flats .970,Single Piece,1.63,0.97,1,1,1,0.97
+4,2026-04-09,040926_F,000052,City of Kansas City,000052 KCMO Metered Flats .970,ADC Auto,14.586,10.67,11,11,0,0.97
+4,2026-04-09,040926_F,000052,City of Kansas City,000052 KCMO Metered Flats .970,ADC Auto,1.326,0.97,1,1,0,0.97
+4,2026-04-09,040926_F,000052,City of Kansas City,000052 KCMO Metered Flats .970,MXD ADC Auto,2.966,1.94,2,2,0,0.97
+4,2026-04-09,040926_F,000079,Multi Service,000079 Multi Service Metered Flats .970,Single Piece,3.26,1.94,2,2,2,0.97
+4,2026-04-09,040926_F,000158,Thomas McGee,000158 Risk Strategies Metered Flats .,MXD ADC Auto,7.415,4.85,5,5,0,0.97
+4,2026-04-09,040926_F,000191,Hallmark Cards,000191 Hallmark Presort Metered Flats .,ADC Auto,17.238,12.61,13,13,0,0.97
+4,2026-04-09,040926_F,000191,Hallmark Cards,000191 Hallmark Presort Metered Flats .,ADC Auto,57.018,41.71,43,43,0,0.97
+4,2026-04-09,040926_F,000191,Hallmark Cards,000191 Hallmark Presort Metered Flats .,MXD ADC Auto,87.497,57.23,59,59,0,0.97
+4,2026-04-09,040926_F,000191,Hallmark Cards,000191 Hallmark Presort Metered Flats .,Single Piece,3.26,1.94,2,2,2,0.97
+4,2026-04-09,040926_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ThreeDigitAuto,136.53,107.67,111,111,0,0.97
+4,2026-04-09,040926_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ADC Auto,106.08,77.6,80,80,0,0.97
+4,2026-04-09,040926_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,ADC Auto,66.3,48.5,50,50,0,0.97
+4,2026-04-09,040926_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,MXD ADC Auto,100.844,65.96,68,68,0,0.97
+4,2026-04-09,040926_F,301001,Lineage Mailing Service,301001 STATE OF KANSAS Flats .970,Single Piece,73.35,43.65,45,45,45,0.97
+4,2026-04-09,040926_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ThreeDigitAuto,18.45,14.55,15,15,0,0.97
+4,2026-04-09,040926_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ADC Auto,11.934,8.73,9,9,0,0.97
+4,2026-04-09,040926_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,ADC Auto,9.282,6.79,7,7,0,0.97
+4,2026-04-09,040926_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,MXD ADC Auto,19.279,12.61,13,13,0,0.97
+4,2026-04-09,040926_F,301003,Lineage Mailing Service,301003 Gainwell  Flats .970,Single Piece,8.15,4.85,5,5,5,0.97
+4,2026-04-09,040926_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,ADC Auto,10.608,7.76,8,8,0,0.97
+4,2026-04-09,040926_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,ADC Auto,7.956,5.82,6,6,0,0.97
+4,2026-04-09,040926_F,301006,Lineage Mailing Service,301006 SUN LIFE Flats .970,MXD ADC Auto,1044.032,682.88,704,704,0,0.97
+4,2026-04-09,040926_F,301031,Lineage Mailing Service,301031 Kansas Fair Plan .970,ThreeDigitAuto,3.69,2.91,3,3,0,0.97
+4,2026-04-09,040926_F,301031,Lineage Mailing Service,301031 Kansas Fair Plan .970,ADC Auto,2.652,1.94,2,2,0,0.97
+4,2026-04-09,040926_F,301040,Lineage Mailing Service,301040 American Truck Historical,MXD ADC Auto,2.966,1.94,2,2,0,0.97
+4,2026-04-09,040926_F,301041,Lineage Mailing Service,301041 Stormont Vail Health Care .970,ADC Auto,2.652,1.94,2,2,0,0.97
+4,2026-04-09,040926_F,301041,Lineage Mailing Service,301041 Stormont Vail Health Care .970,MXD ADC Auto,47.456,31.04,32,32,0,0.97
+4,2026-04-09,040926_F,301041,Lineage Mailing Service,301041 Stormont Vail Health Care .970,Single Piece,6.52,3.88,4,4,4,0.97
+4,2026-04-09,040926_F,301064,Lineage Mailing Service,301064 HCA MidAmerican Divison .97,ADC Auto,26.52,19.4,20,20,0,0.97
+4,2026-04-09,040926_F,301064,Lineage Mailing Service,301064 HCA MidAmerican Divison .97,MXD ADC Auto,11.864,7.76,8,8,0,0.97
+4,2026-04-09,040926_F,301064,Lineage Mailing Service,301064 HCA MidAmerican Divison .97,Single Piece,3.26,1.94,2,2,2,0.97
+4,2026-04-09,040926_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ThreeDigitAuto,8.61,6.79,7,7,0,0.97
+4,2026-04-09,040926_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ADC Auto,7.956,5.82,6,6,0,0.97
+4,2026-04-09,040926_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,ADC Auto,14.586,10.67,11,11,0,0.97
+4,2026-04-09,040926_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,MXD ADC Auto,1537.871,1005.89,1037,1037,0,0.97
+4,2026-04-09,040926_F,301078,Lineage Mailing Service,301078 Security Benefit Zinnia - EFD .970,Single Piece,35.86,21.34,22,22,22,0.97
+4,2026-04-09,040926_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ThreeDigitAuto,65.19,51.41,53,53,0,0.97
+4,2026-04-09,040926_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ADC Auto,147.186,107.67,111,111,0,0.97
+4,2026-04-09,040926_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,ADC Auto,59.67,43.65,45,45,0,0.97
+4,2026-04-09,040926_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,MXD ADC Auto,91.946,60.14,62,62,0,0.97
+4,2026-04-09,040926_F,301079,Lineage Mailing Service,301079 Blue Cross Blue Shield - EFD .970,Single Piece,,,-4,-4,-4,
+4,2026-04-09,040926_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,ThreeDigitAuto,12.3,9.7,10,10,0,0.97
+4,2026-04-09,040926_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,ADC Auto,31.824,23.28,24,24,0,0.97
+4,2026-04-09,040926_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,MXD ADC Auto,4.449,2.91,3,3,0,0.97
+4,2026-04-09,040926_F,301080,Lineage Mailing Service,301080 KC Presort LLC .970,Single Piece,1.63,0.97,1,1,1,0.97

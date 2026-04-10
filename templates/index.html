@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Postage Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="header header-with-nav">
+      <a class="btn btn-nav" href="{{ url_for('customers_hierarchy') }}">Parent / child accounts</a>
+      <a class="btn btn-nav" href="{{ url_for('system_page') }}">System</a>
+      <h1><span class="header-icon" aria-hidden="true">&#128202;</span> Postage Dashboard</h1>
+    </header>
+
+    <div class="watcher-bar" id="watcherBar">
+      <span class="watcher-dot" id="watcherDot" aria-hidden="true"></span>
+      <span class="watcher-label" id="watcherLabel">Watcher …</span>
+      <button type="button" class="btn btn-scan" id="btnScan">&#128260; Scan Now</button>
+    </div>
+
+    <section class="panel controls-panel">
+      <div class="controls-row">
+        <label class="field search-field">
+          <span class="field-label">Search Customer #</span>
+          <span class="input-wrap">
+            <span class="input-icon" aria-hidden="true">&#128269;</span>
+            <input type="text" id="searchCustomer" placeholder="Enter customer number..." />
+          </span>
+        </label>
+        <label class="field grow">
+          <span class="field-label">Select Account</span>
+          <span class="input-wrap">
+            <span class="input-icon" aria-hidden="true">&#128203;</span>
+            <select id="selectAccount"></select>
+          </span>
+        </label>
+      </div>
+      <div class="controls-row">
+        <label class="field">
+          <span class="field-label">Start Date</span>
+          <span class="input-wrap">
+            <span class="input-icon" aria-hidden="true">&#128197;</span>
+            <input type="date" id="startDate" />
+          </span>
+        </label>
+        <label class="field">
+          <span class="field-label">End Date</span>
+          <span class="input-wrap">
+            <span class="input-icon" aria-hidden="true">&#128197;</span>
+            <input type="date" id="endDate" />
+          </span>
+        </label>
+      </div>
+      <div class="controls-row controls-options">
+        <label class="check"><input type="checkbox" id="showParents" checked /> Show Parent Accounts</label>
+        <label class="check"><input type="checkbox" id="showMain" checked /> Show standalone accounts</label>
+        <p class="controls-hint">
+          Standalone = no parent company in the customer file. Uncheck to show only accounts that belong to a parent.
+        </p>
+        <label class="check"><input type="checkbox" id="consolidate" /> Consolidate Date &amp; Mailclass</label>
+        <label class="check"><input type="checkbox" id="removeZeros" /> Remove Zero Count Rows</label>
+        <label class="check"><input type="checkbox" id="hideCosts" /> Hide Costs</label>
+        <button type="button" class="btn btn-primary" id="btnLoad">&#9654; Load All</button>
+      </div>
+    </section>
+
+    <div class="toolbar-exports">
+      <label class="export-discount">
+        <span class="export-discount-label">Flats discount ($)</span>
+        <input
+          type="number"
+          id="invoiceDiscount"
+          min="0"
+          step="0.01"
+          value="0.10"
+          aria-label="Flats discount in dollars per piece"
+        />
+      </label>
+      <button type="button" class="btn btn-export" id="btnExportPostage">
+        <span class="export-btn-label">&#128229; Export Postage Invoice</span>
+        <span class="export-btn-spinner hidden" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="btn btn-export" id="btnExportFlatsSavings">
+        <span class="export-btn-label">&#128196; Export flats report</span>
+        <span class="export-btn-spinner hidden" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="btn btn-export" id="btnExportParcelsCsv">
+        <span class="export-btn-label">&#128196; Export Parcels CSV</span>
+        <span class="export-btn-spinner hidden" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="btn btn-export" id="btnExportParcelsXlsx">
+        <span class="export-btn-label">&#128196; Export Parcels Excel</span>
+        <span class="export-btn-spinner hidden" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="btn btn-export" id="btnExportConsolidatedVolumes">
+        <span class="export-btn-label">📋 Export consolidated volumes XLS</span>
+        <span class="export-btn-spinner hidden" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="btn btn-export" id="btnExportParcel">
+        <span class="export-btn-label">&#128230; Export Parcel Report</span>
+        <span class="export-btn-spinner hidden" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="btn btn-export" id="btnExportParcelZoneSummary">
+        <span class="export-btn-label">&#128202; Export Parcel Summary</span>
+        <span class="export-btn-spinner hidden" aria-hidden="true"></span>
+      </button>
+    </div>
+
+    <nav class="tabs" role="tablist">
+      <button type="button" class="tab active" data-tab="postage" role="tab" aria-selected="true">&#128238; Postage</button>
+      <button type="button" class="tab" data-tab="parcels" role="tab" aria-selected="false">&#128230; Parcels</button>
+      <button type="button" class="tab" data-tab="summary" role="tab" aria-selected="false">&#128203; Import Summary</button>
+    </nav>
+
+    <div id="errorBanner" class="error-banner hidden" role="alert"></div>
+
+    <section id="tabPostage" class="tab-panel" role="tabpanel">
+      <div class="summary-bar" id="summaryPostage"></div>
+      <div class="table-actions">
+        <button type="button" class="btn btn-edit" id="btnEditPostage" disabled>Edit selected row</button>
+        <span class="table-actions-hint" id="postageEditHint">Select a row to edit transactions.</span>
+      </div>
+      <div class="table-wrap loading-wrap" id="wrapPostage">
+        <div class="spinner hidden" id="spinPostage"></div>
+        <div class="table-scroll" id="tablePostage"></div>
+      </div>
+    </section>
+
+    <section id="tabParcels" class="tab-panel hidden" role="tabpanel">
+      <div class="summary-bar" id="summaryParcels"></div>
+      <div class="table-wrap loading-wrap" id="wrapParcels">
+        <div class="spinner hidden" id="spinParcels"></div>
+        <div class="table-scroll" id="tableParcels"></div>
+      </div>
+      <div class="parcel-zone-summary-panel" id="parcelZoneSummaryPanel">
+        <h3 class="parcel-zone-summary-heading">Parcel zone summary (Priority vs EFD)</h3>
+        <p class="parcel-zone-summary-hint">
+          USPS zones 1–8 by weight (1–10 lb). Quantities from billing data; Priority (retail) and EFD unit prices from
+          <code>parcel summary.csv</code>. Costs = EFD × count; savings = (retail − EFD) × count. Same filters as the
+          table above.
+        </p>
+        <div id="parcelZoneBanner"></div>
+        <div class="table-scroll parcel-zone-scroll" id="parcelZoneSummary"></div>
+        <div class="parcel-zone-footer" id="parcelZoneFooter"></div>
+      </div>
+    </section>
+
+    <section id="tabSummary" class="tab-panel hidden" role="tabpanel">
+      <div class="summary-controls">
+        <label>Start <input type="date" id="sumStart" /></label>
+        <label>End <input type="date" id="sumEnd" /></label>
+        <button type="button" class="btn btn-run" id="btnRunSummary">&#9654; Run</button>
+      </div>
+      <h3 class="summary-section-heading">Postage</h3>
+      <div class="summary-grid">
+        <div class="summary-panel">
+          <h3 class="summary-panel-title">
+            <span>&#128230; Customer Summary</span>
+            <label class="summary-filter-check"
+              ><input type="checkbox" id="sumCustUnmatchedOnly" /> Show only unmatched</label
+            >
+          </h3>
+          <div class="table-scroll short" id="tableSumCust"></div>
+          <div class="footer-totals" id="sumCustFooter"></div>
+        </div>
+        <div class="summary-panel">
+          <h3>&#127991; Postage Classes</h3>
+          <div class="table-scroll short" id="tableSumClass"></div>
+          <div class="footer-totals" id="sumClassFooter"></div>
+        </div>
+      </div>
+      <h3 class="summary-section-heading">Parcels</h3>
+      <div class="summary-grid">
+        <div class="summary-panel">
+          <h3 class="summary-panel-title">
+            <span>&#128230; Parcel Customer Summary</span>
+            <label class="summary-filter-check"
+              ><input type="checkbox" id="sumParcelUnmatchedOnly" /> Show only unmatched</label
+            >
+          </h3>
+          <div class="table-scroll short" id="tableSumParcelCust"></div>
+          <div class="footer-totals" id="sumParcelCustFooter"></div>
+        </div>
+        <div class="summary-panel">
+          <h3>&#127991; Parcel Mail Classes</h3>
+          <div class="table-scroll short" id="tableSumParcelClass"></div>
+          <div class="footer-totals" id="sumParcelClassFooter"></div>
+        </div>
+      </div>
+      <h3 class="import-log-title">Import Log</h3>
+      <div class="table-scroll" id="tableImports"></div>
+    </section>
+  </div>
+
+  <div class="modal-overlay hidden" id="postageEditOverlay" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="modal" role="document" aria-labelledby="postageEditTitle">
+      <div class="modal-header">
+        <h2 class="modal-title" id="postageEditTitle">Edit Postage Transactions</h2>
+        <button type="button" class="btn btn-modal-close" id="btnClosePostageEdit" aria-label="Close">&#10005;</button>
+      </div>
+      <div class="modal-body">
+        <div class="edit-context" id="postageEditContext"></div>
+
+        <div class="edit-grid">
+          <label class="field">
+            <span class="field-label">New account #</span>
+            <span class="input-wrap">
+              <span class="input-icon" aria-hidden="true">&#128203;</span>
+              <input type="text" id="postageEditAccount" placeholder="Enter customer number..." />
+            </span>
+          </label>
+          <label class="field grow">
+            <span class="field-label">Reason (optional)</span>
+            <span class="input-wrap">
+              <span class="input-icon" aria-hidden="true">&#9998;</span>
+              <input type="text" id="postageEditReason" placeholder="Why is this being updated?" />
+            </span>
+          </label>
+        </div>
+
+        <div class="edit-weights">
+          <div class="edit-weights-head">
+            <h3 class="edit-weights-title">Pieces by weight (oz)</h3>
+            <p class="edit-weights-hint">These values will be written back to the database. Conflicts will merge (sum) into existing destination rows.</p>
+          </div>
+          <div class="table-scroll short" id="postageEditWeights"></div>
+        </div>
+
+        <div class="edit-preview hidden" id="postageEditPreview"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn" id="btnPreviewPostageEdit">Preview changes</button>
+        <button type="button" class="btn btn-primary" id="btnApplyPostageEdit" disabled>Apply update</button>
+      </div>
+    </div>
+  </div>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

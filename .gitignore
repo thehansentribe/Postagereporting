@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+env/
+postage.db
+postage.db-*
+watch/
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
+~$*.xlsx
+~$*.xls
