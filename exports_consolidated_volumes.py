@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +17,38 @@ import db
 from exports import aggregate_parcel_count_rows
 
 
-def consolidated_volumes_download_name(start_date: str, end_date: str) -> str:
-    return f"volumes_flats_parcels_{start_date}_{end_date}.xlsx"
+_FILENAME_BAD_CHARS_RE = re.compile(r'[\\/:*?"<>|]+')
+
+
+def _safe_filename_piece(s: str) -> str:
+    # Keep spaces/parentheses for readability, but remove characters that break downloads.
+    out = _FILENAME_BAD_CHARS_RE.sub("-", s)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out or "Report"
+
+
+def _short_mdy(date_str: str) -> str:
+    """M-D-YYYY with no leading zeros; falls back to raw if parsing fails."""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+        return f"{d.month}-{d.day}-{d.year}"
+    except ValueError:
+        return str(date_str)
+
+
+def consolidated_volumes_download_name(account_scope_label: str, end_date: str) -> str:
+    scope = _safe_filename_piece(account_scope_label or "All Accounts")
+    end_short = _safe_filename_piece(_short_mdy(end_date))
+    return f"{scope} {end_short}.xlsx"
+
+
+def total_presort_reject_pieces_from_postage_rows(rows: list[dict[str, Any]]) -> int:
+    """WS3 presort rejects appear as synthetic postage rows (mail class Presort rejects)."""
+    return sum(
+        int(r.get("total_qty") or 0)
+        for r in rows
+        if r.get("mail_class") == db.WS3_REJECT_MAIL_CLASS
+    )
 
 
 def _find_block_side_for_zone(blocks: list[dict[str, Any]], z: int) -> tuple[dict[str, Any], str] | None:
@@ -191,6 +223,7 @@ def export_consolidated_volumes_xlsx(
         conn.close()
 
     flat_rows = postage.get("rows") or []
+    rejected_flats = total_presort_reject_pieces_from_postage_rows(flat_rows)
     parcel_agg = aggregate_parcel_count_rows(parcels.get("rows") or [])
     zone_pieces = int(zone.get("total_pieces") or 0)
 
@@ -249,6 +282,7 @@ def export_consolidated_volumes_xlsx(
     if parcels.get("total_retail") is not None:
         kv_row(r, "Total parcel retail", round(float(parcels["total_retail"]), 2), money=True)
         r += 1
+    kv_row(r, "Total flats rejected items", rejected_flats, is_int=True)
 
     ws_sum.column_dimensions["A"].width = 28.0
     ws_sum.column_dimensions["B"].width = 36.0

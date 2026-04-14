@@ -317,9 +317,7 @@ def test_export_parcel_report_workbook(monkeypatch):
             tot_row = 3
             assert ws.cell(tot_row, 1).value == "TOTALS"
             assert ws.cell(tot_row, 10).value == "=SUM(J2:J2)"
-            assert ws.cell(15, 1).value == "Count"
-            assert ws.cell(15, 8).value == "Customer #"
-            assert ws.cell(16, 10).value == 1
+            assert ws.max_row == tot_row
         finally:
             out.unlink(missing_ok=True)
 
@@ -329,13 +327,21 @@ def test_export_parcel_report_workbook(monkeypatch):
 
 
 def test_export_parcel_zone_summary_includes_af_hm_sections(monkeypatch):
-    """Export Parcel Summary workbook includes 11–100 lb A–F and customer H–M below the zone grid."""
+    """Parcel Invoice workbook: over-10lb block, then per-customer invoice table below the zone grid."""
     from openpyxl import load_workbook
 
     def fake_af_hm(*_a, **_k):
         return {
             "heavy_rows": [
-                {"count": 2, "lbs": 15, "zone": 2, "base": 20.5, "efd": 20.0, "savings": 0.5},
+                {
+                    "customer_name": "Heavy Child",
+                    "count": 2,
+                    "lbs": 15,
+                    "zone": 2,
+                    "base": 20.5,
+                    "efd": 20.0,
+                    "savings": 0.5,
+                },
             ],
             "customers": [
                 {
@@ -384,12 +390,22 @@ def test_export_parcel_zone_summary_includes_af_hm_sections(monkeypatch):
     )
     try:
         wb = load_workbook(out)
+        assert len(wb.sheetnames) == 2
         ws = wb.active
-        assert ws.cell(56, 1).value == "Count"
-        assert ws.cell(56, 8).value == "Customer #"
-        assert ws.cell(57, 1).value == 2
-        assert ws.cell(57, 8).value == 101
-        assert ws.cell(57, 10).value == 5
+        assert wb.worksheets[1].cell(1, 1).value == "Customer #"
+        assert wb.worksheets[1].cell(1, 13).value == "IMPB"
+        assert ws.cell(56, 1).value == "Customer Name"
+        assert ws.cell(57, 1).value == "Heavy Child"
+        assert ws.cell(57, 2).value == 2
+        assert ws.cell(58, 1).value == "Total"
+        assert str(ws.cell(58, 2).value or "").startswith("=SUM(")
+        assert "SUMPRODUCT" in str(ws.cell(58, 6).value or "")
+        assert str(ws.cell(58, 7).value or "").startswith("=SUM(")
+        assert ws.cell(60, 1).value == "Customer #"
+        assert ws.cell(61, 1).value == 101
+        assert ws.cell(61, 3).value == 3
+        assert ws.cell(62, 1).value == "Total"
+        assert str(ws.cell(62, 3).value or "").startswith("=SUM(")
     finally:
         out.unlink(missing_ok=True)
 
@@ -451,8 +467,11 @@ def test_query_parcel_zone_summary_matrix_and_totals(monkeypatch):
 
 
 def test_compute_parcel_report_af_hm_sections(monkeypatch):
-    fake_rates = {(2, 13): (19.2, 18.95), (3, 16): (22.05, 21.8)}
-    monkeypatch.setattr(dbmod, "get_heavy_parcel_rates", lambda: fake_rates)
+    # Per-customer cost/savings follow parcel summary (zone × lb_row≤10), same as zone grid footer.
+    fake_parcel = {(2, 10): (19.2, 18.95), (3, 10): (22.05, 21.8)}
+    fake_heavy = {(2, 13): (19.2, 18.95), (3, 16): (22.05, 21.8)}
+    monkeypatch.setattr(dbmod, "get_parcel_summary_rates", lambda: fake_parcel)
+    monkeypatch.setattr(dbmod, "get_heavy_parcel_rates", lambda: fake_heavy)
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "afhm.db"
         monkeypatch.setattr(dbmod, "DB_PATH", p)
@@ -498,6 +517,55 @@ def test_compute_parcel_report_af_hm_sections(monkeypatch):
     lbs_z = {(r["lbs"], r["zone"]): r["count"] for r in s["heavy_rows"]}
     assert lbs_z[(13, 2)] == 1
     assert lbs_z[(16, 3)] == 1
+    assert s["heavy_rows"][0]["customer_name"] == "Heavy Co"
+    assert s["heavy_rows"][1]["customer_name"] == "Heavy Co"
+
+
+def test_compute_parcel_report_af_hm_matches_zone_summary_totals(monkeypatch):
+    """Customer invoice cost/savings roll up to the same totals as the zone summary footer."""
+    fake_parcel = {(1, 1): (11.0, 10.0), (2, 10): (25.0, 20.0)}
+    monkeypatch.setattr(dbmod, "get_parcel_summary_rates", lambda: fake_parcel)
+    monkeypatch.setattr(dbmod, "get_heavy_parcel_rates", lambda: {})
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "afhm_align.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", p)
+        dbmod.init_db()
+        conn = dbmod.get_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO customers (customer_number, customer_name, parent_number, parent_name)
+                VALUES (700, 'Align Co', NULL, NULL)
+                """
+            )
+            conn.execute(
+                "INSERT INTO billing_imports (billing_id, file_name, row_count) VALUES ('b1', 'b.csv', 2)"
+            )
+            conn.executemany(
+                """
+                INSERT INTO billing_records (
+                    billing_import_id, custom_account_code, account_name, time_stamp,
+                    weight_oz, usps_mail_class, billing_amount, fully_paid_postage, zone
+                ) VALUES (1, 700, 'Align Co', '4/1/2026 10:00', ?, 'CLS', 1.0, 1.0, ?)
+                """,
+                [
+                    (16.0, "1"),
+                    (200.0, "2"),
+                ],
+            )
+            conn.commit()
+            af = dbmod.compute_parcel_report_af_hm_sections(
+                conn, "2026-04-01", "2026-04-30", None, None, True, True
+            )
+            zn = dbmod.query_parcel_zone_summary(
+                conn, "2026-04-01", "2026-04-30", None, None, True, True, False
+            )
+        finally:
+            conn.close()
+
+    c0 = af["customers"][0]
+    assert c0["cost"] == zn["total_cost"]
+    assert c0["savings"] == zn["total_savings"]
 
 
 def test_compute_parcel_report_af_hm_uses_customer_master_name_not_billing(monkeypatch):
@@ -715,3 +783,95 @@ def test_query_parcel_over_10lb_lines_filters_and_base(monkeypatch):
     assert by_lbs[13]["base"] == pytest.approx(19.2, rel=1e-9)
     assert by_lbs[16]["zone"] == 3
     assert by_lbs[16]["base"] == pytest.approx(22.05, rel=1e-9)
+
+
+def test_presort_reject_unit_cost_and_invoice_reject_count(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "rej.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", p)
+        dbmod.init_db()
+        conn = dbmod.get_connection()
+        try:
+            assert dbmod.get_presort_reject_unit_cost(conn) == pytest.approx(0.66, rel=1e-9)
+            dbmod.set_presort_reject_unit_cost(conn, 0.55)
+            assert dbmod.get_presort_reject_unit_cost(conn) == pytest.approx(0.55, rel=1e-9)
+
+            conn.executemany(
+                """
+                INSERT INTO customers (customer_number, customer_name, parent_number, parent_name)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (100, "Parent Co", None, None),
+                    (101, "Child A", 100, "Parent Co"),
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO ws3_parent_daily_rejects (mail_date, parent_customer_number, reject_count)
+                VALUES ('2026-04-01', 100, 4), ('2026-04-02', 100, 6)
+                """
+            )
+            conn.commit()
+
+            n = dbmod.query_ws3_presort_reject_count_for_invoice(
+                conn, "2026-04-01", "2026-04-30", 100, None, True, True
+            )
+            assert n == 10
+
+            n_child = dbmod.query_ws3_presort_reject_count_for_invoice(
+                conn, "2026-04-01", "2026-04-30", 100, 101, True, True
+            )
+            assert n_child == 10
+        finally:
+            conn.close()
+
+
+def test_clamp_negative_ws3_reject_counts(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "clamp.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", p)
+        dbmod.init_db()
+
+        conn = dbmod.get_connection()
+        try:
+            # Minimal WS3 run + detail with negative pcs_rejected
+            conn.execute(
+                "INSERT INTO ws3_netsort_customers (customer_code, customer_name) VALUES ('1','A')"
+            )
+            cur = conn.execute(
+                "INSERT INTO ws3_mail_runs (mail_date, mail_id) VALUES ('2026-04-01', '')"
+            )
+            run_id = int(cur.lastrowid)
+            cur = conn.execute("INSERT INTO ws3_profiles (profile_name) VALUES ('P1')")
+            profile_id = int(cur.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO ws3_mail_detail (run_id, profile_id, customer_code, rate_type, pcs_rejected)
+                VALUES (?, ?, '1', 'ADC Auto', -5)
+                """,
+                (run_id, profile_id),
+            )
+            # ws3_parent_daily_rejects has FK to customers, so insert a customer row.
+            conn.execute(
+                "INSERT INTO customers (customer_number, customer_name) VALUES (1, 'A')"
+            )
+            conn.execute(
+                """
+                INSERT INTO ws3_parent_daily_rejects (mail_date, parent_customer_number, reject_count)
+                VALUES ('2026-04-01', 1, -2)
+                """
+            )
+            conn.commit()
+
+            dbmod.clamp_negative_ws3_reject_counts(conn)
+            conn.commit()
+
+            d = conn.execute("SELECT pcs_rejected FROM ws3_mail_detail").fetchone()[0]
+            pval = conn.execute(
+                "SELECT reject_count FROM ws3_parent_daily_rejects"
+            ).fetchone()[0]
+            assert int(d) == 0
+            assert int(pval) == 0
+        finally:
+            conn.close()

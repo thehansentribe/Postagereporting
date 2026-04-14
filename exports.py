@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from functools import cmp_to_key
 import os
+import re
 import sqlite3
 import tempfile
 from copy import copy
@@ -200,6 +202,168 @@ def _cost_centers_flats_range(
     return out
 
 
+# Flats data grid XLSX — column keys/labels aligned with `postageTableColumns` in static/app.js.
+def _flats_grid_header_keys_and_labels(hide_costs: bool) -> tuple[list[str], list[str]]:
+    oz_keys = [f"oz_{i}" for i in range(13)] + ["oz_13", "oz_13plus"]
+    keys: list[str] = [
+        "date",
+        "parent_name",
+        "child_name",
+        "mail_class",
+        *oz_keys,
+        "total_qty",
+    ]
+    labels: list[str] = [
+        "Date",
+        "Parent Name",
+        "Child Name",
+        "Class",
+        *[f"{i} oz" for i in range(13)],
+        "13 oz",
+        "13+ oz",
+        "Total Qty",
+    ]
+    if not hide_costs:
+        keys.append("total_cost")
+        labels.append("Total Cost")
+    return keys, labels
+
+
+_FLATS_GRID_ALL_KEYS = set(_flats_grid_header_keys_and_labels(False)[0])
+
+
+def _flats_grid_cell_value(row: dict[str, Any], k: str) -> Any:
+    v = row.get(k)
+    if k == "total_cost":
+        if v is None or v == "":
+            return None
+        return round(float(v), 2)
+    if k.startswith("oz_") or k == "total_qty":
+        return int(v or 0)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v
+    return v if v is not None else ""
+
+
+def _flats_grid_cmp(key: str, mul: int):
+    """Comparator aligned with `sortRows` in static/app.js (nulls last for mul=1)."""
+
+    def cmp(a: dict[str, Any], b: dict[str, Any]) -> int:
+        va, vb = a.get(key), b.get(key)
+        if va is None and vb is None:
+            return 0
+        if va is None:
+            return 1 * mul
+        if vb is None:
+            return -1 * mul
+        if (
+            isinstance(va, (int, float))
+            and not isinstance(va, bool)
+            and isinstance(vb, (int, float))
+            and not isinstance(vb, bool)
+        ):
+            if va < vb:
+                return -mul
+            if va > vb:
+                return mul
+            return 0
+        sa, sb = str(va), str(vb)
+        try:
+            na, nb = float(sa), float(sb)
+            if na < nb:
+                return -mul
+            if na > nb:
+                return mul
+            return 0
+        except ValueError:
+            if sa < sb:
+                return -mul
+            if sa > sb:
+                return mul
+            return 0
+
+    return cmp
+
+
+def _sort_flats_grid_rows(
+    rows: list[dict[str, Any]], sort_key: str, sort_dir: int
+) -> list[dict[str, Any]]:
+    key = sort_key if sort_key in _FLATS_GRID_ALL_KEYS else "date"
+    mul = 1 if sort_dir >= 0 else -1
+    return sorted(rows, key=cmp_to_key(_flats_grid_cmp(key, mul)))
+
+
+def export_flats_data_grid_xlsx(
+    start_date: str,
+    end_date: str,
+    parent_number: int | None = None,
+    customer_number: int | None = None,
+    show_parents: bool = True,
+    show_main: bool = True,
+    consolidate: bool = False,
+    remove_zeros: bool = False,
+    hide_costs: bool = False,
+    sort_key: str = "date",
+    sort_dir: int = 1,
+) -> Path:
+    """
+    One-sheet workbook: postage dashboard rows (same columns as the former flats CSV export).
+    """
+    conn = db.get_connection()
+    try:
+        data = db.query_postage(
+            conn,
+            start_date,
+            end_date,
+            parent_number=parent_number,
+            customer_number=customer_number,
+            show_parents=show_parents,
+            show_main=show_main,
+            consolidate=consolidate,
+            remove_zeros=remove_zeros,
+            hide_costs=hide_costs,
+        )
+        rows_raw = list(data.get("rows") or [])
+        rows = _sort_flats_grid_rows(rows_raw, sort_key, sort_dir)
+
+        header_keys, headers = _flats_grid_header_keys_and_labels(hide_costs)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Flats"
+
+        INT_FMT = "#,##0"
+        CURR_FMT = "$#,##0.00"
+        bold = Font(bold=True)
+
+        for col, h in enumerate(headers, start=1):
+            c = ws.cell(1, col, h)
+            c.font = bold
+
+        oz_key_set = {k for k in header_keys if k.startswith("oz_")}
+        for r_idx, row in enumerate(rows, start=2):
+            for c_idx, k in enumerate(header_keys, start=1):
+                val = _flats_grid_cell_value(row, k)
+                cell = ws.cell(r_idx, c_idx, val)
+                if k == "total_cost" and val is not None:
+                    cell.number_format = CURR_FMT
+                elif k in oz_key_set or k == "total_qty":
+                    cell.number_format = INT_FMT
+
+        for col in range(1, len(headers) + 1):
+            ws.column_dimensions[get_column_letter(col)].width = min(18, 12 + (2 if col <= 4 else 0))
+
+        out = Path(
+            tempfile.mkstemp(
+                suffix=f"_Flats_Invoice_{start_date}_{end_date}.xlsx",
+                prefix="flats_grid_",
+            )[1]
+        )
+        wb.save(out)
+        return out
+    finally:
+        conn.close()
+
+
 def export_postage_invoice(
     parent_number: int,
     start_date: str,
@@ -328,6 +492,18 @@ def export_postage_invoice(
             sheet_title = _invoice_range_sheet_title(start_date, end_date)
             ws = wb.create_sheet(title=sheet_title)
             period_end = datetime.strptime(end_date, "%Y-%m-%d")
+            reject_unit = db.get_presort_reject_unit_cost(conn)
+            reject_count = db.query_ws3_presort_reject_count_for_invoice(
+                conn,
+                start_date,
+                end_date,
+                parent_number,
+                customer_number,
+                show_parents,
+                show_main,
+            )
+            reject_line_cost = round(float(reject_count) * float(reject_unit), 2)
+
             _write_invoice_sheet(
                 ws,
                 1,
@@ -345,6 +521,9 @@ def export_postage_invoice(
                 other_cost,
                 range_total_pieces,
                 range_total_cost,
+                reject_count=reject_count,
+                reject_unit_cost=reject_unit,
+                reject_line_cost=reject_line_cost,
                 hide_costs=hide_costs,
                 hide_savings=hide_savings,
             )
@@ -371,12 +550,12 @@ def _redact_postage_invoice_privacy(
 ) -> None:
     """Remove currency from Costs/Savings columns per dashboard hide flags."""
     if hide_costs:
-        for r in range(16, 33):
+        for r in range(16, 34):
             ws.cell(r, 12, None)
             ws.cell(r, 13, None)
-        ws.cell(33, 13, None)
-        ws.cell(34, 12, None)
         ws.cell(34, 13, None)
+        ws.cell(35, 12, None)
+        ws.cell(35, 13, None)
         ws["K13"] = None
         ws["M13"] = None
         if last_data_row >= 37:
@@ -389,10 +568,10 @@ def _redact_postage_invoice_privacy(
         return
 
     if hide_savings:
-        for r in range(16, 33):
+        for r in range(16, 34):
             ws.cell(r, 13, None)
-        ws.cell(33, 13, None)
         ws.cell(34, 13, None)
+        ws.cell(35, 13, None)
         if last_data_row >= 37:
             for r in range(37, last_data_row + 1):
                 ws.cell(r, 5, None)
@@ -417,6 +596,9 @@ def _write_invoice_sheet(
     other_cost: float = 0.0,
     range_total_pieces: int = 0,
     range_total_cost: float = 0.0,
+    reject_count: int = 0,
+    reject_unit_cost: float = 0.66,
+    reject_line_cost: float = 0.0,
     hide_costs: bool = False,
     hide_savings: bool = False,
 ) -> None:
@@ -479,7 +661,7 @@ def _write_invoice_sheet(
     ws["G13"] = 0
     ws["G13"].font = BOLD
     ws["J13"] = "$"
-    ws["K13"] = "=L34"
+    ws["K13"] = "=L35"
     ws["K13"].font = BOLD
     ws["M13"] = "=(E13+G13)-K13"
     ws["M13"].font = BOLD
@@ -499,7 +681,7 @@ def _write_invoice_sheet(
     for col, val in [
         (6, "Weight"),
         (7, "1st Class"),
-        (8, "EFD 1st Class"),
+        (8, "FC discount"),
         (9, "Total #'s"),
         (10, "IMB rejects"),
         (11, "Total #'s"),
@@ -531,8 +713,29 @@ def _write_invoice_sheet(
         ws.cell(r, 13, f"=G{r}*I{r}+G{r}*K{r}-L{r}").number_format = CURR
         ws.cell(r, 13).font = BOLD
 
+    r_reject = 29
+    ru = round(float(reject_unit_cost), 4)
+    rc = int(reject_count or 0)
+    ws.cell(r_reject, 6, "Presort rejects").font = BOLD
+    ws.cell(r_reject, 7, 0).number_format = CURR
+    ws.cell(r_reject, 7).font = BOLD
+    ws.cell(r_reject, 8, 0).number_format = CURR
+    ws.cell(r_reject, 8).font = BOLD
+    ws.cell(r_reject, 9, 0).number_format = INT_FMT
+    ws.cell(r_reject, 9).font = BOLD
+    ws.cell(r_reject, 10, ru).number_format = CURR
+    ws.cell(r_reject, 10).font = BOLD
+    ws.cell(r_reject, 11, rc).number_format = INT_FMT
+    ws.cell(r_reject, 11).font = BOLD
+    ws.cell(r_reject, 12, f"=H{r_reject}*I{r_reject}+J{r_reject}*K{r_reject}").number_format = CURR
+    ws.cell(r_reject, 12).font = BOLD
+    ws.cell(r_reject, 13, f"=G{r_reject}*I{r_reject}+G{r_reject}*K{r_reject}-L{r_reject}").number_format = (
+        CURR
+    )
+    ws.cell(r_reject, 13).font = BOLD
+
     # Mail not in the 1–13 oz flat grid: non-flat classes and flat mail at 0 oz / 13+ oz (postage only; no discount savings).
-    r_other = 29
+    r_other = 30
     ws.cell(r_other, 6, "Letter").font = BOLD
     ws.cell(r_other, 7, 0).number_format = CURR
     ws.cell(r_other, 7).font = BOLD
@@ -550,7 +753,7 @@ def _write_invoice_sheet(
     ws.cell(r_other, 13, 0).number_format = CURR
     ws.cell(r_other, 13).font = BOLD
 
-    for r in (30, 31):
+    for r in (31, 32):
         ws.cell(r, 6, "").font = BOLD
         for col in (7, 8, 10, 12, 13):
             ws.cell(r, col, 0).number_format = CURR
@@ -560,35 +763,40 @@ def _write_invoice_sheet(
         ws.cell(r, 11, 0).number_format = INT_FMT
         ws.cell(r, 11).font = BOLD
 
-    ws.cell(32, 6, "Foreign").font = BOLD
+    ws.cell(33, 6, "Foreign").font = BOLD
     for col in (7, 8, 10):
-        ws.cell(32, col, 0).number_format = CURR
-        ws.cell(32, col).font = BOLD
-    ws.cell(32, 9, 0).font = BOLD
-    ws.cell(32, 9).number_format = INT_FMT
-    ws.cell(32, 11, 0).number_format = INT_FMT
-    ws.cell(32, 11).font = BOLD
-    ws.cell(32, 12, 0).number_format = CURR
-    ws.cell(32, 12).font = BOLD
-    ws.cell(32, 13, 0).number_format = CURR
-    ws.cell(32, 13).font = BOLD
+        ws.cell(33, col, 0).number_format = CURR
+        ws.cell(33, col).font = BOLD
+    ws.cell(33, 9, 0).font = BOLD
+    ws.cell(33, 9).number_format = INT_FMT
+    ws.cell(33, 11, 0).number_format = INT_FMT
+    ws.cell(33, 11).font = BOLD
+    ws.cell(33, 12, 0).number_format = CURR
+    ws.cell(33, 12).font = BOLD
+    ws.cell(33, 13, 0).number_format = CURR
+    ws.cell(33, 13).font = BOLD
 
-    ws.cell(33, 9, "=SUM(I16:I32)").font = BOLD
-    ws.cell(33, 11, "=SUM(K16:K32)").font = BOLD
-    ws.cell(33, 13, "Total Savings").font = BOLD
+    ws.cell(34, 9, "=SUM(I16:I33)").font = BOLD
+    ws.cell(34, 11, "=SUM(K16:K33)").font = BOLD
+    ws.cell(34, 13, "Total Savings").font = BOLD
 
-    # Match dashboard totals: same SUM(pieces) / SUM(total_cost) as /api/postage for this parent + date range.
-    ws.cell(34, 8, "Total Pieces").font = BOLD
-    ws.cell(34, 9, range_total_pieces).number_format = INT_FMT
-    ws.cell(34, 9).font = BOLD
-    ws.cell(34, 11, "Total Cost:").font = BOLD
-    ws.cell(34, 12, round(range_total_cost, 2)).number_format = CURR
-    ws.cell(34, 12).font = BOLD
+    # Match dashboard postage totals; add presort reject charges (not in postage_data costs).
+    rlc = round(float(reject_line_cost or 0.0), 2)
+    invoice_total_cost = round(float(range_total_cost or 0.0) + rlc, 2)
     flat_pieces_total = sum(
         int(weight_data.get(oz, {}).get("pieces", 0) or 0) for oz in range(1, 14)
     )
-    ws.cell(34, 13, round(flat_pieces_total * discount, 2)).number_format = CURR
-    ws.cell(34, 13).font = BOLD
+    flat_savings = round(flat_pieces_total * discount, 2)
+    invoice_total_savings = round(flat_savings - rlc, 2)
+
+    ws.cell(35, 8, "Total Pieces").font = BOLD
+    ws.cell(35, 9, range_total_pieces).number_format = INT_FMT
+    ws.cell(35, 9).font = BOLD
+    ws.cell(35, 11, "Total Cost:").font = BOLD
+    ws.cell(35, 12, invoice_total_cost).number_format = CURR
+    ws.cell(35, 12).font = BOLD
+    ws.cell(35, 13, invoice_total_savings).number_format = CURR
+    ws.cell(35, 13).font = BOLD
 
     for col, val in [
         (1, "Cost Centers "),
@@ -600,6 +808,16 @@ def _write_invoice_sheet(
         ws.cell(36, col, val).font = BOLD
 
     child_list = list(children)
+    if rc > 0:
+        child_list.append(
+            {
+                "customer_number": "",
+                "customer_name": "Presort rejects",
+                "pieces": rc,
+                "cost": rlc,
+                "savings": -rlc,
+            }
+        )
     if int(other_pieces or 0) > 0 or abs(float(other_cost or 0.0)) > 1e-9:
         child_list.append(
             {
@@ -654,7 +872,7 @@ def _write_invoice_sheet(
         for cell in ws[r]:
             if cell.value is not None:
                 _apply_bold_preserve_font(cell)
-    for r in range(16, 35):
+    for r in range(16, 36):
         for cell in ws[r]:
             if cell.value is not None:
                 _apply_bold_preserve_font(cell)
@@ -702,6 +920,40 @@ def parcel_counts_download_name(
 ) -> str:
     scope = parcel_report_scope_label(parent_number, customer_number)
     return f"Parcel_Counts_{scope}_{start_date}_{end_date}.xlsx"
+
+
+_FILENAME_BAD_CHARS_RE = re.compile(r'[\\/:*?"<>|]+')
+
+
+def _safe_filename_piece(s: str) -> str:
+    # Keep spaces/parentheses/underscores for readability, but remove characters that break downloads.
+    out = _FILENAME_BAD_CHARS_RE.sub("-", str(s))
+    out = re.sub(r"\s+", " ", out).strip()
+    return out or "Report"
+
+
+def _short_mdy(date_str: str) -> str:
+    """M-D-YYYY with no leading zeros; falls back to raw if parsing fails."""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+        return f"{d.month}-{d.day}-{d.year}"
+    except ValueError:
+        return str(date_str)
+
+
+def parcel_invoice_download_name(*, title_name: str | None, parent_number: int | None, end_date: str) -> str:
+    """
+    Friendly Parcel Invoice download name.
+
+    Example: "Security Benefit_Zinnia -EFD (3900) Parcel invoice 4-10-2026.xlsx"
+    """
+    raw_title = (title_name or "Parcel Invoice").strip()
+    display_title = raw_title if raw_title.rstrip().endswith("-EFD") else f"{raw_title} -EFD"
+    base = _safe_filename_piece(display_title)
+    end_short = _safe_filename_piece(_short_mdy(end_date))
+    if parent_number is None:
+        return f"{base} Parcel invoice {end_short}.xlsx"
+    return f"{base} ({int(parent_number)}) Parcel invoice {end_short}.xlsx"
 
 
 def aggregate_parcel_count_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -865,80 +1117,156 @@ def export_parcel_counts_report_xlsx(
     return out
 
 
-# Min column widths for A–F / H–M blocks (parcel report); merged with zone-summary widths where overlapping.
+# Min column widths for stacked over-10lb (A–G) + parcel invoice (A–E) blocks; merged with zone-summary widths.
 _AF_HM_MIN_WIDTHS: dict[int, float] = {
-    1: 12.0,
+    1: 30.0,
     2: 30.0,
-    3: 30.0,
-    4: 28.0,
-    5: 18.0,
-    6: 25.0,
-    8: 12.0,
-    9: 12.0,
-    10: 8.0,
-    11: 14.0,
-    12: 14.0,
-    13: 12.0,
+    3: 12.0,
+    4: 14.0,
+    5: 14.0,
+    6: 14.0,
+    7: 14.0,
 }
 
 
 def write_parcel_af_hm_sections(ws, section_start: int, sections: dict[str, Any]) -> None:
-    """11–100 lb aggregates (A–F) and per-customer totals (H–M) at ``section_start`` (header row)."""
+    """Over-10lb block (customer name in column A), optional totals row, then per-customer invoice + total."""
     sec_hdr = Font(name="Arial", bold=True, size=10)
     sec_fill = PatternFill("solid", start_color="E7E6E6")
+    tot_font = Font(name="Arial", bold=True, size=10)
     cur_fmt = "$#,##0.00"
     int_fmt = "0"
     data_font = Font(name="Arial", size=10)
 
     hrows = sections.get("heavy_rows") or []
     crows = sections.get("customers") or []
-    gtot = sections.get("grand_total_qty", 0)
 
-    hdr_af = ["Count", "lbs.", "Zone", "Base", "EFD", "Savings"]
+    hdr_af = [
+        "Customer Name",
+        "Count",
+        "lbs.",
+        "Zone",
+        "Base",
+        "EFD",
+        "Savings",
+    ]
     hdr_hm = [
         "Customer #",
         "Customer Name",
-        "Total qty (period)",
         "Items (customer)",
         "Total cost",
         "Savings",
     ]
-    for col, h in enumerate(hdr_af, 1):
-        c = ws.cell(section_start, col, h)
-        c.font = sec_hdr
-        c.fill = sec_fill
-        c.alignment = Alignment(horizontal="center")
-    for col, h in enumerate(hdr_hm, 8):
-        c = ws.cell(section_start, col, h)
+
+    cur_row = section_start
+    if hrows:
+        for col, h in enumerate(hdr_af, 1):
+            c = ws.cell(cur_row, col, h)
+            c.font = sec_hdr
+            c.fill = sec_fill
+            c.alignment = Alignment(horizontal="center")
+        for i, hr in enumerate(hrows):
+            r = cur_row + 1 + i
+            ws.cell(r, 1, hr.get("customer_name") or "(no name)")
+            ws.cell(r, 2, hr["count"])
+            ws.cell(r, 3, hr["lbs"])
+            ws.cell(r, 4, hr["zone"])
+            ws.cell(r, 5, hr["base"]).number_format = cur_fmt
+            ws.cell(r, 6, hr["efd"]).number_format = cur_fmt
+            ws.cell(r, 7, hr["savings"]).number_format = cur_fmt
+            for col in range(1, 8):
+                cell = ws.cell(r, col)
+                cell.font = data_font
+                if col == 1:
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                else:
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+            for col in (2, 3, 4):
+                ws.cell(r, col).number_format = int_fmt
+        first_h = cur_row + 1
+        last_h = cur_row + len(hrows)
+        tot_h = cur_row + 1 + len(hrows)
+        ht = ws.cell(tot_h, 1, "Total")
+        ht.font = tot_font
+        ht.fill = sec_fill
+        ht.alignment = Alignment(horizontal="left", vertical="center")
+        hb = ws.cell(tot_h, 2, f"=SUM(B{first_h}:B{last_h})")
+        hb.font = tot_font
+        hb.fill = sec_fill
+        hb.number_format = int_fmt
+        hb.alignment = Alignment(horizontal="right", vertical="center")
+        for col in (3, 4, 5):
+            ws.cell(tot_h, col).fill = sec_fill
+        hf = ws.cell(
+            tot_h,
+            6,
+            f"=SUMPRODUCT(B{first_h}:B{last_h},F{first_h}:F{last_h})",
+        )
+        hf.font = tot_font
+        hf.fill = sec_fill
+        hf.number_format = cur_fmt
+        hf.alignment = Alignment(horizontal="right", vertical="center")
+        hg = ws.cell(tot_h, 7, f"=SUM(G{first_h}:G{last_h})")
+        hg.font = tot_font
+        hg.fill = sec_fill
+        hg.number_format = cur_fmt
+        hg.alignment = Alignment(horizontal="right", vertical="center")
+        cur_row = tot_h + 2
+
+    for col, h in enumerate(hdr_hm, 1):
+        c = ws.cell(cur_row, col, h)
         c.font = sec_hdr
         c.fill = sec_fill
         c.alignment = Alignment(horizontal="center")
 
-    max_sec = max(len(hrows), len(crows), 0)
-    for i in range(max_sec):
-        r = section_start + 1 + i
-        if i < len(hrows):
-            hr = hrows[i]
-            ws.cell(r, 1, hr["count"])
-            ws.cell(r, 2, hr["lbs"])
-            ws.cell(r, 3, hr["zone"])
-            ws.cell(r, 4, hr["base"]).number_format = cur_fmt
-            ws.cell(r, 5, hr["efd"]).number_format = cur_fmt
-            ws.cell(r, 6, hr["savings"]).number_format = cur_fmt
-            for col in range(1, 7):
-                ws.cell(r, col).font = data_font
-        if i < len(crows):
-            cr = crows[i]
-            ws.cell(r, 8, cr["customer_number"])
-            ws.cell(r, 9, cr["name"])
-            ws.cell(r, 10, gtot)
-            ws.cell(r, 11, cr["qty"])
-            ws.cell(r, 12, cr["cost"]).number_format = cur_fmt
-            ws.cell(r, 13, cr["savings"]).number_format = cur_fmt
-            for col in range(8, 14):
-                ws.cell(r, col).font = data_font
-            ws.cell(r, 10).number_format = int_fmt
-            ws.cell(r, 11).number_format = int_fmt
+    for i, cr in enumerate(crows):
+        r = cur_row + 1 + i
+        ws.cell(r, 1, cr["customer_number"])
+        ws.cell(r, 2, cr["name"])
+        ws.cell(r, 3, cr["qty"])
+        ws.cell(r, 4, cr["cost"]).number_format = cur_fmt
+        ws.cell(r, 5, cr["savings"]).number_format = cur_fmt
+        for col in range(1, 6):
+            cell = ws.cell(r, col)
+            cell.font = data_font
+            if col in (1, 2):
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+            else:
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+        ws.cell(r, 3).number_format = int_fmt
+
+    tot_r = cur_row + 1 + len(crows)
+    t = ws.cell(tot_r, 1, "Total")
+    t.font = tot_font
+    t.fill = sec_fill
+    if crows:
+        d1 = cur_row + 1
+        d2 = cur_row + len(crows)
+        c3 = ws.cell(tot_r, 3, f"=SUM(C{d1}:C{d2})")
+        c3.font = tot_font
+        c3.number_format = int_fmt
+        c3.fill = sec_fill
+        c4 = ws.cell(tot_r, 4, f"=SUM(D{d1}:D{d2})")
+        c4.font = tot_font
+        c4.number_format = cur_fmt
+        c4.fill = sec_fill
+        c5 = ws.cell(tot_r, 5, f"=SUM(E{d1}:E{d2})")
+        c5.font = tot_font
+        c5.number_format = cur_fmt
+        c5.fill = sec_fill
+    else:
+        c3z = ws.cell(tot_r, 3, 0)
+        c3z.font = tot_font
+        c3z.number_format = int_fmt
+        c3z.fill = sec_fill
+        z4 = ws.cell(tot_r, 4, 0.0)
+        z4.font = tot_font
+        z4.number_format = cur_fmt
+        z4.fill = sec_fill
+        z5 = ws.cell(tot_r, 5, 0.0)
+        z5.font = tot_font
+        z5.number_format = cur_fmt
+        z5.fill = sec_fill
 
 
 def fill_parcel_report_worksheet(
@@ -950,19 +1278,10 @@ def fill_parcel_report_worksheet(
     show_parents: bool = True,
     show_main: bool = True,
 ) -> None:
-    """Write parcel piece table plus A–F / H–M sections to an existing worksheet."""
+    """Write parcel piece line-item table and a count total row only (no over-10lb / invoice blocks)."""
     conn = db.get_connection()
     try:
         filtered = db.query_parcel_report_rows(
-            conn,
-            start_date,
-            end_date,
-            parent_number,
-            customer_number,
-            show_parents,
-            show_main,
-        )
-        sections = db.compute_parcel_report_af_hm_sections(
             conn,
             start_date,
             end_date,
@@ -1032,10 +1351,6 @@ def fill_parcel_report_worksheet(
         c.font = bold
         c.border = top_border
 
-    tot_row = n + 1
-    section_start = max(15, tot_row + 2)
-    write_parcel_af_hm_sections(ws, section_start, sections)
-
     widths = [12, 30, 30, 28, 18, 25, 6, 12, 12, 8, 25, 20, 42]
     for idx, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(idx)].width = w
@@ -1100,15 +1415,18 @@ def export_parcel_zone_summary_xlsx(
 ) -> Path:
     """Zone × weight workbook from `query_parcel_zone_summary` (CSV retail/EFD rates × DB quantities).
 
-    Layout matches **Parcel Summary Final example.xlsx**: four zone pairs stacked vertically in
-    columns **A–I**, then total cost/savings in **H–I**, then **11–100 lb A–F** and **H–M** blocks.
+    **Sheet 1 — Parcel Invoice:** four zone pairs stacked vertically in columns **A–I**, then total
+    cost/savings in **H–I**, then **over-10lb** and **per-customer invoice** blocks below.
+
+    **Sheet 2 — Parcel Report:** line-item detail only (same as standalone parcel report export);
+    tab title is the date range.
     """
     blocks = summary["blocks"]
     num_blocks = len(blocks)
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "Parcel Summary"
+    ws.title = "Parcel Invoice"
 
     fill_prior = PatternFill("solid", start_color="D9E2F3")
     fill_efd = PatternFill("solid", start_color="D6F5F5")
@@ -1126,7 +1444,7 @@ def export_parcel_zone_summary_xlsx(
     cur_fmt = "$#,##0.00"
     int_fmt = "#,##0"
 
-    raw_title = (summary.get("title_name") or "Parcel Summary").strip()
+    raw_title = (summary.get("title_name") or "Parcel Invoice").strip()
     display_title = (
         raw_title if raw_title.rstrip().endswith("-EFD") else f"{raw_title} -EFD"
     )
@@ -1260,11 +1578,22 @@ def export_parcel_zone_summary_xlsx(
         letter = get_column_letter(col_1)
         cur = ws.column_dimensions[letter].width or 0
         ws.column_dimensions[letter].width = max(cur, w)
-    for col in range(1, 14):
+    for col in range(1, 10):
         letter = get_column_letter(col)
         w = ws.column_dimensions[letter].width or 0
         if col in _AF_HM_MIN_WIDTHS:
             ws.column_dimensions[letter].width = max(w, _AF_HM_MIN_WIDTHS[col])
+
+    ws_report = wb.create_sheet(title=f"{start_date} to {end_date}"[:31])
+    fill_parcel_report_worksheet(
+        ws_report,
+        start_date,
+        end_date,
+        parent_number,
+        customer_number,
+        show_parents,
+        show_main,
+    )
 
     out = Path(
         tempfile.mkstemp(

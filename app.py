@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import os
 import threading
 from pathlib import Path
@@ -62,8 +63,15 @@ def api_system_flats_retail():
     try:
         conn = db.get_connection()
         rows = db.list_flat_retail_rates(conn)
+        presort_reject_unit_cost = db.get_presort_reject_unit_cost(conn)
         conn.close()
-        return jsonify({"rows": rows, "empty": len(rows) == 0})
+        return jsonify(
+            {
+                "rows": rows,
+                "empty": len(rows) == 0,
+                "presort_reject_unit_cost": presort_reject_unit_cost,
+            }
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -75,8 +83,11 @@ def api_system_flats_retail_seed():
         with conn:
             result = db.seed_flat_retail_rates_if_empty(conn)
         rows = db.list_flat_retail_rates(conn)
+        presort_reject_unit_cost = db.get_presort_reject_unit_cost(conn)
         conn.close()
-        return jsonify({"ok": True, **result, "rows": rows})
+        return jsonify(
+            {"ok": True, **result, "rows": rows, "presort_reject_unit_cost": presort_reject_unit_cost}
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -88,12 +99,89 @@ def api_system_flats_retail_update():
         rows = payload.get("rows") or []
         if not isinstance(rows, list):
             return jsonify({"error": "rows must be a list"}), 400
+        pr_raw = payload.get("presort_reject_unit_cost")
         conn = db.get_connection()
         with conn:
             result = db.upsert_flat_retail_rates(conn, rows)
+            if pr_raw is not None and pr_raw != "":
+                try:
+                    pr = float(pr_raw)
+                except (TypeError, ValueError):
+                    conn.close()
+                    return jsonify({"error": "presort_reject_unit_cost must be a number"}), 400
+                db.set_presort_reject_unit_cost(conn, pr)
         out = db.list_flat_retail_rates(conn)
+        presort_reject_unit_cost = db.get_presort_reject_unit_cost(conn)
         conn.close()
-        return jsonify({"ok": True, **result, "rows": out})
+        return jsonify(
+            {
+                "ok": True,
+                **result,
+                "rows": out,
+                "presort_reject_unit_cost": presort_reject_unit_cost,
+            }
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/system/ws3-profiles")
+def api_system_ws3_profiles():
+    try:
+        conn = db.get_connection()
+        profiles = db.list_ws3_profiles(conn)
+        assignment_accounts = db.list_ws3_assignment_accounts(conn)
+        conn.close()
+        return jsonify(
+            {
+                "profiles": profiles,
+                "assignment_accounts": assignment_accounts,
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/system/ws3-profiles", methods=["PUT"])
+def api_system_ws3_profiles_update():
+    payload = request.get_json(silent=True) or {}
+    profile_id = payload.get("profile_id")
+    parent_raw = payload.get("parent_customer_number")
+    reject_raw = payload.get("reject_fee")
+    if profile_id is None:
+        return jsonify({"error": "profile_id required"}), 400
+    try:
+        pid = int(profile_id)
+    except (TypeError, ValueError):
+        return jsonify({"error": "profile_id must be an integer"}), 400
+    parent_num: int | None
+    if parent_raw is None or parent_raw == "":
+        parent_num = None
+    else:
+        try:
+            parent_num = int(parent_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "parent_customer_number must be an integer or null"}), 400
+
+    reject_fee: float | None
+    if reject_raw is None or reject_raw == "":
+        reject_fee = None
+    else:
+        try:
+            reject_fee = float(reject_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "reject_fee must be a number or empty"}), 400
+    try:
+        conn = db.get_connection()
+        with conn:
+            out = db.update_ws3_profile(conn, pid, parent_num, reject_fee)
+        profiles = db.list_ws3_profiles(conn)
+        conn.close()
+        return jsonify({"ok": True, **out, "profiles": profiles})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -170,6 +258,8 @@ def api_postage_row_details():
         return jsonify({"error": "file_date, account_code, mail_class required"}), 400
     if file_date == "Combined":
         return jsonify({"error": "Cannot edit a consolidated row"}), 400
+    if mail_class == db.WS3_REJECT_MAIL_CLASS:
+        return jsonify({"error": "Presort rejects are not editable"}), 400
     try:
         conn = db.get_connection()
         rows = db.get_postage_row_details(conn, file_date, account_code, mail_class)
@@ -431,7 +521,61 @@ def api_export_postage_invoice():
             hide_costs=hide_costs,
             hide_savings=hide_savings,
         )
-        name = f"Postage_Invoice_{pn}_{start}_{end}.xlsx"
+        # Friendly download name: "Customer (1234) Postage invoice M-D-YYYY.xlsx"
+        conn = db.get_connection()
+        row = conn.execute(
+            "SELECT customer_name FROM customers WHERE customer_number = ?",
+            (int(pn),),
+        ).fetchone()
+        conn.close()
+        cust_name = (row["customer_name"] if row else f"Account {pn}").strip()
+        dt = datetime.strptime(end, "%Y-%m-%d")
+        end_label = f"{dt.month}-{dt.day}-{dt.year}"
+        name = f"{cust_name} ({pn}) Postage invoice {end_label}.xlsx"
+        return send_file(
+            out,
+            as_attachment=True,
+            download_name=name,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/export/flats-grid-xlsx")
+def api_export_flats_grid_xlsx():
+    start = request.args.get("start_date")
+    end = request.args.get("end_date")
+    if not start or not end:
+        return jsonify({"error": "start_date and end_date required"}), 400
+    pn = request.args.get("parent_number", type=int)
+    cn = request.args.get("customer_number", type=int)
+    show_parents = _bool_param("show_parents", True)
+    show_main = _bool_param("show_main", True)
+    consolidate = _bool_param("consolidate", False)
+    remove_zeros = _bool_param("remove_zeros", False)
+    hide_costs = _bool_param("hide_costs", False)
+    sort_key = request.args.get("sort_key") or "date"
+    sort_dir = request.args.get("sort_dir", type=int)
+    if sort_dir is None:
+        sort_dir = 1
+    if sort_dir not in (-1, 1):
+        sort_dir = 1
+    try:
+        out = exports.export_flats_data_grid_xlsx(
+            start,
+            end,
+            parent_number=pn,
+            customer_number=cn,
+            show_parents=show_parents,
+            show_main=show_main,
+            consolidate=consolidate,
+            remove_zeros=remove_zeros,
+            hide_costs=hide_costs,
+            sort_key=sort_key,
+            sort_dir=sort_dir,
+        )
+        name = f"Flats_Invoice_{start}_{end}.xlsx"
         return send_file(
             out,
             as_attachment=True,
@@ -461,7 +605,19 @@ def api_export_parcel_report():
             show_parents=show_parents,
             show_main=show_main,
         )
-        name = exports.parcel_report_download_name(start, end, pn, cn)
+        if pn is None:
+            name = exports.parcel_report_download_name(start, end, pn, cn)
+        else:
+            conn = db.get_connection()
+            row = conn.execute(
+                "SELECT customer_name FROM customers WHERE customer_number = ?",
+                (int(pn),),
+            ).fetchone()
+            conn.close()
+            cust_name = (row["customer_name"] if row else f"Account {pn}").strip()
+            dt = datetime.strptime(end, "%Y-%m-%d")
+            end_label = f"{dt.month}-{dt.day}-{dt.year}"
+            name = f"{cust_name} ({pn}) Parcel Invoice {end_label}.xlsx"
         return send_file(
             out,
             as_attachment=True,
@@ -535,7 +691,7 @@ def api_export_consolidated_volumes_xlsx():
             hide_costs_summary=hide_summary_money,
             account_scope_label=scope,
         )
-        name = exports_consolidated_volumes.consolidated_volumes_download_name(start, end)
+        name = exports_consolidated_volumes.consolidated_volumes_download_name(scope, end)
         return send_file(
             out,
             as_attachment=True,
@@ -580,8 +736,11 @@ def api_export_parcel_zone_summary():
             show_parents=show_parents,
             show_main=show_main,
         )
-        scope = exports.parcel_report_scope_label(pn, cn)
-        name = f"Parcel_Zone_Summary_{scope}_{start}_{end}.xlsx"
+        name = exports.parcel_invoice_download_name(
+            title_name=summary.get("title_name"),
+            parent_number=pn,
+            end_date=end,
+        )
         return send_file(
             out,
             as_attachment=True,

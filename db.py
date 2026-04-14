@@ -131,6 +131,11 @@ CREATE TABLE IF NOT EXISTS parcel_costs (
 CREATE INDEX IF NOT EXISTS idx_parcel_costs_lookup
     ON parcel_costs(service_type, weight_min_oz, weight_max_oz, zone);
 
+CREATE TABLE IF NOT EXISTS app_settings (
+    key         TEXT PRIMARY KEY NOT NULL,
+    value_real  REAL
+);
+
 CREATE TABLE IF NOT EXISTS billing_imports (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     billing_id  TEXT    NOT NULL UNIQUE,
@@ -245,14 +250,119 @@ CREATE INDEX IF NOT EXISTS idx_billing_account   ON billing_records(custom_accou
 CREATE INDEX IF NOT EXISTS idx_billing_timestamp ON billing_records(time_stamp);
 CREATE INDEX IF NOT EXISTS idx_billing_zone      ON billing_records(zone);
 CREATE INDEX IF NOT EXISTS idx_billing_class     ON billing_records(usps_mail_class);
+
+CREATE TABLE IF NOT EXISTS ws3_netsort_customers (
+    customer_code TEXT PRIMARY KEY,
+    customer_name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ws3_mail_runs (
+    run_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    mail_date    TEXT NOT NULL,
+    mail_id      TEXT NOT NULL DEFAULT '',
+    run_datetime TEXT,
+    source_file_name TEXT,
+    UNIQUE (mail_date, mail_id)
+);
+
+CREATE TABLE IF NOT EXISTS ws3_profiles (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_name            TEXT NOT NULL UNIQUE,
+    parent_customer_number  INTEGER REFERENCES customers (customer_number),
+    reject_fee              REAL
+);
+
+CREATE TABLE IF NOT EXISTS ws3_mail_detail (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           INTEGER NOT NULL REFERENCES ws3_mail_runs (run_id) ON DELETE CASCADE,
+    profile_id       INTEGER NOT NULL REFERENCES ws3_profiles (id),
+    customer_code    TEXT NOT NULL REFERENCES ws3_netsort_customers (customer_code),
+    rate_type        TEXT NOT NULL,
+    postage_claimed  REAL,
+    postage_applied  REAL,
+    num_pieces       INTEGER,
+    pcs_accepted     INTEGER,
+    pcs_rejected     INTEGER,
+    cost_per_piece   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_ws3_detail_run ON ws3_mail_detail (run_id);
+CREATE INDEX IF NOT EXISTS idx_ws3_detail_profile ON ws3_mail_detail (profile_id);
+
+CREATE TABLE IF NOT EXISTS ws3_imports (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_name    TEXT NOT NULL UNIQUE,
+    mail_date    TEXT NOT NULL,
+    run_id       INTEGER NOT NULL REFERENCES ws3_mail_runs (run_id) ON DELETE CASCADE,
+    row_count    INTEGER,
+    imported_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS ws3_parent_daily_rejects (
+    mail_date                TEXT    NOT NULL,
+    parent_customer_number   INTEGER NOT NULL REFERENCES customers (customer_number),
+    reject_count             INTEGER NOT NULL,
+    updated_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (mail_date, parent_customer_number)
+);
+CREATE INDEX IF NOT EXISTS idx_ws3_rejects_date ON ws3_parent_daily_rejects (mail_date);
 """
+
+
+# Sentinel mail_class for WS3 presort reject totals on the postage dashboard.
+WS3_REJECT_MAIL_CLASS = "Presort rejects"
+
+# Invoice / billing: per-piece charge for WS3 presort rejects (editable on System page).
+PRESORT_REJECT_UNIT_COST_KEY = "presort_reject_unit_cost"
+DEFAULT_PRESORT_REJECT_UNIT_COST = 0.66
 
 
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    _ensure_app_settings(conn)
     return conn
+
+
+def _migrate_ws3_profiles_reject_fee(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("ALTER TABLE ws3_profiles ADD COLUMN reject_fee REAL")
+    except sqlite3.OperationalError:
+        pass
+
+
+def _ensure_app_settings(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key         TEXT PRIMARY KEY NOT NULL,
+            value_real  REAL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO app_settings (key, value_real)
+        VALUES (?, ?)
+        """,
+        (PRESORT_REJECT_UNIT_COST_KEY, DEFAULT_PRESORT_REJECT_UNIT_COST),
+    )
+
+
+def clamp_negative_ws3_reject_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """
+    Data repair: WS3 reject counts must never be negative.
+
+    Older imports could produce negative values when pcs_accepted > num_pieces.
+    """
+    cur = conn.cursor()
+    cur.execute("UPDATE ws3_mail_detail SET pcs_rejected = 0 WHERE pcs_rejected < 0")
+    detail_updated = int(cur.rowcount or 0)
+    cur.execute(
+        "UPDATE ws3_parent_daily_rejects SET reject_count = 0 WHERE reject_count < 0"
+    )
+    parent_updated = int(cur.rowcount or 0)
+    return {"ws3_mail_detail": detail_updated, "ws3_parent_daily_rejects": parent_updated}
 
 
 def init_db() -> None:
@@ -260,6 +370,9 @@ def init_db() -> None:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    _migrate_ws3_profiles_reject_fee(conn)
+    _ensure_app_settings(conn)
+    clamp_negative_ws3_reject_counts(conn)
     conn.commit()
     conn.close()
 
@@ -279,6 +392,76 @@ def list_flat_retail_rates(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         }
         for r in cur.fetchall()
     ]
+
+
+def get_presort_reject_unit_cost(conn: sqlite3.Connection) -> float:
+    """Per-piece presort reject charge used on the postage invoice (default $0.66)."""
+    row = conn.execute(
+        "SELECT value_real FROM app_settings WHERE key = ?",
+        (PRESORT_REJECT_UNIT_COST_KEY,),
+    ).fetchone()
+    if row is None or row["value_real"] is None:
+        return float(DEFAULT_PRESORT_REJECT_UNIT_COST)
+    return float(row["value_real"])
+
+
+def set_presort_reject_unit_cost(conn: sqlite3.Connection, cost_per_piece: float) -> None:
+    if cost_per_piece < 0:
+        raise ValueError("presort reject unit cost must be non-negative")
+    conn.execute(
+        """
+        INSERT INTO app_settings (key, value_real) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value_real = excluded.value_real
+        """,
+        (PRESORT_REJECT_UNIT_COST_KEY, float(cost_per_piece)),
+    )
+
+
+def query_ws3_presort_reject_count_for_invoice(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    parent_number: int,
+    customer_number: int | None,
+    show_parents: bool,
+    show_main: bool,
+) -> int:
+    """
+    Total WS3 presort reject pieces in range for the same scope as the postage invoice
+    (parent / optional child, show_parents / show_main).
+    """
+    par = "par"
+    conditions: list[str] = ["r.mail_date BETWEEN ? AND ?"]
+    params: list[Any] = [start_date, end_date]
+
+    conditions.append(f"({par}.parent_number = ? OR {par}.customer_number = ?)")
+    params.extend([parent_number, parent_number])
+
+    if customer_number is not None:
+        ep = effective_parent_account_for_ws3(conn, customer_number)
+        conditions.append("r.parent_customer_number = ?")
+        params.append(ep)
+
+    if not show_parents:
+        conditions.append(
+            f"""{par}.customer_number NOT IN (
+            SELECT DISTINCT parent_number FROM customers WHERE parent_number IS NOT NULL
+        )"""
+        )
+    if not show_main:
+        conditions.append(
+            f"NOT ({par}.parent_number IS NULL AND {par}.parent_name IS NULL)"
+        )
+
+    where_sql = " AND ".join(conditions)
+    sql = f"""
+        SELECT COALESCE(SUM(r.reject_count), 0) AS cnt
+        FROM ws3_parent_daily_rejects r
+        JOIN customers {par} ON {par}.customer_number = r.parent_customer_number
+        WHERE {where_sql}
+    """
+    row = conn.execute(sql, params).fetchone()
+    return int(row["cnt"] or 0)
 
 
 def seed_flat_retail_rates_if_empty(
@@ -501,6 +684,309 @@ def postage_scope_where_clause(
     return " AND ".join(conditions), params
 
 
+def effective_parent_account_for_ws3(conn: sqlite3.Connection, customer_number: int) -> int:
+    """Parent account used for WS3 presort reject rollup when filtering by a child or parent."""
+    r = conn.execute(
+        "SELECT parent_number, customer_number FROM customers WHERE customer_number = ?",
+        (int(customer_number),),
+    ).fetchone()
+    if not r:
+        return int(customer_number)
+    if r["parent_number"] is not None:
+        return int(r["parent_number"])
+    return int(r["customer_number"])
+
+
+def recompute_ws3_parent_rejects_for_mail_dates(
+    conn: sqlite3.Connection, mail_dates: list[str]
+) -> None:
+    """Rebuild ws3_parent_daily_rejects for each mail_date from detail + profile parent links."""
+    for md in mail_dates:
+        conn.execute("DELETE FROM ws3_parent_daily_rejects WHERE mail_date = ?", (md,))
+        conn.execute(
+            """
+            INSERT INTO ws3_parent_daily_rejects (mail_date, parent_customer_number, reject_count)
+            SELECT r.mail_date, pr.parent_customer_number, COALESCE(SUM(d.pcs_rejected), 0)
+            FROM ws3_mail_detail d
+            JOIN ws3_profiles pr ON d.profile_id = pr.id
+            JOIN ws3_mail_runs r ON d.run_id = r.run_id
+            WHERE r.mail_date = ? AND pr.parent_customer_number IS NOT NULL
+            GROUP BY r.mail_date, pr.parent_customer_number
+            """,
+            (md,),
+        )
+
+
+def recompute_ws3_rejects_for_profile(conn: sqlite3.Connection, profile_id: int) -> None:
+    cur = conn.execute(
+        """
+        SELECT DISTINCT r.mail_date
+        FROM ws3_mail_detail d
+        JOIN ws3_mail_runs r ON d.run_id = r.run_id
+        WHERE d.profile_id = ?
+        """,
+        (int(profile_id),),
+    )
+    dates = [str(row[0]) for row in cur.fetchall() if row[0]]
+    recompute_ws3_parent_rejects_for_mail_dates(conn, dates)
+
+
+def list_ws3_profiles(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    cur = conn.execute(
+        """
+        SELECT p.id, p.profile_name, p.parent_customer_number, p.reject_fee,
+               par.customer_name AS parent_customer_name
+        FROM ws3_profiles p
+        LEFT JOIN customers par ON par.customer_number = p.parent_customer_number
+        ORDER BY p.profile_name COLLATE NOCASE
+        """
+    )
+    out: list[dict[str, Any]] = []
+    for r in cur.fetchall():
+        rf = r["reject_fee"]
+        out.append(
+            {
+                "id": int(r["id"]),
+                "profile_name": r["profile_name"] or "",
+                "parent_customer_number": (
+                    int(r["parent_customer_number"])
+                    if r["parent_customer_number"] is not None
+                    else None
+                ),
+                "parent_customer_name": (r["parent_customer_name"] or "").strip()
+                if r["parent_customer_name"]
+                else None,
+                "reject_fee": round(float(rf), 4) if rf is not None else None,
+            }
+        )
+    return out
+
+
+def list_ws3_assignment_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """
+    All customers, labeled for the UI:
+
+    - **parent** — at least one other account lists this number as `parent_number`.
+    - **main** — no child accounts (nothing uses this `customer_number` as `parent_number`).
+
+    Every account is exactly one of these two.
+    """
+    cur = conn.execute(
+        """
+        SELECT customer_number, customer_name FROM customers ORDER BY customer_name COLLATE NOCASE
+        """
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    cur = conn.execute(
+        """
+        SELECT DISTINCT parent_number FROM customers WHERE parent_number IS NOT NULL
+        """
+    )
+    parents_of_someone = {int(r[0]) for r in cur.fetchall() if r[0] is not None}
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        cn = int(r["customer_number"])
+        nm = (r["customer_name"] or "").strip() or f"Account {cn}"
+        kind = "parent" if cn in parents_of_someone else "main"
+        out.append(
+            {
+                "customer_number": cn,
+                "customer_name": nm,
+                "kind": kind,
+            }
+        )
+    out.sort(
+        key=lambda x: (
+            0 if x["kind"] == "parent" else 1,
+            (x["customer_name"] or "").casefold(),
+            x["customer_number"],
+        )
+    )
+    return out
+
+
+def customer_allowed_for_ws3_assignment(conn: sqlite3.Connection, customer_number: int) -> bool:
+    r = conn.execute(
+        "SELECT 1 FROM customers WHERE customer_number = ? LIMIT 1",
+        (int(customer_number),),
+    ).fetchone()
+    return r is not None
+
+
+def update_ws3_profile(
+    conn: sqlite3.Connection,
+    profile_id: int,
+    parent_customer_number: int | None,
+    reject_fee: float | None,
+) -> dict[str, Any]:
+    if parent_customer_number is not None:
+        if not customer_allowed_for_ws3_assignment(conn, parent_customer_number):
+            raise ValueError(
+                "Parent account must be a parent company or a standalone main account (not a child)"
+            )
+        ex = conn.execute(
+            "SELECT 1 FROM customers WHERE customer_number = ?",
+            (int(parent_customer_number),),
+        ).fetchone()
+        if not ex:
+            raise ValueError(f"Customer {parent_customer_number} does not exist")
+    if reject_fee is not None and reject_fee < 0:
+        raise ValueError("reject_fee must be non-negative")
+    conn.execute(
+        """
+        UPDATE ws3_profiles
+        SET parent_customer_number = ?, reject_fee = ?
+        WHERE id = ?
+        """,
+        (parent_customer_number, reject_fee, int(profile_id)),
+    )
+    recompute_ws3_rejects_for_profile(conn, profile_id)
+    return {"ok": True, "profile_id": int(profile_id)}
+
+
+def update_ws3_profile_parent(
+    conn: sqlite3.Connection, profile_id: int, parent_customer_number: int | None
+) -> dict[str, Any]:
+    """Backward-compatible: preserves existing reject_fee."""
+    row = conn.execute(
+        "SELECT reject_fee FROM ws3_profiles WHERE id = ?", (int(profile_id),)
+    ).fetchone()
+    if not row:
+        raise ValueError(f"Profile {profile_id} not found")
+    fee = float(row["reject_fee"]) if row["reject_fee"] is not None else None
+    return update_ws3_profile(conn, profile_id, parent_customer_number, fee)
+
+
+def _ws3_reject_rows_for_postage(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    parent_number: int | None,
+    customer_number: int | None,
+    show_parents: bool,
+    show_main: bool,
+    consolidate: bool,
+    remove_zeros: bool,
+    hide_costs: bool,
+) -> list[dict[str, Any]]:
+    """Synthetic postage-shaped rows from ws3_parent_daily_rejects."""
+    par = "par"
+    conditions: list[str] = [f"r.mail_date BETWEEN ? AND ?"]
+    params: list[Any] = [start_date, end_date]
+
+    if parent_number is not None:
+        conditions.append(f"({par}.parent_number = ? OR {par}.customer_number = ?)")
+        params.extend([parent_number, parent_number])
+    if customer_number is not None:
+        ep = effective_parent_account_for_ws3(conn, customer_number)
+        conditions.append("r.parent_customer_number = ?")
+        params.append(ep)
+
+    if not show_parents:
+        conditions.append(
+            f"""{par}.customer_number NOT IN (
+            SELECT DISTINCT parent_number FROM customers WHERE parent_number IS NOT NULL
+        )"""
+        )
+    if not show_main:
+        conditions.append(
+            f"NOT ({par}.parent_number IS NULL AND {par}.parent_name IS NULL)"
+        )
+
+    where_sql = " AND ".join(conditions)
+
+    if consolidate:
+        sql = f"""
+        SELECT r.parent_customer_number,
+               SUM(r.reject_count) AS reject_count,
+               {par}.customer_name AS par_name,
+               {par}.parent_number AS par_parent_number,
+               {par}.parent_name AS par_parent_name
+        FROM ws3_parent_daily_rejects r
+        JOIN customers {par} ON {par}.customer_number = r.parent_customer_number
+        WHERE {where_sql}
+        GROUP BY r.parent_customer_number, {par}.customer_name, {par}.parent_number, {par}.parent_name
+        """
+    else:
+        sql = f"""
+        SELECT r.mail_date, r.parent_customer_number, r.reject_count,
+               {par}.customer_name AS par_name,
+               {par}.parent_number AS par_parent_number,
+               {par}.parent_name AS par_parent_name
+        FROM ws3_parent_daily_rejects r
+        JOIN customers {par} ON {par}.customer_number = r.parent_customer_number
+        WHERE {where_sql}
+        """
+
+    cur = conn.execute(sql, params)
+    raw_rows = cur.fetchall()
+
+    oz_keys = [f"oz_{i}" for i in range(14)] + ["oz_13plus"]
+    out: list[dict[str, Any]] = []
+    for r in raw_rows:
+        if consolidate:
+            rc = int(r["reject_count"] or 0)
+            if remove_zeros and rc == 0:
+                continue
+            pn = int(r["parent_customer_number"])
+            par_name = r["par_name"] or ""
+            parent_disp = (r["par_parent_name"] or "").strip() or par_name
+            parent_num = (
+                int(r["par_parent_number"])
+                if r["par_parent_number"] is not None
+                else pn
+            )
+            item: dict[str, Any] = {
+                "date": "Combined",
+                "parent_name": parent_disp,
+                "parent_number": parent_num,
+                "child_name": par_name,
+                "child_number": pn,
+                "mail_class": WS3_REJECT_MAIL_CLASS,
+                **{k: 0 for k in oz_keys},
+                "total_qty": rc,
+            }
+        else:
+            rc = int(r["reject_count"] or 0)
+            if remove_zeros and rc == 0:
+                continue
+            pn = int(r["parent_customer_number"])
+            par_name = r["par_name"] or ""
+            parent_disp = (r["par_parent_name"] or "").strip() or par_name
+            parent_num = (
+                int(r["par_parent_number"])
+                if r["par_parent_number"] is not None
+                else pn
+            )
+            fd = r["mail_date"]
+            date_str = str(fd) if fd is not None else ""
+            item = {
+                "date": date_str,
+                "parent_name": parent_disp,
+                "parent_number": parent_num,
+                "child_name": par_name,
+                "child_number": pn,
+                "mail_class": WS3_REJECT_MAIL_CLASS,
+                **{k: 0 for k in oz_keys},
+                "total_qty": rc,
+            }
+        if not hide_costs:
+            item["total_cost"] = 0.0
+        out.append(item)
+
+    out.sort(
+        key=lambda x: (
+            x["date"] == "Combined",
+            str(x["date"]),
+            (x["parent_name"] or "").casefold(),
+            (x["child_name"] or "").casefold(),
+            (x["mail_class"] or "").casefold(),
+        )
+    )
+    return out
+
+
 def query_postage(
     conn: sqlite3.Connection,
     start_date: str,
@@ -595,6 +1081,32 @@ def query_postage(
         rows.append(item)
         total_pieces += tq
         total_cost_sum += tc
+
+    rej_rows = _ws3_reject_rows_for_postage(
+        conn,
+        start_date,
+        end_date,
+        parent_number,
+        customer_number,
+        show_parents,
+        show_main,
+        consolidate,
+        remove_zeros,
+        hide_costs,
+    )
+    for rj in rej_rows:
+        rows.append(rj)
+        total_pieces += int(rj.get("total_qty") or 0)
+
+    rows.sort(
+        key=lambda x: (
+            x["date"] == "Combined",
+            str(x["date"]),
+            (x["parent_name"] or "").casefold(),
+            (x["child_name"] or "").casefold(),
+            (x["mail_class"] or "").casefold(),
+        )
+    )
 
     out: dict[str, Any] = {
         "total_records": len(rows),
@@ -1186,11 +1698,22 @@ def compute_parcel_report_af_hm_sections(
     show_main: bool,
 ) -> dict[str, Any]:
     """
-    A–F block: aggregates for 11–100 lb by (lb, zone) with Base/EFD from heavy_parcel_rates.csv.
-    H–M block: per-customer totals using CSV rates per piece, else billing_amount / (retail − billed).
+    Over-10lb block: aggregates for 11–100 lb by (customer, lb, zone) with Base/EFD from
+    heavy_parcel_rates.csv; each row includes **customer_name** for column A in the export.
+
+    Per-customer **cost** and **savings** use the same rules as ``query_parcel_zone_summary``:
+    ``parcel summary.csv`` retail and EFD at ``(zone, lb_row)`` where
+    ``lb_row = min(int(_parcel_lb_bucket(weight_oz)), 10)``. So 11+ lb pieces use the **10 lb**
+    row from the parcel summary (not heavy_parcel_rates). That keeps customer totals aligned with
+    the zone grid footer **Total cost** / **Savings**.
+
+    If no parcel-summary rate exists for that cell, falls back to ``billing_amount`` and
+    ``fully_paid_postage - billing_amount`` (same spirit as unrated rows elsewhere).
+
     Customer **name** is ``customers.customer_name`` for ``custom_account_code``, not billing ``account_name``.
     """
-    rates = get_heavy_parcel_rates()
+    parcel_rates = get_parcel_summary_rates()
+    heavy_rates = get_heavy_parcel_rates()
     where_sql, params = _parcel_billing_filters(
         start_date,
         end_date,
@@ -1211,7 +1734,7 @@ def compute_parcel_report_af_hm_sections(
     )
 
     grand_total_qty = 0
-    heavy_groups: dict[tuple[int, int], dict[str, Any]] = {}
+    heavy_groups: dict[tuple[Any, int, int], dict[str, Any]] = {}
     customers: dict[Any, dict[str, Any]] = {}
 
     for row in cur:
@@ -1226,13 +1749,17 @@ def compute_parcel_report_af_hm_sections(
         if not name:
             name = f"Account {acc}" if acc is not None else "(no name)"
 
-        rate = None
-        if z is not None and lb is not None:
-            rate = rates.get((z, lb))
-        if rate:
-            base_r, efd_r = rate
-            cost_p = efd_r
-            sav_p = base_r - efd_r
+        bkt = _parcel_lb_bucket(row["weight_oz"])
+        if z is not None and bkt is not None:
+            lb_row = min(int(bkt), 10)
+            pr = parcel_rates.get((z, lb_row))
+            if pr:
+                retail_p, efd_p = pr
+                cost_p = efd_p
+                sav_p = retail_p - efd_p
+            else:
+                cost_p = bill
+                sav_p = fp - bill
         else:
             cost_p = bill
             sav_p = fp - bill
@@ -1251,21 +1778,37 @@ def compute_parcel_report_af_hm_sections(
         customers[ck]["savings"] += sav_p
 
         if z is not None and lb is not None and 11 <= lb <= 100:
-            gk = (lb, z)
+            gk = (acc, lb, z)
             if gk not in heavy_groups:
-                heavy_groups[gk] = {"count": 0, "sum_fp": 0.0, "sum_bill": 0.0}
+                heavy_groups[gk] = {
+                    "count": 0,
+                    "sum_fp": 0.0,
+                    "sum_bill": 0.0,
+                    "customer_name": name,
+                }
             g = heavy_groups[gk]
             g["count"] += 1
             g["sum_fp"] += fp
             g["sum_bill"] += bill
 
+    def _heavy_row_sort_key(gk: tuple[Any, int, int]) -> tuple:
+        acc, lb, z = gk
+        g = heavy_groups[gk]
+        nm = (g.get("customer_name") or "").lower()
+        try:
+            an = int(acc) if acc is not None else 0
+        except (TypeError, ValueError):
+            an = 0
+        return (nm, an, lb, z)
+
     heavy_rows: list[dict[str, Any]] = []
-    for lb, z in sorted(heavy_groups.keys(), key=lambda x: (x[0], x[1])):
-        g = heavy_groups[(lb, z)]
+    for gk in sorted(heavy_groups.keys(), key=_heavy_row_sort_key):
+        acc, lb, z = gk
+        g = heavy_groups[gk]
         cnt = g["count"]
         if cnt <= 0:
             continue
-        rt = rates.get((z, lb))
+        rt = heavy_rates.get((z, lb))
         if rt:
             base, efd = rt
             savings = (base - efd) * cnt
@@ -1275,6 +1818,8 @@ def compute_parcel_report_af_hm_sections(
             savings = g["sum_fp"] - g["sum_bill"]
         heavy_rows.append(
             {
+                "customer_name": g.get("customer_name") or "(no name)",
+                "customer_number": acc,
                 "count": cnt,
                 "lbs": lb,
                 "zone": z,

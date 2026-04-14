@@ -149,7 +149,7 @@
     return hideCosts ? 1 : 2;
   }
 
-  /** Shared column layout for Postage grid and flats CSV export (no parent/child #, no savings). */
+  /** Shared column layout for Postage grid (no parent/child #, no savings). */
   function postageTableColumns(hideCosts) {
     const ozKeys = [];
     for (let i = 0; i <= 12; i++) ozKeys.push(`oz_${i}`);
@@ -189,17 +189,6 @@
     const x = Number(n);
     if (Number.isNaN(x)) return "";
     return (Math.round(x * 100) / 100).toFixed(2);
-  }
-
-  function postageCsvCell(row, k) {
-    const v = row[k];
-    if (k === "total_cost") {
-      if (v == null || v === "") return "";
-      return csvMoneyRounded(v);
-    }
-    if (k.startsWith("oz_") || k === "total_qty") return String(Number(v) || 0);
-    if (typeof v === "number") return String(v);
-    return v != null ? String(v) : "";
   }
 
   /**
@@ -298,25 +287,6 @@
     return v != null ? String(v) : "";
   }
 
-  /** Lines (including header) for the flats CSV, or null if no rows. Shared with consolidated export. */
-  function buildFlatsCsvLines() {
-    const data = state.postageData;
-    if (!data || !(data.rows || []).length) return null;
-    const hideCosts = $("hideCosts").checked;
-    const { headerKeys, headers } = postageTableColumns(hideCosts);
-    const discount = parseFlatsDiscount();
-    const rowsWithSavings = (data.rows || []).map((r) => ({
-      ...r,
-      savings: (Number(r.total_qty) || 0) * discount,
-    }));
-    const rows = sortRows(rowsWithSavings, state.sortPostage.key, state.sortPostage.dir);
-    const lines = [headers.map((h) => csvEscape(h)).join(",")];
-    for (const row of rows) {
-      lines.push(headerKeys.map((k) => csvEscape(postageCsvCell(row, k))).join(","));
-    }
-    return lines;
-  }
-
   function findBlockSideForZone(blocks, z) {
     for (const block of blocks) {
       if (block.zone_a === z) return { block, side: "a" };
@@ -379,6 +349,38 @@
     return t || "All Accounts";
   }
 
+  function fmtFilenameDate(isoDate) {
+    // Input is yyyy-mm-dd from <input type="date">. Output is m-d-yyyy.
+    if (!isoDate) return "";
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(isoDate).trim());
+    if (!m) return String(isoDate).trim();
+    const y = m[1];
+    const mm = String(parseInt(m[2], 10));
+    const dd = String(parseInt(m[3], 10));
+    return `${mm}-${dd}-${y}`;
+  }
+
+  function safeFilename(name) {
+    return String(name || "")
+      .replace(/[\\/:*?"<>|]/g, "-")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function selectedAccountRow() {
+    const sel = $("selectAccount");
+    const opt = sel && sel.selectedOptions && sel.selectedOptions[0];
+    if (!opt || !opt.value) return null;
+    const n = parseInt(opt.value, 10);
+    if (Number.isNaN(n)) return null;
+    for (const kind of ["parent", "child", "standalone"]) {
+      const rows = state.accountsByKind[kind] || [];
+      const hit = rows.find((r) => Number(r.customer_number) === n);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
   function downloadParcelsCsv() {
     const lines = buildParcelsCsvLines();
     if (!lines) {
@@ -389,23 +391,6 @@
     const start = $("startDate").value || "start";
     const end = $("endDate").value || "end";
     const name = `parcels_counts_${start}_${end}.csv`;
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = name;
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }
-
-  function downloadFlatsSavingsCsv() {
-    const lines = buildFlatsCsvLines();
-    if (!lines) {
-      alert("Load postage data first (no rows to export).");
-      return;
-    }
-    const blob = new Blob([lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
-    const start = $("startDate").value || "start";
-    const end = $("endDate").value || "end";
-    const name = `flats_report_${start}_${end}.csv`;
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = name;
@@ -509,6 +494,7 @@
         const childNumRaw = tr.getAttribute("data-child-number") || "";
         const mailClass = tr.getAttribute("data-mail-class") || "";
         if (!date || date === "Combined") return;
+        if (mailClass === "Presort rejects") return;
         const cn = parseInt(childNumRaw, 10);
         if (Number.isNaN(cn) || !mailClass) return;
         state.selectedPostage = { date, child_number: cn, mail_class: mailClass };
@@ -1255,11 +1241,36 @@
     }
   });
 
-  $("btnExportFlatsSavings").addEventListener("click", () => {
+  $("btnExportFlatsSavings").addEventListener("click", async () => {
+    if (!state.postageData || !(state.postageData.rows || []).length) {
+      alert("Load postage data first (no rows to export).");
+      return;
+    }
     const btn = $("btnExportFlatsSavings");
     setExportLoading(btn, true);
     try {
-      downloadFlatsSavingsCsv();
+      const p = queryParams();
+      p.set("sort_key", state.sortPostage.key || "date");
+      p.set("sort_dir", String(state.sortPostage.dir || 1));
+      const r = await fetch("/api/export/flats-grid-xlsx?" + p.toString());
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || "Export failed");
+      }
+      const blob = await r.blob();
+      const endLabel = fmtFilenameDate($("endDate").value) || "end";
+      const acct = selectedAccountRow();
+      const acctLabel = acct
+        ? `${acct.customer_name} (${fmtId(acct.customer_number)})`
+        : "All Accounts";
+      const name = safeFilename(`${acctLabel} Flats Report ${endLabel}`) + ".xlsx";
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (e) {
+      alert(String(e.message || e));
     } finally {
       setExportLoading(btn, false);
     }
@@ -1352,7 +1363,7 @@
       const blob = await r.blob();
       const name =
         filenameFromContentDisposition(r.headers.get("Content-Disposition") || "") ||
-        "parcel_zone_summary.xlsx";
+        "parcel_invoice.xlsx";
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
       a.download = name;

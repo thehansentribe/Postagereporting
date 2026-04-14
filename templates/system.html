@@ -24,10 +24,37 @@
       <h2 class="system-section-title">Flats retail cost</h2>
       <p class="system-hint">
         Edit the Retail value for each weight tier (oz). This updates <code>flat_rate_costs.rate_retail</code>.
+        Presort reject charge (per piece) is used on the postage invoice for WS3 reject counts (row under 13 oz,
+        cost centers, totals).
+      </p>
+      <p class="system-hint system-inline-field">
+        <label for="presortRejectUnitCost">Presort reject charge ($ / piece)</label>
+        <input
+          type="text"
+          id="presortRejectUnitCost"
+          class="system-money-input"
+          inputmode="decimal"
+          placeholder="0.66"
+          style="max-width: 8rem"
+        />
       </p>
       <div class="table-wrap">
         <div class="table-scroll">
           <div id="flatsRetailTable"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">WS3 profile → parent account</h2>
+      <p class="system-hint">
+        Map each NetSort profile to a rollup account (parent company or main account) and set an optional
+        <strong>reject fee</strong> (e.g. per reject). Parent accounts have child accounts; main accounts have none.
+        Import WS3 Customer Mail Detail files via <code>input/</code> first; then configure here.
+      </p>
+      <div class="table-wrap">
+        <div class="table-scroll">
+          <div id="ws3ProfilesTable"></div>
         </div>
       </div>
     </section>

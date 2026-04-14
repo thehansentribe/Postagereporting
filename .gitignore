@@ -14,3 +14,7 @@ htmlcov/
 .DS_Store
 ~$*.xlsx
 ~$*.xls
+
+# Generated/import artifacts (keep repo lightweight)
+processed/
+reports/

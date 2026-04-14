@@ -11,6 +11,7 @@ from pathlib import Path
 
 import db
 import importer
+import ws3_mail_detail
 
 ROOT = Path(__file__).resolve().parent
 INPUT_DIR = ROOT / "input"
@@ -71,6 +72,15 @@ def _is_bm_raw_export(name: str) -> bool:
     return suf in (".csv", ".xlsx", ".xls")
 
 
+def _is_ws3_customer_mail_detail(name: str) -> bool:
+    """NetSort WS3 FCFL Customer Mail Detail (xls/xlsx)."""
+    low = name.lower().replace(" ", "")
+    suf = Path(name).suffix.lower()
+    if suf not in (".xls", ".xlsx"):
+        return False
+    return "ws3_fcfl_customermaildetail" in low
+
+
 def process_one_file(path: Path) -> dict:
     """Import a single file; raises on failure. Does not move file."""
     name = path.name
@@ -87,6 +97,11 @@ def process_one_file(path: Path) -> dict:
     if _is_bm_raw_export(name):
         ensure_dirs()
         return importer.process_bm_file(str(path), db_path, csv_out_dir=str(REPORTS_DIR))
+    if _is_ws3_customer_mail_detail(name):
+        ensure_dirs()
+        return ws3_mail_detail.process_ws3_mail_detail_file(
+            str(path), db_path, csv_out_path=str(REPORTS_DIR / "mail_detail_export.csv")
+        )
 
     raise ValueError(f"Unrecognized file type: {name}")
 
