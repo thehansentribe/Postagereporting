@@ -24,8 +24,8 @@
       <h2 class="system-section-title">Flats retail cost</h2>
       <p class="system-hint">
         Edit the Retail value for each weight tier (oz). This updates <code>flat_rate_costs.rate_retail</code>.
-        Presort reject charge (per piece) is used on the postage invoice for WS3 reject counts (row under 13 oz,
-        cost centers, totals).
+        Presort reject charge (per piece) is used on the postage invoice for WS3 reject counts (distributed across
+        1–13 oz and cost centers by flat volume; included in totals).
       </p>
       <p class="system-hint system-inline-field">
         <label for="presortRejectUnitCost">Presort reject charge ($ / piece)</label>
@@ -55,6 +55,19 @@
       <div class="table-wrap">
         <div class="table-scroll">
           <div id="ws3ProfilesTable"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Unmatched accounts → create/assign</h2>
+      <p class="system-hint">
+        When imports contain a customer number that is not in <code>customers</code>, it shows as <strong>Unmatched</strong>.
+        Use this table to give the number a name and optionally associate it to a parent account.
+      </p>
+      <div class="table-wrap">
+        <div class="table-scroll">
+          <div id="unmatchedAccountsTable"></div>
         </div>
       </div>
     </section>

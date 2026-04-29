@@ -9,7 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +90,34 @@ def parse_bm_date(filename: str) -> str:
     month, day, year_2d = int(m.group(1)), int(m.group(2)), int(m.group(3))
     year = 2000 + year_2d if year_2d < 100 else year_2d
     return date(year, month, day).isoformat()
+
+
+def read_bm_report_date_from_xlsx(xlsx_path: str) -> str:
+    """
+    Read the Business Manager report date from the sheet itself.
+
+    The BM/DM Weight Break report embeds the date in cells P3 and S3.
+    Those cells must match; otherwise the import is rejected.
+    """
+    wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+        p3_raw = ws["P3"].value
+        s3_raw = ws["S3"].value
+    finally:
+        wb.close()
+
+    p3 = _parse_effective_date_any(p3_raw)
+    s3 = _parse_effective_date_any(s3_raw)
+    base = os.path.basename(xlsx_path)
+
+    if not p3 or not s3:
+        raise ValueError(
+            f"Cannot parse BM report date from P3/S3 in {base}: P3={p3_raw!r} S3={s3_raw!r}"
+        )
+    if p3 != s3:
+        raise ValueError(f"BM report date mismatch in {base}: P3={p3} S3={s3}")
+    return p3
 
 
 def _find_libreoffice_executable() -> str | None:
@@ -262,9 +290,14 @@ def write_report_csv(rows: list[dict[str, Any]], source_path: str, out_dir: str)
     return out_path
 
 
-def import_bm_csv(csv_path: str, db_path: Path | str) -> dict[str, Any]:
+def import_bm_csv(
+    csv_path: str,
+    db_path: Path | str,
+    *,
+    file_date_override: str | None = None,
+) -> dict[str, Any]:
     file_name = os.path.basename(csv_path)
-    file_date = parse_bm_date(file_name)
+    file_date = file_date_override or parse_bm_date(file_name)
 
     data_rows: list[dict[str, str]] = []
     with open(csv_path, encoding="utf-8") as f:
@@ -292,6 +325,7 @@ def import_bm_csv(csv_path: str, db_path: Path | str) -> dict[str, Any]:
 
     unmatched: set[int] = set()
     inserted = 0
+    diverted_reject_pieces = 0
     for row in data_rows:
         account_code = strip_zeros(row.get("Account Code", ""))
         if account_code is None:
@@ -307,6 +341,30 @@ def import_bm_csv(csv_path: str, db_path: Path | str) -> dict[str, Any]:
         is_unmatched = 0 if account_code in valid_accounts else 1
         if is_unmatched:
             unmatched.add(account_code)
+
+        # KC presort uplift artifact: OtherCls @ 1120 oz (70 lb) is not real weight; treat as
+        # presort rejects and exclude from postage totals/volumes.
+        if mail_class.strip().upper() == "OTHERCLS" and float(weight_oz) == 1120.0:
+            pcs = int(pieces or 0)
+            if pcs > 0:
+                cur.execute(
+                    """
+                    INSERT INTO postage_presort_rejects (file_date, account_code, reject_count, source, import_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(file_date, account_code, source) DO UPDATE SET
+                        reject_count = postage_presort_rejects.reject_count + excluded.reject_count,
+                        import_id = COALESCE(postage_presort_rejects.import_id, excluded.import_id)
+                    """,
+                    (
+                        file_date,
+                        account_code,
+                        pcs,
+                        "bm_uplift_1120_othercls",
+                        import_id,
+                    ),
+                )
+                diverted_reject_pieces += pcs
+            continue
 
         try:
             cur.execute(
@@ -338,22 +396,28 @@ def import_bm_csv(csv_path: str, db_path: Path | str) -> dict[str, Any]:
         "file_name": file_name,
         "file_date": file_date,
         "rows_imported": inserted,
+        "diverted_presort_reject_pieces": diverted_reject_pieces,
         "unmatched": sorted(unmatched),
     }
 
 
-def process_bm_file(xls_path: str, db_path: Path | str, csv_out_dir: str | None = None) -> dict[str, Any]:
+def process_bm_file(
+    xls_path: str, db_path: Path | str, csv_out_dir: str | None = None
+) -> dict[str, Any]:
     csv_out_dir = csv_out_dir or os.path.dirname(xls_path)
     low = xls_path.lower()
+    file_date_override: str | None = None
     if low.endswith(".csv"):
         rows = parse_bm_raw_csv(xls_path)
     elif low.endswith(".xls") and not low.endswith(".xlsx"):
         xlsx_path = convert_xls_to_xlsx(xls_path)
+        file_date_override = read_bm_report_date_from_xlsx(xlsx_path)
         rows = parse_bm_xlsx(xlsx_path)
     else:
+        file_date_override = read_bm_report_date_from_xlsx(xls_path)
         rows = parse_bm_xlsx(xls_path)
     csv_path = write_report_csv(rows, xls_path, csv_out_dir)
-    return import_bm_csv(csv_path, db_path)
+    return import_bm_csv(csv_path, db_path, file_date_override=file_date_override)
 
 
 def safe_real(value: Any) -> float | None:
@@ -652,3 +716,467 @@ def import_flat_rate_costs(csv_path: str, db_path: Path | str) -> dict[str, Any]
     conn.commit()
     conn.close()
     return {"rows_imported": len(rows)}
+
+
+def _parse_effective_date_any(cell: Any) -> str | None:
+    """
+    Try to parse M/D/YYYY or similar into YYYY-MM-DD.
+    Returns None if parsing fails.
+    """
+    if cell is None:
+        return None
+    s = str(cell).strip()
+    if not s:
+        return None
+    s = s.replace("\\", "/").replace("-", "/")
+    # Prefer month/day/year (matches the sample files).
+    for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _cell_money_float(val: Any) -> float | None:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    s = s.replace("$", "").replace(",", "").strip()
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _cell_float(val: Any) -> float | None:
+    if val is None:
+        return None
+    s = str(val).strip().replace(",", "")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _normalize_row_cells(row: list[Any]) -> list[str]:
+    return [str(c).strip() if c is not None else "" for c in row]
+
+
+def _parse_compact_priority_mail_zone_matrix_xlsx(
+    raw_rows: list[list[Any]],
+    file_name: str,
+    *,
+    effective_date: str | None,
+) -> list[dict[str, Any]] | None:
+    """
+    Sheet with row 0 like '(lbs.)', 1, 2, ... 9 and data rows: weight, z1..z9 prices.
+    Returns matrix rows only, or None if the layout does not match.
+    """
+    if len(raw_rows) < 2:
+        return None
+    header = _normalize_row_cells(raw_rows[0])
+    if not header or "lb" not in header[0].lower():
+        return None
+    zone_cols: list[tuple[int, int]] = []
+    for idx in range(1, min(len(header), 12)):
+        zf = _cell_float(header[idx])
+        if zf is None:
+            continue
+        zi = int(zf)
+        if 1 <= zi <= 9:
+            zone_cols.append((zi, idx))
+    if len(zone_cols) < 9:
+        return None
+
+    out_rows: list[dict[str, Any]] = []
+    sort_group = 1
+    sort_order = 0
+    for r in raw_rows[1:]:
+        cells = _normalize_row_cells(r)
+        line = " ".join(c for c in cells if c).strip()
+        if not line:
+            continue
+        w = _cell_float(cells[0])
+        if w is None or w <= 0:
+            continue
+        for zone, idx in zone_cols:
+            if idx >= len(cells):
+                continue
+            p = _cell_money_float(cells[idx])
+            if p is None:
+                continue
+            out_rows.append(
+                {
+                    "effective_date": effective_date,
+                    "source_file_name": file_name,
+                    "row_type": "matrix",
+                    "label": None,
+                    "zone": zone,
+                    "weight_unit": "lb",
+                    "weight_max": float(w),
+                    "price": float(p),
+                    "sort_group": sort_group,
+                    "sort_order": sort_order,
+                }
+            )
+            sort_order += 1
+    return out_rows if out_rows else None
+
+
+def _parse_priority_mail_retail_rows(
+    raw_rows: list[list[Any]],
+    file_name: str,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Parse USPS Priority Mail retail CSV-style rows (flat-rate block + zone matrix + fees)."""
+    effective_date: str | None = None
+    out_rows: list[dict[str, Any]] = []
+
+    sort_group = 0
+    sort_order = 0
+
+    in_matrix = False
+    zone_cols: list[tuple[int, int]] = []  # (zone_number, col_index)
+
+    for r in raw_rows:
+        cells = _normalize_row_cells(r)
+        line = " ".join(c for c in cells if c).strip()
+        if not line:
+            continue
+
+        # Header: "Priority Mail - Retail,,Final,,4/7/2026"
+        if not effective_date and any("priority mail" in c.lower() and "retail" in c.lower() for c in cells):
+            # Scan for a date-like token anywhere on the row.
+            for c in cells:
+                if (d := _parse_effective_date_any(c)) is not None:
+                    effective_date = d
+                    break
+            sort_group += 1
+            continue
+
+        # Start of matrix section
+        if any("weight not over" in c.lower() and "(lbs" in c.lower() for c in cells):
+            in_matrix = True
+            zone_cols = []
+            sort_group += 1
+            continue
+
+        # Zone header row (sometimes begins with blank then Zone 1..)
+        if in_matrix and any(re.match(r"^zone\s*\d+$", c, re.I) for c in cells):
+            zone_cols = []
+            for idx, c in enumerate(cells):
+                m = re.match(r"^zone\s*(\d+)$", c, re.I)
+                if m:
+                    zone_cols.append((int(m.group(1)), idx))
+            sort_group += 1
+            continue
+
+        # Matrix data row: first cell numeric weight, then prices by zone columns
+        if in_matrix and zone_cols:
+            w = _cell_float(cells[0])
+            if w is not None and w > 0:
+                for zone, idx in zone_cols:
+                    if idx >= len(cells):
+                        continue
+                    p = _cell_money_float(cells[idx])
+                    if p is None:
+                        continue
+                    out_rows.append(
+                        {
+                            "effective_date": effective_date,
+                            "source_file_name": file_name,
+                            "row_type": "matrix",
+                            "label": None,
+                            "zone": zone,
+                            "weight_unit": "lb",
+                            "weight_max": float(w),
+                            "price": float(p),
+                            "sort_group": sort_group,
+                            "sort_order": sort_order,
+                        }
+                    )
+                    sort_order += 1
+                continue
+
+        # Non-matrix lines: flat rate items and fee lines.
+        # Flat-rate items typically: "<Label>,12.90"
+        if not in_matrix:
+            label = cells[0].strip().strip('"')
+            price = _cell_money_float(cells[1] if len(cells) > 1 else "")
+            if label and price is not None:
+                out_rows.append(
+                    {
+                        "effective_date": effective_date,
+                        "source_file_name": file_name,
+                        "row_type": "flat_rate_item",
+                        "label": label,
+                        "zone": None,
+                        "weight_unit": None,
+                        "weight_max": None,
+                        "price": float(price),
+                        "sort_group": sort_group,
+                        "sort_order": sort_order,
+                    }
+                )
+                sort_order += 1
+                continue
+
+        # Fees/notes: take first non-empty cell as label, and first parseable money as price.
+        label = ""
+        for c in cells:
+            if c:
+                label = c.strip().strip('"')
+                break
+        if label:
+            price: float | None = None
+            for c in cells[1:]:
+                if (p := _cell_money_float(c)) is not None:
+                    price = p
+                    break
+            out_rows.append(
+                {
+                    "effective_date": effective_date,
+                    "source_file_name": file_name,
+                    "row_type": "fee" if price is not None else "note",
+                    "label": label,
+                    "zone": None,
+                    "weight_unit": None,
+                    "weight_max": None,
+                    "price": float(price) if price is not None else None,
+                    "sort_group": sort_group,
+                    "sort_order": sort_order,
+                }
+            )
+            sort_order += 1
+
+    return out_rows, effective_date
+
+
+def _priority_mail_retail_rows_from_file(source_path: str) -> tuple[list[dict[str, Any]], str | None]:
+    """Load raw grid from CSV or XLSX and parse into priority_mail_retail row dicts."""
+    file_name = os.path.basename(source_path)
+    suffix = Path(source_path).suffix.lower()
+    if suffix == ".xlsx":
+        wb = load_workbook(source_path, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            raw_rows = [list(row) for row in ws.iter_rows(values_only=True)]
+        finally:
+            wb.close()
+        eff_compact: str | None = date.today().isoformat()
+        compact = _parse_compact_priority_mail_zone_matrix_xlsx(
+            raw_rows, file_name, effective_date=eff_compact
+        )
+        if compact is not None:
+            return compact, eff_compact
+        out_rows, effective_date = _parse_priority_mail_retail_rows(raw_rows, file_name)
+        return out_rows, effective_date
+    with open(source_path, encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        raw_rows = [r for r in reader]
+    return _parse_priority_mail_retail_rows(raw_rows, file_name)
+
+
+def import_priority_mail_retail(source_path: str, db_path: Path | str) -> dict[str, Any]:
+    """
+    Import Priority Mail Retail rates (matrix by Zone x Weight(Lbs) + flat-rate items + fees).
+    Accepts `.csv` (USPS export layout) or `.xlsx` (compact zone matrix: row 0 = lbs + zones 1–9).
+    Full-replaces `priority_mail_retail`.
+    """
+    file_name = os.path.basename(source_path)
+    out_rows, effective_date = _priority_mail_retail_rows_from_file(source_path)
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys = ON")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM priority_mail_retail")
+    cur.executemany(
+        """
+        INSERT INTO priority_mail_retail (
+            effective_date, source_file_name, row_type, label, zone,
+            weight_unit, weight_max, price, sort_group, sort_order
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                r.get("effective_date"),
+                r.get("source_file_name"),
+                r.get("row_type"),
+                r.get("label"),
+                r.get("zone"),
+                r.get("weight_unit"),
+                r.get("weight_max"),
+                r.get("price"),
+                r.get("sort_group"),
+                r.get("sort_order"),
+            )
+            for r in out_rows
+        ],
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "rows_imported": len(out_rows),
+        "effective_date": effective_date,
+        "file_name": file_name,
+    }
+
+
+def import_ground_advantage_retail(csv_path: str, db_path: Path | str) -> dict[str, Any]:
+    """
+    Import USPS Ground Advantage Retail rates (oz section + lb section + fees/special lines).
+    Full-replaces `ground_advantage_retail`.
+    """
+    file_name = os.path.basename(csv_path)
+    with open(csv_path, encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        raw_rows = [r for r in reader]
+
+    effective_date: str | None = None
+    out_rows: list[dict[str, Any]] = []
+
+    sort_group = 0
+    sort_order = 0
+
+    section_unit: str | None = None  # oz | lb
+    in_matrix = False
+    zone_cols: list[tuple[int, int]] = []
+
+    for r in raw_rows:
+        cells = _normalize_row_cells(r)
+        line = " ".join(c for c in cells if c).strip()
+        if not line:
+            continue
+
+        if not effective_date and any("ground advantage" in c.lower() for c in cells):
+            # date sometimes isn't on the same row; still scan this row.
+            for c in cells:
+                if (d := _parse_effective_date_any(c)) is not None:
+                    effective_date = d
+                    break
+            sort_group += 1
+            continue
+
+        if not effective_date:
+            for c in cells:
+                if (d := _parse_effective_date_any(c)) is not None:
+                    effective_date = d
+                    break
+
+        if any("weight not over" in c.lower() and "(ounces" in c.lower() for c in cells):
+            section_unit = "oz"
+            in_matrix = True
+            zone_cols = []
+            sort_group += 1
+            continue
+
+        if any("weight not over" in c.lower() and "(pounds" in c.lower() for c in cells):
+            section_unit = "lb"
+            in_matrix = True
+            # The pounds section in your file does not repeat the Zone header row,
+            # so keep the previously detected `zone_cols` (from the ounces section).
+            sort_group += 1
+            continue
+
+        if in_matrix and any(re.match(r"^zone\s*\d+$", c, re.I) for c in cells):
+            zone_cols = []
+            for idx, c in enumerate(cells):
+                m = re.match(r"^zone\s*(\d+)$", c, re.I)
+                if m:
+                    zone_cols.append((int(m.group(1)), idx))
+            sort_group += 1
+            continue
+
+        if in_matrix and zone_cols and section_unit:
+            w = _cell_float(cells[0])
+            if w is not None and w > 0:
+                for zone, idx in zone_cols:
+                    if idx >= len(cells):
+                        continue
+                    p = _cell_money_float(cells[idx])
+                    if p is None:
+                        continue
+                    out_rows.append(
+                        {
+                            "effective_date": effective_date,
+                            "source_file_name": file_name,
+                            "row_type": "matrix",
+                            "label": None,
+                            "zone": zone,
+                            "weight_unit": section_unit,
+                            "weight_max": float(w),
+                            "price": float(p),
+                            "sort_group": sort_group,
+                            "sort_order": sort_order,
+                        }
+                    )
+                    sort_order += 1
+                continue
+
+        # Special/fee/note lines (e.g. Oversized, Nonstandard Length..., notes)
+        label = ""
+        for c in cells:
+            if c:
+                label = c.strip().strip('"')
+                break
+        if label:
+            price: float | None = None
+            for c in cells[1:]:
+                if (p := _cell_money_float(c)) is not None:
+                    price = p
+                    break
+            out_rows.append(
+                {
+                    "effective_date": effective_date,
+                    "source_file_name": file_name,
+                    "row_type": "fee" if price is not None else "note",
+                    "label": label,
+                    "zone": None,
+                    "weight_unit": None,
+                    "weight_max": None,
+                    "price": float(price) if price is not None else None,
+                    "sort_group": sort_group,
+                    "sort_order": sort_order,
+                }
+            )
+            sort_order += 1
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys = ON")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM ground_advantage_retail")
+    cur.executemany(
+        """
+        INSERT INTO ground_advantage_retail (
+            effective_date, source_file_name, row_type, label, zone,
+            weight_unit, weight_max, price, sort_group, sort_order
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                r.get("effective_date"),
+                r.get("source_file_name"),
+                r.get("row_type"),
+                r.get("label"),
+                r.get("zone"),
+                r.get("weight_unit"),
+                r.get("weight_max"),
+                r.get("price"),
+                r.get("sort_group"),
+                r.get("sort_order"),
+            )
+            for r in out_rows
+        ],
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "rows_imported": len(out_rows),
+        "effective_date": effective_date,
+        "file_name": file_name,
+    }

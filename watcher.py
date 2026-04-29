@@ -54,6 +54,31 @@ def _is_billing_csv(name: str) -> bool:
     return "export_billing" in low or "billing" in low
 
 
+def _is_pm_retail_csv(name: str) -> bool:
+    low = name.lower()
+    if not low.endswith(".csv"):
+        return False
+    # Prefer explicit names, but keep flexible for renamed files.
+    return ("pm" in low and "retail" in low) or ("priority" in low and "retail" in low)
+
+
+def _is_pm_retail_xlsx(name: str) -> bool:
+    """Compact Priority Mail zone matrix (.xlsx), e.g. Priority mail zones.xlsx."""
+    low = name.lower()
+    if not low.endswith(".xlsx"):
+        return False
+    if "priority" not in low:
+        return False
+    return ("retail" in low) or ("zone" in low) or ("zones" in low)
+
+
+def _is_ground_advantage_retail_csv(name: str) -> bool:
+    low = name.lower()
+    if not low.endswith(".csv"):
+        return False
+    return "ground" in low and "advantage" in low and "retail" in low
+
+
 def _is_bm_report_csv(name: str) -> bool:
     """Normalized flat report: ends with _report.csv and BM prefix (underscore or space)."""
     low = name.lower()
@@ -64,7 +89,10 @@ def _is_bm_report_csv(name: str) -> bool:
 
 def _is_bm_raw_export(name: str) -> bool:
     """BM postage file not already normalized to *_report.csv (xls, xlsx, or raw csv)."""
-    if not re.search(r"BM[_\s]", name, re.IGNORECASE):
+    low = name.lower()
+    is_bm_prefix = bool(re.search(r"BM[_\s]", name, re.IGNORECASE))
+    is_dm_weight_break = low.startswith("dm weight break by account-carrier-class")
+    if not (is_bm_prefix or is_dm_weight_break):
         return False
     if _is_bm_report_csv(name):
         return False
@@ -78,7 +106,8 @@ def _is_ws3_customer_mail_detail(name: str) -> bool:
     suf = Path(name).suffix.lower()
     if suf not in (".xls", ".xlsx"):
         return False
-    return "ws3_fcfl_customermaildetail" in low
+    # Anything after the prefix is ignored (e.g. WS3_FCFL_CustomerMailDetail(3).xls).
+    return low.startswith("ws3_fcfl_customermaildetail")
 
 
 def process_one_file(path: Path) -> dict:
@@ -90,6 +119,10 @@ def process_one_file(path: Path) -> dict:
         return importer.import_customers_csv(str(path), db_path)
     if _is_flat_rate_csv(name):
         return importer.import_flat_rate_costs(str(path), db_path)
+    if _is_pm_retail_csv(name) or _is_pm_retail_xlsx(name):
+        return importer.import_priority_mail_retail(str(path), db_path)
+    if _is_ground_advantage_retail_csv(name):
+        return importer.import_ground_advantage_retail(str(path), db_path)
     if _is_billing_csv(name) and name.lower().endswith(".csv"):
         return importer.import_billing_csv(str(path), db_path)
     if _is_bm_report_csv(name):

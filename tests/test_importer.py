@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from openpyxl import Workbook
 
 import importer
 import watcher
@@ -132,6 +133,51 @@ def test_parse_bm_raw_csv_fixture_bm_3_19_26():
         assert got == expected
 
 
+def test_import_bm_csv_diverts_othercls_1120_to_presort_rejects(monkeypatch, tmp_path):
+    import db as dbmod
+
+    # Init an empty DB for import to write into.
+    db_path = tmp_path / "imp.db"
+    monkeypatch.setattr(dbmod, "DB_PATH", db_path)
+    dbmod.init_db()
+
+    conn = dbmod.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO customers (customer_number, customer_name) VALUES (1234, 'Co')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Minimal BM report CSV with a single uplift row.
+    p = tmp_path / "BM_4_23_26_report.csv"
+    p.write_text(
+        "\n".join(
+            [
+                "Account Code,Class,Weight  (oz.),Pieces,Total Cost",
+                "1234,OtherCls,1120.0,7,0.66",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    out = importer.import_bm_csv(str(p), db_path, file_date_override="2026-04-23")
+    assert out["rows_imported"] == 0
+    assert out["diverted_presort_reject_pieces"] == 7
+
+    conn = dbmod.get_connection()
+    try:
+        n_postage = conn.execute("SELECT COUNT(*) FROM postage_data").fetchone()[0]
+        assert int(n_postage) == 0
+        n_rej = conn.execute(
+            "SELECT COALESCE(SUM(reject_count),0) FROM postage_presort_rejects"
+        ).fetchone()[0]
+        assert int(n_rej) == 7
+    finally:
+        conn.close()
+
+
 def test_parse_bm_raw_csv_commas_in_numbers(tmp_path):
     """Thousands separators in weight and pieces must parse."""
     p = tmp_path / "BM_1_2_26.csv"
@@ -154,6 +200,9 @@ def test_watcher_bm_report_vs_raw_detection():
     assert watcher._is_bm_report_csv("BM_3_19_26_report.csv")
     assert not watcher._is_bm_raw_export("BM 3.19.26_report.csv")
     assert watcher._is_bm_raw_export("BM 3.19.26.csv")
+    assert watcher._is_bm_raw_export(
+        "DM Weight Break by Account-Carrier-Class 04242026 - 053056.7513322.xlsx"
+    )
 
 
 def test_write_report_csv_renames_csv_source(tmp_path):
@@ -173,3 +222,26 @@ def test_write_report_csv_renames_csv_source(tmp_path):
         str(tmp_path),
     )
     assert Path(out).name == "BM_1_2_26_report.csv"
+
+
+def test_read_bm_report_date_from_xlsx_happy_path(tmp_path):
+    p = tmp_path / "DM Weight Break by Account-Carrier-Class 04242026.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws["P3"].value = "04/24/2026"
+    ws["S3"].value = "04/24/2026"
+    wb.save(p)
+
+    assert importer.read_bm_report_date_from_xlsx(str(p)) == "2026-04-24"
+
+
+def test_read_bm_report_date_from_xlsx_mismatch_raises(tmp_path):
+    p = tmp_path / "DM Weight Break by Account-Carrier-Class 04242026.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws["P3"].value = "04/24/2026"
+    ws["S3"].value = "04/25/2026"
+    wb.save(p)
+
+    with pytest.raises(ValueError, match=r"BM report date mismatch"):
+        importer.read_bm_report_date_from_xlsx(str(p))

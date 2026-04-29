@@ -14,7 +14,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 import db
-from exports import aggregate_parcel_count_rows
+from exports import _retail_rate, aggregate_parcel_count_rows
 
 
 _FILENAME_BAD_CHARS_RE = re.compile(r'[\\/:*?"<>|]+')
@@ -51,6 +51,29 @@ def total_presort_reject_pieces_from_postage_rows(rows: list[dict[str, Any]]) ->
     )
 
 
+def total_flats_retail_invoice_basis(
+    rows: list[dict[str, Any]],
+    retail_rates_by_oz: dict[int, float],
+) -> float:
+    """
+    Sum of first-class retail for invoice flat classes, weights 1–13 oz only (same basis as
+    postage invoice column M per oz row). Excludes synthetic Presort rejects rows.
+    """
+    flat_set = db.POSTAGE_INVOICE_FLAT_MAIL_CLASSES
+    total = 0.0
+    for r in rows:
+        if r.get("mail_class") == db.WS3_REJECT_MAIL_CLASS:
+            continue
+        if r.get("mail_class") not in flat_set:
+            continue
+        for oz in range(1, 14):
+            k = f"oz_{oz}"
+            pc = int(r.get(k) or 0)
+            if pc:
+                total += float(pc) * float(_retail_rate(retail_rates_by_oz, oz))
+    return round(total, 2)
+
+
 def _find_block_side_for_zone(blocks: list[dict[str, Any]], z: int) -> tuple[dict[str, Any], str] | None:
     for b in blocks:
         if b.get("zone_a") == z:
@@ -60,32 +83,60 @@ def _find_block_side_for_zone(blocks: list[dict[str, Any]], z: int) -> tuple[dic
     return None
 
 
-def _zone_cell_priority_count(blocks: list[dict[str, Any]], z: int, ri: int) -> tuple[Any, int]:
+def _zone_cell_priority_count(blocks: list[dict[str, Any]], z: int, ri: int) -> tuple[Any, Any, int]:
     hit = _find_block_side_for_zone(blocks, z)
     if not hit:
-        return None, 0
+        return None, None, 0
     block, side = hit
     rw = block["rows"][ri]
     cell = rw["zone_a"] if side == "a" else rw["zone_b"]
     pr = cell.get("priority")
+    disc = cell.get("efd")
     cnt = int(cell.get("count") or 0)
-    return pr, cnt
+    return pr, disc, cnt
 
 
-def _flats_consolidated_column_plan() -> tuple[list[str], list[str]]:
+def _parcel_consolidated_headers(remove_customer_numbers: bool) -> list[str]:
+    """Column order must match the PARCELS (COUNTS) sheet (retail is last column)."""
+    return [
+        "Date",
+        "Parent Name",
+        *(["Parent Number"] if not remove_customer_numbers else []),
+        "Child Name",
+        *(["Child Number"] if not remove_customer_numbers else []),
+        *[f"{i} lb" for i in range(1, 11)],
+        "10+ lb",
+        "Total Qty",
+        "Retail Cost",
+    ]
+
+
+def _flats_consolidated_column_plan(remove_customer_numbers: bool) -> tuple[list[str], list[str]]:
     oz_keys = [f"oz_{i}" for i in range(13)] + ["oz_13", "oz_13plus"]
     headers = [
         "Date",
         "Parent Name",
+        *(["Parent Number"] if not remove_customer_numbers else []),
         "Child Name",
+        *(["Child Number"] if not remove_customer_numbers else []),
         "Class",
         *[f"{i} oz" for i in range(13)],
         "13 oz",
         "13+ oz",
         "Total Qty",
-        "Total Cost",
+        "Retail cost",
     ]
-    keys = ["date", "parent_name", "child_name", "mail_class", *oz_keys, "total_qty", "total_cost"]
+    keys = [
+        "date",
+        "parent_name",
+        *(["parent_number"] if not remove_customer_numbers else []),
+        "child_name",
+        *(["child_number"] if not remove_customer_numbers else []),
+        "mail_class",
+        *oz_keys,
+        "total_qty",
+        "retail_cost",
+    ]
     return headers, keys
 
 
@@ -108,16 +159,16 @@ def _write_zone_summary_stacked_sheet(ws: Any, zone_data: dict[str, Any], *, sta
     int_fmt = "#,##0"
 
     r = start_row
-    for z in range(1, 9):
+    for z in range(1, 10):
         if _find_block_side_for_zone(blocks, z) is None:
             continue
         if r > start_row:
             r += 1
         title = ws.cell(r, 1, f"Zone {z}")
         title.font = sec_font
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=4)
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
         r += 1
-        hdrs = ["Weight", f"Priority Z{z}", f"Count Z{z}", "Line total"]
+        hdrs = ["Weight", f"Retail Z{z}", f"Discount Z{z}", f"Count Z{z}", "Retail total", "Savings"]
         for c, h in enumerate(hdrs, start=1):
             cell = ws.cell(r, c, h)
             cell.font = hdr_font
@@ -127,10 +178,13 @@ def _write_zone_summary_stacked_sheet(ws: Any, zone_data: dict[str, Any], *, sta
         r += 1
         for ri in row_indices:
             wl = blocks[0]["rows"][ri]["weight_label"]
-            pri, cnt = _zone_cell_priority_count(blocks, z, ri)
-            line_val: float | None = None
+            pri, disc, cnt = _zone_cell_priority_count(blocks, z, ri)
+            retail_total: float | None = None
+            savings_total: float | None = None
             if not hide and pri is not None:
-                line_val = round(float(pri) * cnt, 2)
+                retail_total = round(float(pri) * cnt, 2)
+                if disc is not None:
+                    savings_total = round((float(pri) - float(disc)) * cnt, 2)
             c1 = ws.cell(r, 1, wl)
             c1.font = body
             c1.border = grid
@@ -142,21 +196,35 @@ def _write_zone_summary_stacked_sheet(ws: Any, zone_data: dict[str, Any], *, sta
             pcell.font = body
             pcell.border = grid
             pcell.alignment = Alignment(horizontal="right", vertical="center")
-            ccell = ws.cell(r, 3, cnt)
+            dcell = ws.cell(r, 3)
+            if not hide and disc is not None:
+                dcell.value = float(disc)
+                dcell.number_format = money_fmt
+            dcell.font = body
+            dcell.border = grid
+            dcell.alignment = Alignment(horizontal="right", vertical="center")
+            ccell = ws.cell(r, 4, cnt)
             ccell.font = body
             ccell.border = grid
             ccell.number_format = int_fmt
             ccell.alignment = Alignment(horizontal="right", vertical="center")
-            lcell = ws.cell(r, 4)
-            if line_val is not None:
-                lcell.value = line_val
+            lcell = ws.cell(r, 5)
+            if retail_total is not None:
+                lcell.value = retail_total
                 lcell.number_format = money_fmt
             lcell.font = body
             lcell.border = grid
             lcell.alignment = Alignment(horizontal="right", vertical="center")
+            scell = ws.cell(r, 6)
+            if savings_total is not None:
+                scell.value = savings_total
+                scell.number_format = money_fmt
+            scell.font = body
+            scell.border = grid
+            scell.alignment = Alignment(horizontal="right", vertical="center")
             r += 1
 
-    for col, w in enumerate([14.0, 14.0, 12.0, 14.0], start=1):
+    for col, w in enumerate([14.0, 14.0, 14.0, 12.0, 14.0, 14.0], start=1):
         letter = get_column_letter(col)
         ws.column_dimensions[letter].width = max(ws.column_dimensions[letter].width or 0, w)
     return r
@@ -172,7 +240,9 @@ def export_consolidated_volumes_xlsx(
     consolidate: bool,
     remove_zeros: bool,
     hide_costs_summary: bool,
+    remove_customer_numbers: bool,
     account_scope_label: str,
+    parcel_discount: float = 0.25,
 ) -> Path:
     conn = db.get_connection()
     try:
@@ -218,6 +288,7 @@ def export_consolidated_volumes_xlsx(
             show_parents,
             show_main,
             hide_costs=False,
+            parcel_discount=float(parcel_discount or 0.0),
         )
     finally:
         conn.close()
@@ -243,7 +314,7 @@ def export_consolidated_volumes_xlsx(
     ws_sum = wb.active
     ws_sum.title = "Summary"
 
-    ws_sum.merge_cells("A1:D1")
+    ws_sum.merge_cells("A1:B1")
     t = ws_sum.cell(1, 1, "Consolidated volumes report")
     t.font = Font(name="Calibri", bold=True, size=16, color="FFFFFF")
     t.fill = PatternFill("solid", start_color="1F4E79")
@@ -276,20 +347,69 @@ def export_consolidated_volumes_xlsx(
     combined = int(postage.get("total_pieces") or 0) + int(parcels.get("total_pieces") or 0)
     kv_row(r, "Combined volume", combined, is_int=True)
     r += 1
-    if not hide_costs_summary and postage.get("total_cost") is not None:
-        kv_row(r, "Flats retail", round(float(postage["total_cost"]), 2), money=True)
-        r += 1
-    if parcels.get("total_retail") is not None:
-        kv_row(r, "Total parcel retail", round(float(parcels["total_retail"]), 2), money=True)
-        r += 1
     kv_row(r, "Total flats rejected items", rejected_flats, is_int=True)
+    r += 1
 
-    ws_sum.column_dimensions["A"].width = 28.0
+    f_headers, _ = _flats_consolidated_column_plan(remove_customer_numbers)
+    p_headers = _parcel_consolidated_headers(remove_customer_numbers)
+    flats_retail_col = get_column_letter(len(f_headers))
+    parcel_retail_col = get_column_letter(len(p_headers))
+    flats_sheet_q = "'FLATS (POSTAGE)'"
+    parcel_sheet_q = "'PARCELS (COUNTS)'"
+
+    if not hide_costs_summary:
+        row_flats_retail = r
+        a1 = ws_sum.cell(r, 1, "Flats Total retail Postage Cost")
+        a1.font = label_font
+        a1.alignment = Alignment(horizontal="left", vertical="center")
+        b1 = ws_sum.cell(r, 2)
+        b1.font = body_font
+        b1.alignment = Alignment(horizontal="left", vertical="center")
+        if flat_rows:
+            last_fr = 1 + len(flat_rows)
+            b1.value = f"=SUM({flats_sheet_q}!{flats_retail_col}2:{flats_retail_col}{last_fr})"
+            b1.number_format = money_fmt
+        else:
+            flat_num = (
+                round(float(postage["total_retail_cost"]), 2)
+                if postage.get("total_retail_cost") is not None
+                else 0.0
+            )
+            b1.value = flat_num
+            b1.number_format = money_fmt
+        r += 1
+
+        row_parcel_retail = r
+        a2 = ws_sum.cell(r, 1, "Parcels Total Retail Postage cost")
+        a2.font = label_font
+        a2.alignment = Alignment(horizontal="left", vertical="center")
+        b2 = ws_sum.cell(r, 2)
+        b2.font = body_font
+        b2.alignment = Alignment(horizontal="left", vertical="center")
+        if parcel_agg:
+            last_pr = 1 + len(parcel_agg)
+            b2.value = f"=SUM({parcel_sheet_q}!{parcel_retail_col}2:{parcel_retail_col}{last_pr})"
+            b2.number_format = money_fmt
+        else:
+            b2.value = round(float(parcels.get("total_retail") or 0.0), 2)
+            b2.number_format = money_fmt
+        r += 1
+
+        a_tot = ws_sum.cell(r, 1, "Total Retail Cost")
+        a_tot.font = label_font
+        a_tot.alignment = Alignment(horizontal="left", vertical="center")
+        b_tot = ws_sum.cell(r, 2, f"=B{row_flats_retail}+B{row_parcel_retail}")
+        b_tot.font = body_font
+        b_tot.alignment = Alignment(horizontal="left", vertical="center")
+        b_tot.number_format = money_fmt
+        r += 1
+
+    ws_sum.column_dimensions["A"].width = 40.0
     ws_sum.column_dimensions["B"].width = 36.0
 
     if flat_rows:
         ws_f = wb.create_sheet("FLATS (POSTAGE)")
-        f_headers, f_keys = _flats_consolidated_column_plan()
+        f_headers, f_keys = _flats_consolidated_column_plan(remove_customer_numbers)
         for col, h in enumerate(f_headers, start=1):
             c = ws_f.cell(1, col, h)
             c.font = hdr_font
@@ -302,7 +422,7 @@ def export_consolidated_volumes_xlsx(
                 cell = ws_f.cell(ri, col)
                 cell.font = body_font
                 cell.border = grid
-                if k == "total_cost":
+                if k == "retail_cost":
                     if v is not None:
                         cell.value = round(float(v), 2)
                         cell.number_format = money_fmt
@@ -314,24 +434,25 @@ def export_consolidated_volumes_xlsx(
                 else:
                     cell.value = v
                     cell.alignment = Alignment(horizontal="left", vertical="center")
-        ws_f.freeze_panes = "E2"
+        ws_f.freeze_panes = "G2" if not remove_customer_numbers else "E2"
         ws_f.row_dimensions[1].height = 26
         for i in range(1, len(f_headers) + 1):
             letter = get_column_letter(i)
-            base = 10.0 if i > 4 else (14.0 if i == 1 else 22.0)
+            if i == 1:
+                base = 14.0
+            elif i in (2, 4):
+                base = 22.0
+            elif not remove_customer_numbers and i in (3, 5):
+                base = 14.0
+            elif i <= (6 if not remove_customer_numbers else 4):
+                base = 14.0
+            else:
+                base = 10.0
             ws_f.column_dimensions[letter].width = max(ws_f.column_dimensions[letter].width or 0, base)
 
     if parcel_agg:
         ws_p = wb.create_sheet("PARCELS (COUNTS)")
-        p_headers = [
-            "Date",
-            "Parent Name",
-            "Child Name",
-            *[f"{i} lb" for i in range(1, 11)],
-            "10+ lb",
-            "Total Qty",
-            "Retail Cost",
-        ]
+        p_headers = _parcel_consolidated_headers(remove_customer_numbers)
         for col, h in enumerate(p_headers, start=1):
             c = ws_p.cell(1, col, h)
             c.font = hdr_font
@@ -342,7 +463,9 @@ def export_consolidated_volumes_xlsx(
             vals: list[Any] = [
                 prow.get("date"),
                 prow.get("parent_name"),
+                *([prow.get("parent_number")] if not remove_customer_numbers else []),
                 prow.get("child_name"),
+                *([prow.get("child_number")] if not remove_customer_numbers else []),
                 *[int(prow.get(f"lb_{i}") or 0) for i in range(1, 11)],
                 int(prow.get("lb_10plus") or 0),
                 int(prow.get("total_qty") or 0),
@@ -353,17 +476,23 @@ def export_consolidated_volumes_xlsx(
                 cell = ws_p.cell(ri, col, v)
                 cell.font = body_font
                 cell.border = grid
-                if col <= 3:
+                if col <= (5 if not remove_customer_numbers else 3):
                     cell.alignment = Alignment(horizontal="left", vertical="center")
                 else:
                     cell.alignment = Alignment(horizontal="right", vertical="center")
                 if col == ncols:
                     cell.number_format = money_fmt
-                elif col >= 4:
+                elif col >= (6 if not remove_customer_numbers else 4):
                     cell.number_format = int_fmt
-        ws_p.freeze_panes = "D2"
+        ws_p.freeze_panes = "F2" if not remove_customer_numbers else "D2"
         ws_p.row_dimensions[1].height = 28
-        col_widths = [12.0, 24.0, 30.0] + [9.0] * 10 + [9.0, 11.0, 14.0]
+        col_widths = [12.0, 24.0]
+        if not remove_customer_numbers:
+            col_widths.append(14.0)
+        col_widths.append(30.0)
+        if not remove_customer_numbers:
+            col_widths.append(14.0)
+        col_widths.extend([9.0] * 10 + [9.0, 11.0, 14.0])
         for i, w in enumerate(col_widths, start=1):
             letter = get_column_letter(i)
             ws_p.column_dimensions[letter].width = max(ws_p.column_dimensions[letter].width or 0, w)

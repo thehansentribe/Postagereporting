@@ -299,3 +299,146 @@
   });
 })();
 
+(function () {
+  const $ = (id) => document.getElementById(id);
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function moneyCell(n) {
+    const v = Number(n || 0);
+    if (Number.isNaN(v)) return "0.00";
+    return v.toFixed(2);
+  }
+
+  const tbl = $("unmatchedAccountsTable");
+  if (!tbl) return;
+
+  let state = { unmatched: [], parent_options: [] };
+
+  function buildParentOptions(selected) {
+    const rows = state.parent_options || [];
+    const parents = rows.filter((r) => r.kind === "parent");
+    const standalone = rows.filter((r) => r.kind === "standalone");
+    let h = '<option value="">— None —</option>';
+    function opts(list) {
+      let s = "";
+      for (const r of list) {
+        const n = r.customer_number;
+        const sel = n === selected ? " selected" : "";
+        s += `<option value="${n}"${sel}>${escapeHtml(r.customer_name || "")} (${n})</option>`;
+      }
+      return s;
+    }
+    if (parents.length) {
+      h += '<optgroup label="Parent accounts">';
+      h += opts(parents);
+      h += "</optgroup>";
+    }
+    if (standalone.length) {
+      h += '<optgroup label="Standalone accounts">';
+      h += opts(standalone);
+      h += "</optgroup>";
+    }
+    return h;
+  }
+
+  function render() {
+    const rows = state.unmatched || [];
+    if (!rows.length) {
+      tbl.innerHTML = "<p class='empty-state'>No unmatched accounts found.</p>";
+      return;
+    }
+
+    let html =
+      "<table class='data-table system-edit-table'><thead><tr>" +
+      "<th>Account #</th>" +
+      "<th>Sources</th>" +
+      "<th class='num'>Postage pieces</th>" +
+      "<th class='num'>Postage cost</th>" +
+      "<th class='num'>Parcel pieces</th>" +
+      "<th class='num'>Parcel cost</th>" +
+      "<th>Customer name</th>" +
+      "<th>Parent</th>" +
+      "<th></th>" +
+      "</tr></thead><tbody>";
+
+    for (const r of rows) {
+      const code = r.account_code;
+      html += "<tr>";
+      html += `<td class="num">${escapeHtml(String(code))}</td>`;
+      html += `<td>${escapeHtml(r.sources || "")}</td>`;
+      html += `<td class="num">${escapeHtml(String(r.postage_pieces || 0))}</td>`;
+      html += `<td class="num">${escapeHtml(moneyCell(r.postage_cost))}</td>`;
+      html += `<td class="num">${escapeHtml(String(r.parcel_pieces || 0))}</td>`;
+      html += `<td class="num">${escapeHtml(moneyCell(r.parcel_cost))}</td>`;
+      html += `<td><input type="text" class="unmatched-name" data-account="${escapeHtml(
+        String(code)
+      )}" placeholder="Enter name…" /></td>`;
+      html += `<td><select class="unmatched-parent" data-account="${escapeHtml(
+        String(code)
+      )}">${buildParentOptions("")}</select></td>`;
+      html += `<td><button type="button" class="btn btn-primary unmatched-save" data-account="${escapeHtml(
+        String(code)
+      )}">Save</button></td>`;
+      html += "</tr>";
+    }
+
+    html += "</tbody></table>";
+    tbl.innerHTML = html;
+
+    tbl.querySelectorAll("button.unmatched-save").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const code = parseInt(btn.getAttribute("data-account") || "", 10);
+        const nameEl = tbl.querySelector(`input.unmatched-name[data-account="${code}"]`);
+        const parentEl = tbl.querySelector(`select.unmatched-parent[data-account="${code}"]`);
+        const customer_name = String((nameEl && nameEl.value) || "").trim();
+        const rawParent = parentEl ? parentEl.value : "";
+        const parent_number = rawParent === "" ? null : parseInt(rawParent, 10);
+
+        if (!customer_name) {
+          alert("Customer name is required.");
+          if (nameEl) nameEl.focus();
+          return;
+        }
+
+        btn.disabled = true;
+        try {
+          const r = await fetch("/api/system/unmatched-accounts/assign", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ customer_number: code, customer_name, parent_number }),
+          });
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.error || "Save failed");
+          state.unmatched = j.unmatched || [];
+          state.parent_options = j.parent_options || state.parent_options;
+          render();
+        } catch (e) {
+          alert(String(e.message || e));
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  async function load() {
+    const r = await fetch("/api/system/unmatched-accounts");
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "Failed to load unmatched accounts");
+    state.unmatched = j.unmatched || [];
+    state.parent_options = j.parent_options || [];
+    render();
+  }
+
+  load().catch((e) => {
+    tbl.innerHTML = `<p class="empty-state">${escapeHtml(String(e.message || e))}</p>`;
+  });
+})();
+

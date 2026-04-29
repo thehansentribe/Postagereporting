@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import csv
+import logging
 import os
 import re
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,8 @@ from openpyxl import load_workbook
 
 import db
 from importer import convert_xls_to_xlsx
+
+logger = logging.getLogger(__name__)
 
 SKIP_COL0 = {
     "Customer Mail Details",
@@ -39,6 +43,51 @@ def parse_date_from_filename(path: str) -> str | None:
     return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
 
 
+def parse_mail_id_date(mail_id: str | None) -> str | None:
+    """
+    Parse NetSort Mail ID (row 8 col BI) to YYYY-MM-DD.
+
+    Input examples: '040626_F', '041726_F'
+    """
+    if mail_id is None:
+        return None
+    s = str(mail_id).strip()
+    if not s:
+        return None
+    date_part = s.split("_", 1)[0].strip()
+    if len(date_part) != 6 or not date_part.isdigit():
+        return None
+    month = date_part[0:2]
+    day = date_part[2:4]
+    yy = date_part[4:6]
+    year = f"20{yy}"
+    try:
+        datetime.strptime(f"{year}-{month}-{day}", "%Y-%m-%d")
+    except ValueError:
+        return None
+    return f"{year}-{month}-{day}"
+
+
+def read_bi8_mail_id(xlsx_path: str) -> str | None:
+    """Mail ID string from cell BI8 (e.g. '040626_F')."""
+    wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+        v = ws["BI8"].value
+    finally:
+        wb.close()
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def read_mail_date_from_bi8(xlsx_path: str) -> str | None:
+    """Authoritative WS3 mail_date derived from BI8 Mail ID (MMDDYY_F)."""
+    mid = read_bi8_mail_id(xlsx_path)
+    return parse_mail_id_date(mid)
+
+
 def parse_currency(val: Any) -> float | None:
     if val is None:
         return None
@@ -62,6 +111,12 @@ def calc_cost_per_piece(postage_applied: float | None, num_pieces: int | None) -
     if postage_applied is None or not num_pieces or num_pieces == 0:
         return None
     return round(float(postage_applied) / int(num_pieces), 4)
+
+
+def calc_usps_cost_per_piece(postage_claimed: float | None, num_pieces: int | None) -> float | None:
+    if postage_claimed is None or not num_pieces or num_pieces == 0:
+        return None
+    return round(float(postage_claimed) / int(num_pieces), 4)
 
 
 def parse_ws3_xlsx(xlsx_path: str) -> tuple[str | None, str | None, dict[str, str], list[dict[str, Any]]]:
@@ -217,9 +272,6 @@ def process_ws3_mail_detail_file(
     """
     db_path = Path(db_path)
     file_name = os.path.basename(xls_path)
-    mail_date = parse_date_from_filename(xls_path)
-    if not mail_date:
-        raise ValueError(f"Cannot parse mail date from filename: {file_name}")
 
     root = Path(__file__).resolve().parent
     if csv_out_path is None:
@@ -248,8 +300,22 @@ def process_ws3_mail_detail_file(
     else:
         xlsx_path = convert_xls_to_xlsx(xls_path)
 
+    bi_mail_id = read_bi8_mail_id(xlsx_path)
+    mail_date = parse_mail_id_date(bi_mail_id)
+    if not mail_date:
+        raise ValueError(
+            f"Cannot determine WS3 mail date from BI8 Mail ID (expected MMDDYY_F): {file_name!r} BI8={bi_mail_id!r}"
+        )
+
     mail_id, run_dt, customers, detail_rows = parse_ws3_xlsx(xlsx_path)
     mail_id = mail_id or ""
+    if bi_mail_id and mail_id and bi_mail_id.strip() != mail_id.strip():
+        logger.warning(
+            "WS3 Mail ID mismatch: BI8=%r parse_ws3_xlsx=%r file=%r",
+            bi_mail_id,
+            mail_id,
+            file_name,
+        )
 
     existing_run = conn.execute(
         "SELECT run_id FROM ws3_mail_runs WHERE mail_date = ? AND mail_id = ?",
@@ -299,6 +365,7 @@ def process_ws3_mail_detail_file(
                     r["pcs_accepted"],
                     r["pcs_rejected"],
                     r["cost_per_piece"],
+                    calc_usps_cost_per_piece(r["postage_claimed"], r["num_pieces"]),
                 )
             )
 
@@ -307,8 +374,8 @@ def process_ws3_mail_detail_file(
             INSERT INTO ws3_mail_detail (
                 run_id, profile_id, customer_code, rate_type,
                 postage_claimed, postage_applied, num_pieces,
-                pcs_accepted, pcs_rejected, cost_per_piece
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                pcs_accepted, pcs_rejected, cost_per_piece, usps_cost_per_piece
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """,
             insert_detail,
         )

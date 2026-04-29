@@ -59,6 +59,8 @@
         <p class="controls-hint">
           Standalone = no parent company in the customer file. Uncheck to show only accounts that belong to a parent.
         </p>
+        <label class="check"><input type="checkbox" id="kcPresort" /> KC presort</label>
+        <label class="check"><input type="checkbox" id="efd" /> EFD</label>
         <label class="check"><input type="checkbox" id="consolidate" /> Consolidate Date &amp; Mailclass</label>
         <label class="check"><input type="checkbox" id="removeZeros" /> Remove Zero Count Rows</label>
         <label class="check"><input type="checkbox" id="hideCosts" /> Hide Costs</label>
@@ -67,6 +69,7 @@
     </section>
 
     <div class="toolbar-exports">
+      <label class="check"><input type="checkbox" id="removeCustomerNumbers" checked /> Remove Customer Numbers</label>
       <label class="export-discount">
         <span class="export-discount-label">Flats discount ($)</span>
         <input
@@ -78,6 +81,17 @@
           aria-label="Flats discount in dollars per piece"
         />
       </label>
+      <label class="export-discount">
+        <span class="export-discount-label">Parcel discount ($)</span>
+        <input
+          type="number"
+          id="parcelDiscount"
+          min="0"
+          step="0.01"
+          value="0.25"
+          aria-label="Parcel discount in dollars per piece"
+        />
+      </label>
       <button type="button" class="btn btn-export" id="btnExportPostage">
         <span class="export-btn-label">&#128229; Export Postage Invoice</span>
         <span class="export-btn-spinner hidden" aria-hidden="true"></span>
@@ -86,12 +100,24 @@
         <span class="export-btn-label">&#128196; Export Flats Report view</span>
         <span class="export-btn-spinner hidden" aria-hidden="true"></span>
       </button>
+      <button type="button" class="btn btn-export" id="btnExportProfitReport">
+        <span class="export-btn-label">&#128229; Export Profit Report (Flats)</span>
+        <span class="export-btn-spinner hidden" aria-hidden="true"></span>
+      </button>
       <button type="button" class="btn btn-export" id="btnExportParcelsCsv">
         <span class="export-btn-label">&#128196; Export Parcels CSV</span>
         <span class="export-btn-spinner hidden" aria-hidden="true"></span>
       </button>
       <button type="button" class="btn btn-export" id="btnExportParcelsXlsx">
-        <span class="export-btn-label">&#128196; Export Parcels Excel</span>
+        <span class="export-btn-label">&#128196; Export Parcels Dept/Weight</span>
+        <span class="export-btn-spinner hidden" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="btn btn-export" id="btnExportConsolidatedParcelCsv">
+        <span class="export-btn-label">&#128196; Export Consolidated Parcel CSV</span>
+        <span class="export-btn-spinner hidden" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="btn btn-export" id="btnExportEfdParcelInvoice">
+        <span class="export-btn-label">&#128196; EFD Parcel Invoice</span>
         <span class="export-btn-spinner hidden" aria-hidden="true"></span>
       </button>
       <button type="button" class="btn btn-export" id="btnExportConsolidatedVolumes">
@@ -112,6 +138,7 @@
       <button type="button" class="tab active" data-tab="postage" role="tab" aria-selected="true">&#128238; Postage</button>
       <button type="button" class="tab" data-tab="parcels" role="tab" aria-selected="false">&#128230; Parcels</button>
       <button type="button" class="tab" data-tab="summary" role="tab" aria-selected="false">&#128203; Import Summary</button>
+      <button type="button" class="tab" data-tab="profitFlats" role="tab" aria-selected="false">&#128200; Profit Report (Flats)</button>
     </nav>
 
     <div id="errorBanner" class="error-banner hidden" role="alert"></div>
@@ -135,10 +162,10 @@
         <div class="table-scroll" id="tableParcels"></div>
       </div>
       <div class="parcel-zone-summary-panel" id="parcelZoneSummaryPanel">
-        <h3 class="parcel-zone-summary-heading">Parcel zone summary (Priority vs EFD)</h3>
+        <h3 class="parcel-zone-summary-heading">Parcel zone summary (Retail)</h3>
         <p class="parcel-zone-summary-hint">
-          USPS zones 1–8 by weight (1–10 lb). Quantities from billing data; Priority (retail) and EFD unit prices from
-          <code>parcel summary.csv</code>. Costs = EFD × count; savings = (retail − EFD) × count. Same filters as the
+          USPS zones 1–9 by weight (1–10 lb). Quantities from billing data; retail unit prices come from the database
+          retail-rate tables (Ground Advantage for ≤10 lb). Costs = retail × count. Same filters as the
           table above.
         </p>
         <div id="parcelZoneBanner"></div>
@@ -191,6 +218,20 @@
       </div>
       <h3 class="import-log-title">Import Log</h3>
       <div class="table-scroll" id="tableImports"></div>
+    </section>
+
+    <section id="tabProfitFlats" class="tab-panel hidden" role="tabpanel">
+      <div class="summary-bar" id="summaryProfitFlats"></div>
+      <div id="profitFlatsError" class="error-banner hidden" role="alert"></div>
+      <div class="table-wrap loading-wrap" id="wrapProfitFlats">
+        <div class="spinner hidden" id="spinProfitFlats"></div>
+        <h3 class="summary-section-heading">Parcel Profit</h3>
+        <div class="table-scroll short" id="parcelProfitBlock"></div>
+        <h3 class="summary-section-heading">Flats profit by sort level (WS3 rate_type)</h3>
+        <div class="table-scroll" id="tableProfitFlatsRateType"></div>
+        <h3 class="summary-section-heading">Flats Detail</h3>
+        <div class="table-scroll" id="tableProfitFlatsDetail"></div>
+      </div>
     </section>
   </div>
 
