@@ -4,16 +4,20 @@ Flask + SQLite app for Pitney Bowes postage data and parcel billing imports, wit
 
 ## Requirements
 
-- Python 3.11+
+- Python **3.12** recommended for parity with CI (see `.python-version`); 3.11+ often works locally.
 - Optional: [LibreOffice](https://www.libreoffice.org/) (headless) for converting `BM_*.xls` and NetSort `WS3_FCFL_CustomerMailDetail*.xls` files — not needed if you only use `BM_*_report.csv` or supply `.xlsx`
 
 ## Setup
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+pip install -r requirements-dev.txt   # only needed for tests / development
 ```
+
+See **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)** for run commands, testing, and environment troubleshooting.
 
 ## Run
 
@@ -32,6 +36,9 @@ On the **Import Summary** tab, parcel totals and tables use each piece’s **`Ti
 ## Tests
 
 ```bash
-pip install -r requirements.txt
-pytest
+source .venv/bin/activate
+pip install -r requirements-dev.txt   # first time, or after changing deps
+python -m pytest tests/
 ```
+
+You can also run **`scripts/check_env.sh`** for a quick import + subset check.

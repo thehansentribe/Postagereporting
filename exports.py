@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 import csv
-import math
 from functools import cmp_to_key
 import os
 import re
@@ -19,6 +18,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from allocations import allocate_integer_proportional
 import db
 
 # Re-export from db (single source of truth).
@@ -126,31 +126,6 @@ def _invoice_oz_parent_lines(
     return cust, ret_line
 
 
-def allocate_integer_proportional(total: int, weights: list[float]) -> list[int]:
-    """
-    Split `total` into integers proportional to `weights` (largest remainder method).
-    Sum of result always equals `total` when weights are non-empty and sum(weights) > 0.
-    If `total` <= 0 or weights empty, returns all zeros. If sum(weights) == 0, splits
-    `total` evenly across indices (remainder to low indices).
-    """
-    n = len(weights)
-    if n == 0 or total <= 0:
-        return [0] * n
-    s = float(sum(weights))
-    if s <= 0:
-        base, rem = divmod(total, n)
-        return [base + (1 if i < rem else 0) for i in range(n)]
-    raw = [total * float(w) / s for w in weights]
-    floors = [int(math.floor(x)) for x in raw]
-    assigned = sum(floors)
-    rem = total - assigned
-    order = sorted(range(n), key=lambda i: (raw[i] - floors[i], i), reverse=True)
-    out = list(floors)
-    for j in range(rem):
-        out[order[j]] += 1
-    return out
-
-
 def _allocate_ws3_rejects_joint(
     cur: sqlite3.Cursor,
     scope_range_sql: str,
@@ -217,6 +192,83 @@ def _allocate_ws3_rejects_joint(
     return alloc, dict(ws3_by_oz), dict(ws3_by_dept)
 
 
+def _allocate_presort_rejects_by_day_efd_only(
+    cur: sqlite3.Cursor,
+    scope_range_sql: str,
+    scope_range_params: list[Any],
+    *,
+    rejects_by_day: dict[str, int],
+) -> tuple[dict[tuple[int, int], int], dict[int, int], dict[int, int]]:
+    """
+    Allocate presort rejects by day across (customer_number, weight_oz) using weights from that
+    day's INVOICE_EFD_FLAT_MAIL_CLASS (`1CA5DFlt`) volume only.
+
+    This makes multi-day ranges consistent with the sum of per-day allocations.
+    """
+    efd_cls = db.INVOICE_EFD_FLAT_MAIL_CLASS
+    alloc: dict[tuple[int, int], int] = defaultdict(int)
+    by_oz: dict[int, int] = defaultdict(int)
+    by_dept: dict[int, int] = defaultdict(int)
+
+    for d, total in (rejects_by_day or {}).items():
+        day_total = int(total or 0)
+        if day_total <= 0:
+            continue
+        day_rows = cur.execute(
+            f"""
+            SELECT c.customer_number,
+                   CAST(ROUND(p.weight_oz) AS INTEGER) AS woz,
+                   SUM(p.pieces) AS pcs
+            FROM postage_data p
+            JOIN customers c ON p.account_code = c.customer_number
+            WHERE {scope_range_sql}
+              AND p.file_date = ?
+              AND p.mail_class = ?
+              AND p.weight_oz BETWEEN 1 AND 13
+            GROUP BY c.customer_number, CAST(ROUND(p.weight_oz) AS INTEGER)
+            """,
+            [*scope_range_params, str(d), efd_cls],
+        ).fetchall()
+
+        pairs: list[tuple[int, int, int]] = []
+        for r in day_rows:
+            cn = int(r["customer_number"])
+            woz = int(r["woz"] or 0)
+            pcs = int(r["pcs"] or 0)
+            if pcs <= 0 or not (1 <= woz <= 13):
+                continue
+            pairs.append((cn, woz, pcs))
+
+        if not pairs:
+            continue
+
+        cap = sum(p[2] for p in pairs)
+        alloc_total = min(day_total, cap)
+        if alloc_total <= 0:
+            continue
+
+        weights = [float(p[2]) for p in pairs]
+        amounts = allocate_integer_proportional(int(alloc_total), weights)
+        for (cn, woz, _), a in zip(pairs, amounts):
+            aa = int(a or 0)
+            if aa <= 0:
+                continue
+            alloc[(cn, woz)] += aa
+            by_oz[woz] += aa
+            by_dept[cn] += aa
+
+    return dict(alloc), dict(by_oz), dict(by_dept)
+
+
+def _cost_center_row_all_zeros(child: dict[str, Any]) -> bool:
+    return (
+        int(child.get("pieces") or 0) == 0
+        and int(child.get("rejects") or 0) == 0
+        and abs(float(child.get("cost") or 0.0)) < 1e-9
+        and abs(float(child.get("savings") or 0.0)) < 1e-9
+    )
+
+
 def _cost_centers_flats_range(
     cur: sqlite3.Cursor,
     scope_range_sql: str,
@@ -228,6 +280,7 @@ def _cost_centers_flats_range(
     *,
     ws3_by_oz: dict[int, int],
     ws3_alloc: dict[tuple[int, int], int],
+    remove_zeros: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Per-customer charges mirror the invoice weight grid: I = max(0, efd - ws3), K = imb + ws3,
@@ -367,37 +420,38 @@ def _cost_centers_flats_range(
                 "savings": savings,
             }
         )
+    if remove_zeros:
+        out = [c for c in out if not _cost_center_row_all_zeros(c)]
     return out
 
 
 # Flats data grid XLSX — column keys/labels aligned with `postageTableColumns` in static/app.js.
-def _flats_grid_header_keys_and_labels(hide_costs: bool) -> tuple[list[str], list[str]]:
+def _flats_grid_header_keys_and_labels(
+    hide_costs: bool, hide_customer_numbers: bool = True
+) -> tuple[list[str], list[str]]:
     oz_keys = [f"oz_{i}" for i in range(13)] + ["oz_13", "oz_13plus"]
-    keys: list[str] = [
-        "date",
-        "parent_name",
-        "child_name",
-        "mail_class",
-        *oz_keys,
-        "total_qty",
-    ]
-    labels: list[str] = [
-        "Date",
-        "Parent Name",
-        "Child Name",
-        "Class",
-        *[f"{i} oz" for i in range(13)],
-        "13 oz",
-        "13+ oz",
-        "Total Qty",
-    ]
+    keys: list[str] = ["date", "parent_name", "child_name"]
+    labels: list[str] = ["Date", "Parent Name", "Child Name"]
+    if not hide_customer_numbers:
+        keys.append("child_number")
+        labels.append("Child Number")
+    keys.extend(["mail_class", *oz_keys, "total_qty"])
+    labels.extend(
+        [
+            "Class",
+            *[f"{i} oz" for i in range(13)],
+            "13 oz",
+            "13+ oz",
+            "Total Qty",
+        ]
+    )
     if not hide_costs:
         keys.append("total_cost")
         labels.append("Total Cost")
     return keys, labels
 
 
-_FLATS_GRID_ALL_KEYS = set(_flats_grid_header_keys_and_labels(False)[0])
+_FLATS_GRID_ALL_KEYS = set(_flats_grid_header_keys_and_labels(False, False)[0])
 
 
 def _flats_grid_cell_value(row: dict[str, Any], k: str) -> Any:
@@ -471,6 +525,8 @@ def export_flats_data_grid_xlsx(
     consolidate: bool = False,
     remove_zeros: bool = False,
     hide_costs: bool = False,
+    hide_customer_numbers: bool = True,
+    allocate_presort_rejects: bool = False,
     sort_key: str = "date",
     sort_dir: int = 1,
 ) -> Path:
@@ -490,11 +546,14 @@ def export_flats_data_grid_xlsx(
             consolidate=consolidate,
             remove_zeros=remove_zeros,
             hide_costs=hide_costs,
+            allocate_presort_rejects=allocate_presort_rejects,
         )
         rows_raw = list(data.get("rows") or [])
         rows = _sort_flats_grid_rows(rows_raw, sort_key, sort_dir)
 
-        header_keys, headers = _flats_grid_header_keys_and_labels(hide_costs)
+        header_keys, headers = _flats_grid_header_keys_and_labels(
+            hide_costs, hide_customer_numbers
+        )
         wb = Workbook()
         ws = wb.active
         ws.title = "Flats"
@@ -542,6 +601,8 @@ def export_flats_data_grid_csv(
     consolidate: bool = False,
     remove_zeros: bool = False,
     hide_costs: bool = False,
+    hide_customer_numbers: bool = True,
+    allocate_presort_rejects: bool = False,
     sort_key: str = "date",
     sort_dir: int = 1,
 ) -> Path:
@@ -561,10 +622,13 @@ def export_flats_data_grid_csv(
             consolidate=consolidate,
             remove_zeros=remove_zeros,
             hide_costs=hide_costs,
+            allocate_presort_rejects=allocate_presort_rejects,
         )
         rows_raw = list(data.get("rows") or [])
         rows = _sort_flats_grid_rows(rows_raw, sort_key, sort_dir)
-        header_keys, headers = _flats_grid_header_keys_and_labels(hide_costs)
+        header_keys, headers = _flats_grid_header_keys_and_labels(
+            hide_costs, hide_customer_numbers
+        )
 
         out = Path(
             tempfile.mkstemp(
@@ -582,6 +646,215 @@ def export_flats_data_grid_csv(
         conn.close()
 
 
+def fill_postage_invoice_worksheet(
+    ws,
+    conn: sqlite3.Connection,
+    parent_number: int,
+    start_date: str,
+    end_date: str,
+    *,
+    discount: float = 0.10,
+    customer_number: int | None = None,
+    show_parents: bool = True,
+    show_main: bool = True,
+    remove_zeros: bool = False,
+    hide_costs: bool = False,
+    hide_savings: bool = False,
+    set_sheet_title: str | None = None,
+    sheet_idx: int = 1,
+    empty_invoice_if_no_data: bool = False,
+) -> bool:
+    """
+    Write postage invoice layout onto an existing worksheet.
+
+    Returns True when a full invoice was written; False when only a no-data message
+    was written (standalone export). When ``empty_invoice_if_no_data`` is True, writes
+    a zeroed invoice layout so cross-sheet summary formulas still resolve.
+    """
+    cur = conn.cursor()
+
+    rates: dict[int, float] = {}
+    for row in cur.execute(
+        "SELECT weight_not_over_oz, rate_retail FROM flat_rate_costs ORDER BY weight_not_over_oz"
+    ):
+        rates[int(row["weight_not_over_oz"])] = float(row["rate_retail"] or 0)
+
+    scope_range_sql, scope_range_params = db.postage_scope_where_clause(
+        start_date,
+        end_date,
+        parent_number,
+        customer_number,
+        show_parents,
+        show_main,
+    )
+
+    has_postage = cur.execute(
+        f"""
+        SELECT 1 FROM postage_data p
+        JOIN customers c ON p.account_code = c.customer_number
+        WHERE {scope_range_sql}
+        LIMIT 1
+        """,
+        scope_range_params,
+    ).fetchone()
+
+    parent = cur.execute(
+        "SELECT customer_name FROM customers WHERE customer_number = ?",
+        (parent_number,),
+    ).fetchone()
+    parent_name = parent["customer_name"] if parent else f"Account {parent_number}"
+    contact = CUSTOMER_CONTACTS.get(parent_number, {})
+
+    if set_sheet_title is not None:
+        ws.title = set_sheet_title[:31]
+
+    if not has_postage and not empty_invoice_if_no_data:
+        ws["A1"] = "No postage data in range for this parent."
+        return False
+
+    if not has_postage:
+        weight_data: dict[int, dict[str, Any]] = {}
+        other_pieces = 0
+        other_cost = 0.0
+        range_total_pieces = 0
+        range_total_retail = 0.0
+        children: list = []
+    else:
+        efd_cls = db.INVOICE_EFD_FLAT_MAIL_CLASS
+        weight_data = {}
+        for row in cur.execute(
+            f"""
+            SELECT CAST(ROUND(p.weight_oz) AS INTEGER) AS woz,
+                   SUM(CASE WHEN p.mail_class = '{efd_cls}' THEN p.pieces ELSE 0 END) AS efd_pieces,
+                   SUM(CASE WHEN p.mail_class <> '{efd_cls}' THEN p.pieces ELSE 0 END) AS reject_pieces,
+                   SUM(p.total_cost) AS cost
+            FROM postage_data p
+            JOIN customers c ON p.account_code = c.customer_number
+            WHERE {scope_range_sql}
+              AND CAST(ROUND(p.weight_oz) AS INTEGER) BETWEEN 1 AND 13
+              AND p.mail_class IN {POSTAGE_INVOICE_FLAT_MAIL_SQL_IN}
+            GROUP BY CAST(ROUND(p.weight_oz) AS INTEGER)
+            """,
+            scope_range_params,
+        ):
+            woz = int(row["woz"] or 0)
+            if not (1 <= woz <= 13):
+                continue
+            efd_pc = int(row["efd_pieces"] or 0)
+            rej_pc = int(row["reject_pieces"] or 0)
+            tc = float(row["cost"] or 0.0)
+            if woz not in weight_data:
+                weight_data[woz] = {
+                    "efd_pieces": 0,
+                    "reject_pieces": 0,
+                    "pieces": 0,
+                    "cost": 0.0,
+                }
+            weight_data[woz]["efd_pieces"] += efd_pc
+            weight_data[woz]["reject_pieces"] += rej_pc
+            weight_data[woz]["pieces"] += efd_pc + rej_pc
+            weight_data[woz]["cost"] += tc
+
+        other_row = cur.execute(
+            f"""
+            SELECT COALESCE(SUM(p.pieces), 0) AS pieces,
+                   COALESCE(SUM(p.total_cost), 0) AS cost
+            FROM postage_data p
+            JOIN customers c ON p.account_code = c.customer_number
+            WHERE {scope_range_sql}
+              AND (p.weight_oz IS NULL OR p.weight_oz <= 13)
+              AND (
+                (p.mail_class IS NULL OR p.mail_class NOT IN {POSTAGE_INVOICE_FLAT_MAIL_SQL_IN})
+                OR (
+                  p.mail_class IN {POSTAGE_INVOICE_FLAT_MAIL_SQL_IN}
+                  AND (p.weight_oz IS NULL OR p.weight_oz < 1)
+                )
+              )
+            """,
+            scope_range_params,
+        ).fetchone()
+        other_pieces = int(other_row["pieces"] or 0)
+        other_cost = float(other_row["cost"] or 0.0)
+
+        range_totals = db.query_postage(
+            conn,
+            start_date,
+            end_date,
+            parent_number,
+            customer_number,
+            show_parents,
+            show_main,
+            consolidate=False,
+            remove_zeros=remove_zeros,
+            hide_costs=False,
+        )
+        range_total_pieces = int(range_totals["total_pieces"] or 0)
+        range_total_retail = float(range_totals.get("total_retail_cost") or 0.0)
+
+        rejects_by_day = db.query_total_presort_reject_counts_by_day_for_invoice(
+            conn,
+            start_date,
+            end_date,
+            parent_number,
+            customer_number,
+            show_parents,
+            show_main,
+        )
+        ws3_alloc, ws3_by_oz, _ws3_by_dept = _allocate_presort_rejects_by_day_efd_only(
+            cur,
+            scope_range_sql,
+            list(scope_range_params),
+            rejects_by_day=rejects_by_day,
+        )
+        for oz, wc in ws3_by_oz.items():
+            if int(wc or 0) <= 0:
+                continue
+            if oz not in weight_data:
+                weight_data[oz] = {
+                    "efd_pieces": 0,
+                    "reject_pieces": 0,
+                    "pieces": 0,
+                    "cost": 0.0,
+                }
+            weight_data[oz]["ws3_pieces"] = int(wc)
+
+        children = _cost_centers_flats_range(
+            cur,
+            scope_range_sql,
+            list(scope_range_params),
+            parent_number,
+            customer_number,
+            rates,
+            discount,
+            ws3_by_oz=ws3_by_oz,
+            ws3_alloc=ws3_alloc,
+            remove_zeros=remove_zeros,
+        )
+
+    period_end = datetime.strptime(end_date, "%Y-%m-%d")
+    _write_invoice_sheet(
+        ws,
+        sheet_idx,
+        period_end,
+        start_date,
+        end_date,
+        parent_number,
+        parent_name,
+        contact,
+        rates,
+        weight_data,
+        children,
+        discount,
+        other_pieces,
+        other_cost,
+        range_total_pieces,
+        range_total_retail=range_total_retail,
+        hide_costs=hide_costs,
+        hide_savings=hide_savings,
+    )
+    return True
+
+
 def export_postage_invoice(
     parent_number: int,
     start_date: str,
@@ -596,183 +869,30 @@ def export_postage_invoice(
 ) -> Path:
     conn = db.get_connection()
     try:
-        cur = conn.cursor()
-
-        rates: dict[int, float] = {}
-        for row in cur.execute(
-            "SELECT weight_not_over_oz, rate_retail FROM flat_rate_costs ORDER BY weight_not_over_oz"
-        ):
-            rates[int(row["weight_not_over_oz"])] = float(row["rate_retail"] or 0)
-
-        scope_range_sql, scope_range_params = db.postage_scope_where_clause(
-            start_date,
-            end_date,
-            parent_number,
-            customer_number,
-            show_parents,
-            show_main,
-        )
-
-        has_postage = cur.execute(
-            f"""
-            SELECT 1 FROM postage_data p
-            JOIN customers c ON p.account_code = c.customer_number
-            WHERE {scope_range_sql}
-            LIMIT 1
-            """,
-            scope_range_params,
-        ).fetchone()
-
-        parent = cur.execute(
-            "SELECT customer_name FROM customers WHERE customer_number = ?",
-            (parent_number,),
-        ).fetchone()
-        parent_name = parent["customer_name"] if parent else f"Account {parent_number}"
-        contact = CUSTOMER_CONTACTS.get(parent_number, {})
-
         wb = Workbook()
         wb.remove(wb.active)
 
-        if not has_postage:
+        sheet_title = _invoice_range_sheet_title(start_date, end_date)
+        ws = wb.create_sheet(title=sheet_title)
+        wrote = fill_postage_invoice_worksheet(
+            ws,
+            conn,
+            parent_number,
+            start_date,
+            end_date,
+            discount=discount,
+            customer_number=customer_number,
+            show_parents=show_parents,
+            show_main=show_main,
+            remove_zeros=remove_zeros,
+            hide_costs=hide_costs,
+            hide_savings=hide_savings,
+            set_sheet_title=sheet_title,
+        )
+        if not wrote:
+            wb.remove(ws)
             ws = wb.create_sheet(title="No Data")
             ws["A1"] = "No postage data in range for this parent."
-        else:
-            efd_cls = db.INVOICE_EFD_FLAT_MAIL_CLASS
-            weight_data: dict[int, dict[str, Any]] = {}
-            for row in cur.execute(
-                f"""
-                SELECT CAST(ROUND(p.weight_oz) AS INTEGER) AS woz,
-                       SUM(CASE WHEN p.mail_class = '{efd_cls}' THEN p.pieces ELSE 0 END) AS efd_pieces,
-                       SUM(CASE WHEN p.mail_class <> '{efd_cls}' THEN p.pieces ELSE 0 END) AS reject_pieces,
-                       SUM(p.total_cost) AS cost
-                FROM postage_data p
-                JOIN customers c ON p.account_code = c.customer_number
-                WHERE {scope_range_sql}
-                  AND CAST(ROUND(p.weight_oz) AS INTEGER) BETWEEN 1 AND 13
-                  AND p.mail_class IN {POSTAGE_INVOICE_FLAT_MAIL_SQL_IN}
-                GROUP BY CAST(ROUND(p.weight_oz) AS INTEGER)
-                """,
-                scope_range_params,
-            ):
-                woz = int(row["woz"] or 0)
-                if not (1 <= woz <= 13):
-                    continue
-                efd_pc = int(row["efd_pieces"] or 0)
-                rej_pc = int(row["reject_pieces"] or 0)
-                tc = float(row["cost"] or 0.0)
-                if woz not in weight_data:
-                    weight_data[woz] = {
-                        "efd_pieces": 0,
-                        "reject_pieces": 0,
-                        "pieces": 0,
-                        "cost": 0.0,
-                    }
-                weight_data[woz]["efd_pieces"] += efd_pc
-                weight_data[woz]["reject_pieces"] += rej_pc
-                weight_data[woz]["pieces"] += efd_pc + rej_pc
-                weight_data[woz]["cost"] += tc
-
-            other_row = cur.execute(
-                f"""
-                SELECT COALESCE(SUM(p.pieces), 0) AS pieces,
-                       COALESCE(SUM(p.total_cost), 0) AS cost
-                FROM postage_data p
-                JOIN customers c ON p.account_code = c.customer_number
-                WHERE {scope_range_sql}
-                  AND (p.weight_oz IS NULL OR p.weight_oz <= 13)
-                  AND (
-                    (p.mail_class IS NULL OR p.mail_class NOT IN {POSTAGE_INVOICE_FLAT_MAIL_SQL_IN})
-                    OR (
-                      p.mail_class IN {POSTAGE_INVOICE_FLAT_MAIL_SQL_IN}
-                      AND (p.weight_oz IS NULL OR p.weight_oz < 1)
-                    )
-                  )
-                """,
-                scope_range_params,
-            ).fetchone()
-            other_pieces = int(other_row["pieces"] or 0)
-            other_cost = float(other_row["cost"] or 0.0)
-
-            range_totals = db.query_postage(
-                conn,
-                start_date,
-                end_date,
-                parent_number,
-                customer_number,
-                show_parents,
-                show_main,
-                consolidate=False,
-                remove_zeros=remove_zeros,
-                hide_costs=False,
-            )
-            range_total_pieces = int(range_totals["total_pieces"] or 0)
-            range_total_retail = float(range_totals.get("total_retail_cost") or 0.0)
-
-            sheet_title = _invoice_range_sheet_title(start_date, end_date)
-            ws = wb.create_sheet(title=sheet_title)
-            period_end = datetime.strptime(end_date, "%Y-%m-%d")
-            presort_reject_pieces = db.query_total_presort_reject_count_for_invoice(
-                conn,
-                start_date,
-                end_date,
-                parent_number,
-                customer_number,
-                show_parents,
-                show_main,
-            )
-
-            ws3_alloc, ws3_by_oz, _ws3_by_dept = _allocate_ws3_rejects_joint(
-                cur,
-                scope_range_sql,
-                list(scope_range_params),
-                parent_number,
-                customer_number,
-                presort_reject_pieces,
-            )
-            for oz, wc in ws3_by_oz.items():
-                if int(wc or 0) <= 0:
-                    continue
-                if oz not in weight_data:
-                    weight_data[oz] = {
-                        "efd_pieces": 0,
-                        "reject_pieces": 0,
-                        "pieces": 0,
-                        "cost": 0.0,
-                    }
-                weight_data[oz]["ws3_pieces"] = int(wc)
-
-            children = _cost_centers_flats_range(
-                cur,
-                scope_range_sql,
-                list(scope_range_params),
-                parent_number,
-                customer_number,
-                rates,
-                discount,
-                ws3_by_oz=ws3_by_oz,
-                ws3_alloc=ws3_alloc,
-            )
-
-            _write_invoice_sheet(
-                ws,
-                1,
-                period_end,
-                start_date,
-                end_date,
-                parent_number,
-                parent_name,
-                contact,
-                rates,
-                weight_data,
-                children,
-                discount,
-                other_pieces,
-                other_cost,
-                range_total_pieces,
-                range_total_retail=range_total_retail,
-                hide_costs=hide_costs,
-                hide_savings=hide_savings,
-            )
 
         out = Path(
             tempfile.mkstemp(
@@ -795,17 +915,23 @@ def export_profit_report_xlsx(
     show_parents: bool,
     show_main: bool,
     flats_discount: float,
+    flats_discount_efd: float = 0.23,
+    efd_parcel_fee: float = 1.25,
+    profit_account_ids: list[int] | None = None,
 ) -> Path:
     """
-    Profit report workbook (Flats first).
+    Profit report workbook matching Helper Files/Profit Report Example.xlsx layout:
 
-    Flats profit is computed off WS3 sort levels:
-      sell_to_rate = 1.63 - flats_discount
-      usps_cost_per_piece = postage_claimed / num_pieces
+    Summary uses Excel formulas (B6–B10, flats table D–G, parcel mini-table, combined EFD/Lineage).
+    ``efd_parcel_fee`` is Summary B10 (per-piece adder to billing on the Parcel Profit sheet column Y).
+    Parcel Profit sheet is the full EFD Parcel Invoice (same as standalone EFD export).
+    Flats Detail uses WS3 detail with sell-to = retail minus customer discount (preview parity).
     """
     RETAIL_RATE = 1.63
-    discount = max(0.0, float(flats_discount or 0.0))
-    sell_to = round(float(RETAIL_RATE) - float(discount), 4)
+    discount_cust = max(0.0, float(flats_discount or 0.0))
+    discount_efd = max(0.0, float(flats_discount_efd or 0.0))
+    fee_efd = max(0.0, float(efd_parcel_fee or 0.0))
+    sell_to_detail = round(float(RETAIL_RATE) - float(discount_cust), 4)
 
     conn = db.get_connection()
     try:
@@ -817,7 +943,8 @@ def export_profit_report_xlsx(
             customer_number=customer_number,
             show_parents=show_parents,
             show_main=show_main,
-            sell_to_rate=sell_to,
+            sell_to_rate=sell_to_detail,
+            profit_account_ids=profit_account_ids,
         )
         rate_summary = db.query_ws3_flats_profit_rate_type_summary(
             conn,
@@ -827,7 +954,8 @@ def export_profit_report_xlsx(
             customer_number=customer_number,
             show_parents=show_parents,
             show_main=show_main,
-            sell_to_rate=sell_to,
+            sell_to_rate=sell_to_detail,
+            profit_account_ids=profit_account_ids,
         )
         detail = db.query_ws3_flats_profit_detail(
             conn,
@@ -837,223 +965,341 @@ def export_profit_report_xlsx(
             customer_number=customer_number,
             show_parents=show_parents,
             show_main=show_main,
-            sell_to_rate=sell_to,
+            sell_to_rate=sell_to_detail,
+            profit_account_ids=profit_account_ids,
         )
-    finally:
-        conn.close()
+        parcel_raw = db.query_parcel_profit_totals(
+            conn,
+            start_date,
+            end_date,
+            parent_number=parent_number,
+            customer_number=customer_number,
+            show_parents=show_parents,
+            show_main=show_main,
+            profit_account_ids=profit_account_ids,
+        )
 
-    wb = Workbook()
-    wb.remove(wb.active)
+        wb = Workbook()
+        wb.remove(wb.active)
 
-    # Styles
-    hdr_font = Font(name="Calibri", bold=True, size=11, color="FFFFFF")
-    hdr_fill = PatternFill("solid", start_color="1F4E79")
-    subhdr_font = Font(name="Calibri", bold=True, size=11)
-    body_font = Font(name="Calibri", size=11)
-    thin = Side(style="thin", color="B4B4B4")
-    grid = Border(left=thin, right=thin, top=thin, bottom=thin)
-    money_fmt = "$#,##0.00"
-    rate4_fmt = "0.0000"
-    int_fmt = "#,##0"
+        hdr_font = Font(name="Calibri", bold=True, size=11, color="FFFFFF")
+        hdr_fill = PatternFill("solid", start_color="1F4E79")
+        subhdr_font = Font(name="Calibri", bold=True, size=11)
+        body_font = Font(name="Calibri", size=11)
+        thin = Side(style="thin", color="B4B4B4")
+        grid = Border(left=thin, right=thin, top=thin, bottom=thin)
+        money_fmt = "$#,##0.00"
+        rate4_fmt = "0.0000"
+        int_fmt = "#,##0"
 
-    def write_table(ws, headers: list[str], rows: list[list[Any]], *, money_cols: set[int] = set(), int_cols: set[int] = set(), rate4_cols: set[int] = set()) -> None:
-        for col, h in enumerate(headers, start=1):
-            c = ws.cell(1, col, h)
+        def write_table(
+            tws,
+            headers: list[str],
+            rows: list[list[Any]],
+            *,
+            money_cols: set[int] = set(),
+            int_cols: set[int] = set(),
+            rate4_cols: set[int] = set(),
+        ) -> None:
+            for col, h in enumerate(headers, start=1):
+                c = tws.cell(1, col, h)
+                c.font = hdr_font
+                c.fill = hdr_fill
+                c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                c.border = grid
+            for r_idx, row in enumerate(rows, start=2):
+                for c_idx, v in enumerate(row, start=1):
+                    cell = tws.cell(r_idx, c_idx, v)
+                    cell.font = body_font
+                    cell.border = grid
+                    if c_idx <= 3:
+                        cell.alignment = Alignment(horizontal="left", vertical="center")
+                    else:
+                        cell.alignment = Alignment(horizontal="right", vertical="center")
+                    if c_idx in money_cols and v not in (None, ""):
+                        cell.number_format = money_fmt
+                    elif c_idx in rate4_cols and v not in (None, ""):
+                        cell.number_format = rate4_fmt
+                    elif c_idx in int_cols and v not in (None, ""):
+                        cell.number_format = int_fmt
+            tws.freeze_panes = "A2"
+            tws.row_dimensions[1].height = 24
+
+        # --- Parcel Profit first (EFD invoice layout); Summary formulas reference this sheet.
+        ws_parcel = wb.create_sheet("Parcel Profit")
+        fill_efd_parcel_invoice_worksheet(
+            ws_parcel,
+            conn,
+            start_date,
+            end_date,
+            parent_number,
+            customer_number,
+            show_parents,
+            show_main,
+            set_sheet_title=None,
+            profit_account_ids=profit_account_ids,
+            price_to_efd_adder=fee_efd,
+        )
+
+        ws = wb.create_sheet("Summary", 0)
+        ws["A1"] = "Profit Report"
+        ws["A1"].font = Font(name="Calibri", bold=True, size=16)
+        ws["A3"] = "Start date"
+        ws["B3"] = start_date
+        ws["A4"] = "End date"
+        ws["B4"] = end_date
+        ws["D3"] = "Run days"
+        ws["E3"] = totals.get("run_days", 0)
+        ws["D4"] = "Total pieces"
+        ws["E4"] = totals.get("total_pieces", 0)
+        for r in (3, 4):
+            ws[f"A{r}"].font = subhdr_font
+            ws[f"B{r}"].font = body_font
+        for addr in ("D3", "D4"):
+            ws[addr].font = subhdr_font
+        ws["E3"].number_format = int_fmt
+        ws["E4"].number_format = int_fmt
+
+        ws["A6"] = "Retail rate"
+        ws["B6"] = float(RETAIL_RATE)
+        ws["A7"] = "Flats discount to Customer"
+        ws["B7"] = discount_cust
+        ws["A8"] = "Flats discount to EFD"
+        ws["B8"] = discount_efd
+        ws["A9"] = "Sell-to rate"
+        ws["B9"] = "=B6-B7"
+        ws["A10"] = "Parcel fee to EFD ($/pc)"
+        ws["B10"] = fee_efd
+        for r in range(6, 11):
+            ws[f"A{r}"].font = subhdr_font
+            ws[f"B{r}"].font = body_font
+        ws["B6"].number_format = rate4_fmt
+        ws["B7"].number_format = rate4_fmt
+        ws["B8"].number_format = rate4_fmt
+        ws["B9"].number_format = rate4_fmt
+        ws["B10"].number_format = rate4_fmt
+
+        ws["A12"] = "Flats EFD profit by sort level (WS3 rate_type)"
+        ws["A12"].font = Font(name="Calibri", bold=True, size=12)
+
+        flats_hdr = 13
+        sum_headers = [
+            "Rate Type",
+            "Pieces",
+            "Avg USPS cost / pc",
+            "Price To customer",
+            "Price to EFD",
+            "EFD profit",
+            "Lineage Profit",
+        ]
+        for col, h in enumerate(sum_headers, start=1):
+            c = ws.cell(flats_hdr, col, h)
             c.font = hdr_font
             c.fill = hdr_fill
             c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             c.border = grid
-        for r_idx, row in enumerate(rows, start=2):
-            for c_idx, v in enumerate(row, start=1):
-                cell = ws.cell(r_idx, c_idx, v)
-                cell.font = body_font
-                cell.border = grid
-                if c_idx <= 3:
-                    cell.alignment = Alignment(horizontal="left", vertical="center")
+
+        n_rates = len(rate_summary)
+        data_start = flats_hdr + 1
+        sp_type = db.WS3_FLATS_SINGLE_PIECE_RATE_TYPE
+
+        if n_rates == 0:
+            ws.merge_cells(start_row=data_start, start_column=1, end_row=data_start, end_column=7)
+            c = ws.cell(
+                data_start,
+                1,
+                "No WS3 flats profit rows found for this date range/account scope. Import the WS3 Customer Mail Detail file for these dates (Scan Now), then re-export.",
+            )
+            c.font = Font(name="Calibri", italic=True, size=11)
+            c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+            sum_row = data_start + 1
+            ws.cell(sum_row, 6, 0).number_format = money_fmt
+            ws.cell(sum_row, 7, 0).number_format = money_fmt
+            ws.cell(sum_row, 6).font = body_font
+            ws.cell(sum_row, 7).font = body_font
+        else:
+            for i, row in enumerate(rate_summary):
+                rr = data_start + i
+                rt = str(row.get("rate_type") or "")
+                ws.cell(rr, 1, rt).font = body_font
+                ws.cell(rr, 1).border = grid
+                ws.cell(rr, 1).alignment = Alignment(horizontal="left", vertical="center")
+                pcs = int(row.get("total_pieces") or 0)
+                bcell = ws.cell(rr, 2, pcs)
+                bcell.font = body_font
+                bcell.border = grid
+                bcell.number_format = int_fmt
+                bcell.alignment = Alignment(horizontal="right", vertical="center")
+                avg_usps = row.get("avg_usps_cost_per_piece")
+                cc = ws.cell(rr, 3, avg_usps)
+                cc.font = body_font
+                cc.border = grid
+                cc.number_format = rate4_fmt
+                cc.alignment = Alignment(horizontal="right", vertical="center")
+                if rt == sp_type:
+                    ws.cell(rr, 4, "=$B$6").font = body_font
+                    ws.cell(rr, 5, f"=D{rr}").font = body_font
                 else:
-                    cell.alignment = Alignment(horizontal="right", vertical="center")
-                if c_idx in money_cols and v not in (None, ""):
-                    cell.number_format = money_fmt
-                elif c_idx in rate4_cols and v not in (None, ""):
-                    cell.number_format = rate4_fmt
-                elif c_idx in int_cols and v not in (None, ""):
-                    cell.number_format = int_fmt
-        ws.freeze_panes = "A2"
-        ws.row_dimensions[1].height = 24
+                    ws.cell(rr, 4, "=$B$6-$B$7").font = body_font
+                    ws.cell(rr, 5, "=$B$6-$B$8").font = body_font
+                for cidx in (4, 5):
+                    ws.cell(rr, cidx).border = grid
+                    ws.cell(rr, cidx).number_format = rate4_fmt
+                    ws.cell(rr, cidx).alignment = Alignment(horizontal="right", vertical="center")
+                ws.cell(rr, 6, f"=(D{rr}-E{rr})*B{rr}").font = body_font
+                ws.cell(rr, 6).border = grid
+                ws.cell(rr, 6).number_format = money_fmt
+                ws.cell(rr, 7, f"=(E{rr}-C{rr})*B{rr}").font = body_font
+                ws.cell(rr, 7).border = grid
+                ws.cell(rr, 7).number_format = money_fmt
+            sum_row = data_start + n_rates
+            ws.cell(sum_row, 6, f"=SUM(F{data_start}:F{sum_row - 1})").font = body_font
+            ws.cell(sum_row, 6).border = grid
+            ws.cell(sum_row, 6).number_format = money_fmt
+            ws.cell(sum_row, 7, f"=SUM(G{data_start}:G{sum_row - 1})").font = body_font
+            ws.cell(sum_row, 7).border = grid
+            ws.cell(sum_row, 7).number_format = money_fmt
 
-    # --- Summary sheet
-    ws = wb.create_sheet("Summary")
-    ws["A1"] = "Profit Report (Flats)"
-    ws["A1"].font = Font(name="Calibri", bold=True, size=16)
-    ws["A3"] = "Start date"
-    ws["B3"] = start_date
-    ws["A4"] = "End date"
-    ws["B4"] = end_date
-    ws["A5"] = "Retail rate"
-    ws["B5"] = RETAIL_RATE
-    ws["A6"] = "Flats discount ($)"
-    ws["B6"] = discount
-    ws["A7"] = "Sell-to rate"
-    ws["B7"] = sell_to
-    for r in range(3, 8):
-        ws[f"A{r}"].font = subhdr_font
-        ws[f"B{r}"].font = body_font
-    ws["B5"].number_format = rate4_fmt
-    ws["B6"].number_format = rate4_fmt
-    ws["B7"].number_format = rate4_fmt
+        parcel_title_row = sum_row + 2
+        ws.cell(parcel_title_row, 1, "Parcel Profit").font = Font(name="Calibri", bold=True, size=12)
+        ph = parcel_title_row + 1
+        for col, h in enumerate(["Line", "Description", "Value"], start=1):
+            c = ws.cell(ph, col, h)
+            c.font = hdr_font
+            c.fill = hdr_fill
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = grid
 
-    ws["D3"] = "Run days"
-    ws["E3"] = totals.get("run_days", 0)
-    ws["D4"] = "Total pieces"
-    ws["E4"] = totals.get("total_pieces", 0)
-    ws["D5"] = "Total profit"
-    ws["E5"] = totals.get("total_profit", 0.0)
-    for addr in ("D3", "D4", "D5"):
-        ws[addr].font = subhdr_font
-    ws["E3"].number_format = int_fmt
-    ws["E4"].number_format = int_fmt
-    ws["E5"].number_format = money_fmt
+        pcount = int(parcel_raw.get("parcel_count") or 0)
+        fully = float(parcel_raw.get("total_fully_paid_postage") or 0.0)
+        billing = float(parcel_raw.get("total_billing_amount") or 0.0)
 
-    ws["A9"] = "Flats profit by sort level (WS3 rate_type)"
-    ws["A9"].font = Font(name="Calibri", bold=True, size=12)
+        r1 = ph + 1
+        ws.cell(r1, 1, 1).font = body_font
+        ws.cell(r1, 2, "Parcel count").font = body_font
+        ws.cell(r1, 3, pcount).font = body_font
+        ws.cell(r1, 3).number_format = int_fmt
+        for c in (1, 2, 3):
+            ws.cell(r1, c).border = grid
 
-    sum_headers = [
-        "Rate Type",
-        "Pieces",
-        "Avg USPS cost / pc",
-        "Sell-to / pc",
-        "Avg profit / pc",
-        "Total profit",
-    ]
-    sum_rows: list[list[Any]] = []
-    for r in rate_summary:
-        sum_rows.append(
-            [
-                r.get("rate_type", ""),
-                int(r.get("total_pieces") or 0),
-                r.get("avg_usps_cost_per_piece"),
-                r.get("sell_to_rate"),
-                r.get("avg_profit_per_piece"),
-                r.get("total_profit"),
-            ]
+        r4 = ph + 2
+        ws.cell(r4, 1, 4).font = body_font
+        ws.cell(r4, 2, "Fully Paid Postage total").font = body_font
+        ws.cell(r4, 3, round(fully, 2)).font = body_font
+        ws.cell(r4, 3).number_format = money_fmt
+        for c in (1, 2, 3):
+            ws.cell(r4, c).border = grid
+
+        r5 = ph + 3
+        ws.cell(r5, 1, 5).font = body_font
+        ws.cell(r5, 2, "Billing Amount total").font = body_font
+        ws.cell(r5, 3, round(billing, 2)).font = body_font
+        ws.cell(r5, 3).number_format = money_fmt
+        for c in (1, 2, 3):
+            ws.cell(r5, c).border = grid
+
+        r6 = ph + 4
+        ws.cell(r6, 1, 6).font = body_font
+        ws.cell(r6, 2, "Parcel fee to EFD (total)").font = body_font
+        ws.cell(r6, 3, f"=$B$10*C{r1}").font = body_font
+        ws.cell(r6, 3).number_format = money_fmt
+        for c in (1, 2, 3):
+            ws.cell(r6, c).border = grid
+
+        r8 = ph + 5
+        ws.cell(r8, 1, 8).font = body_font
+        ws.cell(r8, 2, "EFD Profit").font = body_font
+        efd_cell = f"='Parcel Profit'!B{_EFD_PARCEL_INVOICE_SUMMARY_EFD_PROFIT_ROW}"
+        ws.cell(r8, 3, efd_cell).font = body_font
+        ws.cell(r8, 3).number_format = money_fmt
+        for c in (1, 2, 3):
+            ws.cell(r8, c).border = grid
+
+        comb_r = r8 + 2
+        ws.cell(comb_r, 1, "Combined profit summary").font = Font(name="Calibri", bold=True, size=12)
+        ws.cell(comb_r + 1, 2, "EFD").font = subhdr_font
+        ws.cell(comb_r + 1, 3, "Lineage").font = subhdr_font
+        ws.cell(comb_r + 2, 1, "Flats total profit").font = subhdr_font
+        ws.cell(comb_r + 2, 2, f"=F{sum_row}").font = body_font
+        ws.cell(comb_r + 2, 2).number_format = money_fmt
+        ws.cell(comb_r + 2, 3, f"=G{sum_row}").font = body_font
+        ws.cell(comb_r + 2, 3).number_format = money_fmt
+        ws.cell(comb_r + 3, 1, "Parcel ").font = subhdr_font
+        ws.cell(comb_r + 3, 2, f"=C{r8}").font = body_font
+        ws.cell(comb_r + 3, 2).number_format = money_fmt
+        ws.cell(comb_r + 3, 3, f"=C{r6}").font = body_font
+        ws.cell(comb_r + 3, 3).number_format = money_fmt
+        ws.cell(comb_r + 4, 1, "Total").font = subhdr_font
+        ws.cell(comb_r + 4, 2, f"=SUM(B{comb_r + 2}:B{comb_r + 3})").font = body_font
+        ws.cell(comb_r + 4, 2).number_format = money_fmt
+        ws.cell(comb_r + 4, 3, f"=SUM(C{comb_r + 2}:C{comb_r + 3})").font = body_font
+        ws.cell(comb_r + 4, 3).number_format = money_fmt
+
+        for col_letter, w in (("A", 34), ("B", 16), ("C", 14), ("D", 12), ("E", 14), ("F", 14), ("G", 16)):
+            ws.column_dimensions[col_letter].width = w
+
+        ws2 = wb.create_sheet("Flats Detail", 1)
+        det_headers = [
+            "Mail Date",
+            "Mail ID",
+            "Profile",
+            "Parent Account",
+            "Customer Code",
+            "Customer Name",
+            "Rate Type",
+            "Pieces",
+            "Rejected",
+            "Postage Claimed",
+            "USPS cost / pc",
+            "Sell-to / pc",
+            "Profit / pc",
+            "Total profit",
+        ]
+        det_rows: list[list[Any]] = []
+        for r in detail:
+            det_rows.append(
+                [
+                    r.get("mail_date", ""),
+                    r.get("mail_id", ""),
+                    r.get("profile_name", ""),
+                    f"{r.get('parent_customer_name','')} ({r.get('parent_customer_number','')})".strip(),
+                    r.get("customer_code", ""),
+                    r.get("customer_name", ""),
+                    r.get("rate_type", ""),
+                    int(r.get("num_pieces") or 0),
+                    int(r.get("pcs_rejected") or 0),
+                    r.get("postage_claimed"),
+                    r.get("usps_cost_per_piece"),
+                    r.get("sell_to_rate"),
+                    r.get("profit_per_piece"),
+                    r.get("total_profit"),
+                ]
+            )
+        write_table(
+            ws2,
+            det_headers,
+            det_rows,
+            int_cols={8, 9},
+            money_cols={10, 14},
+            rate4_cols={11, 12, 13},
         )
+        if not det_rows:
+            ws2["A3"] = "No WS3 detail rows found for this date range/account scope."
+            ws2["A3"].font = Font(name="Calibri", italic=True, size=11)
+        widths = [12, 14, 18, 28, 14, 26, 16, 10, 10, 14, 14, 12, 12, 14]
+        for i, w in enumerate(widths, start=1):
+            ws2.column_dimensions[get_column_letter(i)].width = w
 
-    # Write summary table at row 10
-    start_row = 10
-    for col, h in enumerate(sum_headers, start=1):
-        c = ws.cell(start_row, col, h)
-        c.font = hdr_font
-        c.fill = hdr_fill
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        c.border = grid
-
-    if not sum_rows:
-        ws.merge_cells(
-            start_row=start_row + 1,
-            start_column=1,
-            end_row=start_row + 1,
-            end_column=len(sum_headers),
+        fd, tmp = tempfile.mkstemp(
+            suffix=f"_Profit_{start_date}_{end_date}.xlsx",
+            prefix="profit_",
         )
-        c = ws.cell(
-            start_row + 1,
-            1,
-            "No WS3 flats profit rows found for this date range/account scope. Import the WS3 Customer Mail Detail file for these dates (Scan Now), then re-export.",
-        )
-        c.font = Font(name="Calibri", italic=True, size=11)
-        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    else:
-        for i, row in enumerate(sum_rows, start=1):
-            rr = start_row + i
-            for c_idx, v in enumerate(row, start=1):
-                cell = ws.cell(rr, c_idx, v)
-                cell.font = body_font
-                cell.border = grid
-                cell.alignment = Alignment(
-                    horizontal="left" if c_idx == 1 else "right", vertical="center"
-                )
-                if c_idx == 2:
-                    cell.number_format = int_fmt
-                elif c_idx in (3, 4, 5):
-                    cell.number_format = rate4_fmt
-                elif c_idx == 6:
-                    cell.number_format = money_fmt
-
-    ws["A" + str(start_row + len(sum_rows) + 2)] = "Parcel Profit Stats (coming next)"
-    ws["A" + str(start_row + len(sum_rows) + 2)].font = Font(name="Calibri", italic=True, size=11)
-
-    # Widths
-    ws.column_dimensions["A"].width = 26
-    ws.column_dimensions["B"].width = 12
-    ws.column_dimensions["C"].width = 18
-    ws.column_dimensions["D"].width = 12
-    ws.column_dimensions["E"].width = 16
-
-    # --- Flats Detail sheet
-    ws2 = wb.create_sheet("Flats Detail")
-    det_headers = [
-        "Mail Date",
-        "Mail ID",
-        "Profile",
-        "Parent Account",
-        "Customer Code",
-        "Customer Name",
-        "Rate Type",
-        "Pieces",
-        "Rejected",
-        "Postage Claimed",
-        "USPS cost / pc",
-        "Sell-to / pc",
-        "Profit / pc",
-        "Total profit",
-    ]
-    det_rows: list[list[Any]] = []
-    for r in detail:
-        det_rows.append(
-            [
-                r.get("mail_date", ""),
-                r.get("mail_id", ""),
-                r.get("profile_name", ""),
-                f"{r.get('parent_customer_name','')} ({r.get('parent_customer_number','')})".strip(),
-                r.get("customer_code", ""),
-                r.get("customer_name", ""),
-                r.get("rate_type", ""),
-                int(r.get("num_pieces") or 0),
-                int(r.get("pcs_rejected") or 0),
-                r.get("postage_claimed"),
-                r.get("usps_cost_per_piece"),
-                r.get("sell_to_rate"),
-                r.get("profit_per_piece"),
-                r.get("total_profit"),
-            ]
-        )
-    write_table(
-        ws2,
-        det_headers,
-        det_rows,
-        int_cols={8, 9},
-        money_cols={10, 14},
-        rate4_cols={11, 12, 13},
-    )
-    if not det_rows:
-        ws2["A3"] = "No WS3 detail rows found for this date range/account scope."
-        ws2["A3"].font = Font(name="Calibri", italic=True, size=11)
-    widths = [12, 14, 18, 28, 14, 26, 16, 10, 10, 14, 14, 12, 12, 14]
-    for i, w in enumerate(widths, start=1):
-        ws2.column_dimensions[get_column_letter(i)].width = w
-
-    # --- Parcel Detail placeholder sheet
-    ws3 = wb.create_sheet("Parcel Detail")
-    ws3["A1"] = "Parcel Detail (coming next)"
-    ws3["A1"].font = Font(name="Calibri", bold=True, size=12)
-
-    fd, tmp = tempfile.mkstemp(
-        suffix=f"_Profit_{start_date}_{end_date}.xlsx",
-        prefix="profit_",
-    )
-    os.close(fd)
-    out = Path(tmp)
-    wb.save(out)
-    return out
+        os.close(fd)
+        out = Path(tmp)
+        wb.save(out)
+        return out
+    finally:
+        conn.close()
 
 
 def _redact_postage_invoice_privacy(
@@ -1159,12 +1405,12 @@ def _write_invoice_sheet(
 
     ws["C5"] = contact.get("address1", "")
     ws["C6"] = contact.get("city_state_zip", "")
-    ws["A8"] = "Phone #"
-    ws["C8"] = contact.get("phone", "")
-    ws["A9"] = "Fax#"
-    ws["C9"] = contact.get("fax", "")
-    ws["A10"] = "email:"
-    ws["C10"] = contact.get("email", "")
+    ws["A8"] = None
+    ws["C8"] = None
+    ws["A9"] = None
+    ws["C9"] = None
+    ws["A10"] = None
+    ws["C10"] = None
 
     if start_date == end_date:
         period_note = start_date
@@ -1172,17 +1418,17 @@ def _write_invoice_sheet(
         period_note = f"{start_date} to {end_date}"
     ws.cell(11, 9, f"Account Summary for {parent_name} ({period_note})").font = BOLD
 
-    ws["A12"] = "2820 Roe Lane Bldg U "
+    ws["A12"] = None
     c_f12 = ws.cell(12, 6, file_date)
     c_f12.number_format = "MM/DD/YYYY"
 
-    ws["A13"] = "Kansas City, KS 66103"
-    ws["A15"] = "phone"
-    ws["B15"] = "913-671-0011"
-    ws["A16"] = "fax "
-    ws["B16"] = "913-403-9919"
-    ws["A17"] = "email "
-    ws["B17"] = "efdmailing@aol.com"
+    ws["A13"] = None
+    ws["A15"] = None
+    ws["B15"] = None
+    ws["A16"] = None
+    ws["B16"] = None
+    ws["A17"] = None
+    ws["B17"] = None
 
     for col, val in [
         (6, "Weight"),
@@ -1530,6 +1776,7 @@ def export_parcel_counts_report_xlsx(
     consolidate: bool,
     remove_zeros: bool,
     hide_costs: bool,
+    hide_customer_numbers: bool = True,
 ) -> Path:
     """Formatted workbook: PARCELS (COUNTS) with weight buckets; last column = Retail Cost (when costs on).
 
@@ -1566,16 +1813,15 @@ def export_parcel_counts_report_xlsx(
     money_fmt = "$#,##0.00"
     int_fmt = "#,##0"
 
-    headers_text = [
-        "Date",
-        "Parent Name",
-        "Child Name",
-        *[f"{i} lb" for i in range(1, 11)],
-        "10+ lb",
-        "Total Qty",
-    ]
+    headers_text = ["Date", "Parent Name", "Child Name"]
+    if not hide_customer_numbers:
+        headers_text.append("Child Number")
+    headers_text.extend([*[f"{i} lb" for i in range(1, 11)], "10+ lb", "Total Qty"])
     if not hide_costs:
         headers_text.append("Retail Cost")
+
+    name_col_count = 3 + (0 if hide_customer_numbers else 1)
+    first_lb_col = name_col_count + 1
 
     for col, h in enumerate(headers_text, start=1):
         c = ws.cell(1, col, h)
@@ -1589,10 +1835,16 @@ def export_parcel_counts_report_xlsx(
             row.get("date"),
             row.get("parent_name"),
             row.get("child_name"),
-            *[int(row.get(f"lb_{i}") or 0) for i in range(1, 11)],
-            int(row.get("lb_10plus") or 0),
-            int(row.get("total_qty") or 0),
         ]
+        if not hide_customer_numbers:
+            values.append(row.get("child_number"))
+        values.extend(
+            [
+                *[int(row.get(f"lb_{i}") or 0) for i in range(1, 11)],
+                int(row.get("lb_10plus") or 0),
+                int(row.get("total_qty") or 0),
+            ]
+        )
         if not hide_costs:
             # Retail-only costing: write one retail-cost column.
             values.append(round(float(row.get("total_retail") or 0), 2))
@@ -1601,19 +1853,22 @@ def export_parcel_counts_report_xlsx(
             cell = ws.cell(ri, col, v)
             cell.font = body_font
             cell.border = grid
-            if col <= 3:
+            if col <= name_col_count:
                 cell.alignment = Alignment(horizontal="left", vertical="center")
             else:
                 cell.alignment = Alignment(horizontal="right", vertical="center")
             if not hide_costs and col == ncols:
                 cell.number_format = money_fmt
-            elif col >= 4:
+            elif col >= first_lb_col:
                 cell.number_format = int_fmt
 
-    ws.freeze_panes = "D2"
+    ws.freeze_panes = f"{get_column_letter(first_lb_col)}2"
     ws.row_dimensions[1].height = 28
 
-    col_widths = [12.0, 24.0, 30.0] + [9.0] * 10 + [9.0, 11.0]
+    col_widths = [12.0, 24.0, 30.0]
+    if not hide_customer_numbers:
+        col_widths.append(10.0)
+    col_widths.extend([9.0] * 10 + [9.0, 11.0])
     if not hide_costs:
         col_widths.append(14.0)
     for i, w in enumerate(col_widths, start=1):
@@ -1944,9 +2199,16 @@ def export_parcel_billing_csv(
         if not billing_cols:
             raise ValueError("No billing_records columns found (table missing?)")
 
-        # Cache retail tables once for the export.
+        # GA rates once; Priority Mail is chosen per billing row date (latest tariff on or before that day).
         ga_rates = db.get_ground_advantage_retail_rates(conn)
-        pm_rates = db.get_priority_mail_retail_rates(conn)
+        pm_by_day: dict[str, tuple] = {}
+
+        def _pm_for_billing_row(ts_raw: Any) -> tuple:
+            od = db.iso_date_from_billing_timestamp(ts_raw)
+            key = od if od is not None else end_date
+            if key not in pm_by_day:
+                pm_by_day[key] = db.get_priority_mail_retail_rates(conn, as_of_date=key)
+            return pm_by_day[key]
 
         rows = db.query_parcel_billing_rows_full(
             conn,
@@ -1998,13 +2260,14 @@ def export_parcel_billing_csv(
             fallback_retail = (
                 r["fully_paid_postage"] if "fully_paid_postage" in r.keys() else None
             )
+            ts_raw = r["time_stamp"] if "time_stamp" in r.keys() else None
             priced = db.compute_retail_cost_for_piece(
                 conn_for_cost,
                 weight_oz=weight_oz,
                 zone_raw=zone_raw,
                 fallback_retail=fallback_retail,
                 ga_rates=ga_rates,
-                pm_rates=pm_rates,
+                pm_rates=_pm_for_billing_row(ts_raw),
             )
             retail_val = priced.get("retail")
             if retail_val is not None:
@@ -2028,7 +2291,7 @@ def export_parcel_billing_csv(
 
 
 # EFD Parcel Invoice XLSX: fixed column subset so billing_amount = Excel column X (24),
-# Price to EFD = Y (25), EFD Revenue = Z (26), retail_cost = AA (27). Matches Helper Files/EFD Parcel Billing.csv.
+# Price to EFD = Y (25), EFD Revenue = Z (26) = retail_cost (AA) − Price to EFD (Y), retail_cost = AA (27).
 _EFD_PARCEL_INVOICE_PREFIX_KEYS: tuple[str, ...] = (
     "parent_name",
     "parent_number",
@@ -2072,6 +2335,196 @@ _EFD_PARCEL_INVOICE_HEADER_ROW = 9
 _EFD_PARCEL_INVOICE_DATA_START = 10
 _EFD_PARCEL_INVOICE_MONEY_FMT = "$#,##0.00"
 _EFD_PARCEL_INVOICE_QTY_FMT = "#,##0"
+# Summary block on EFD Parcel Invoice sheet: EFD Profit total is always B5.
+_EFD_PARCEL_INVOICE_SUMMARY_EFD_PROFIT_ROW = 5
+_EFD_PARCEL_INVOICE_SUMMARY_EFD_PROFIT_COL = 2
+
+
+def _efd_price_to_efd_adder_literal(parcel_reseller: float) -> str:
+    """Non-negative adder formatted for Excel formulas (billing + adder → Price to EFD)."""
+    x = max(0.0, float(parcel_reseller or 0.0))
+    x = round(x, 6)
+    if abs(x - round(x)) < 1e-12:
+        return str(int(round(x)))
+    return f"{x:.6f}".rstrip("0").rstrip(".")
+
+
+def fill_efd_parcel_invoice_worksheet(
+    ws,
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    parent_number: int | None,
+    customer_number: int | None,
+    show_parents: bool,
+    show_main: bool,
+    *,
+    set_sheet_title: str | None = "EFD Parcel Invoice",
+    profit_account_ids: list[int] | None = None,
+    price_to_efd_adder: float = 1.25,
+) -> tuple[str, int, int, int]:
+    """
+    Write EFD Parcel Invoice layout to an existing worksheet (summary rows 1–6, header row 9, data from row 10).
+
+    Returns ``(title, header_row, data_start_row, last_data_row)`` for cross-sheet formulas.
+    Does not ``save`` or ``close`` the connection.
+    ``price_to_efd_adder`` is the per-piece dollar adder in column Y (Price to EFD = billing + adder).
+    """
+    adder_lit = _efd_price_to_efd_adder_literal(price_to_efd_adder)
+    ga_rates = db.get_ground_advantage_retail_rates(conn)
+    pm_by_day: dict[str, tuple] = {}
+
+    def _pm_for_billing_row(ts_raw: Any) -> tuple:
+        od = db.iso_date_from_billing_timestamp(ts_raw)
+        key = od if od is not None else end_date
+        if key not in pm_by_day:
+            pm_by_day[key] = db.get_priority_mail_retail_rates(conn, as_of_date=key)
+        return pm_by_day[key]
+
+    rows = db.query_parcel_billing_rows_full(
+        conn,
+        start_date,
+        end_date,
+        parent_number,
+        customer_number,
+        show_parents,
+        show_main,
+        profit_account_ids,
+    )
+    title = db.parcel_summary_title_name(conn, parent_number, customer_number)
+    conn_for_cost = conn
+
+    hdr_row = _EFD_PARCEL_INVOICE_HEADER_ROW
+    data_start = _EFD_PARCEL_INVOICE_DATA_START
+    col_x = 24
+    col_y = 25
+    col_z = 26
+    col_aa = 27
+    lx = get_column_letter(col_x)
+    ly = get_column_letter(col_y)
+    laa = get_column_letter(col_aa)
+
+    if set_sheet_title is not None:
+        ws.title = set_sheet_title
+
+    font_body = Font(name="Calibri", size=11)
+    font_hdr = Font(name="Calibri", bold=True, size=11)
+
+    ws.cell(1, 1, title).font = font_body
+    ws.cell(1, 2, _short_mdy(start_date)).font = font_body
+    ws.cell(1, 3, _short_mdy(end_date)).font = font_body
+
+    ws.cell(2, 1, "Parcel Cost").font = font_body
+    ws.cell(3, 1, "Price to EFD").font = font_body
+    ws.cell(4, 1, "Price To customer").font = font_body
+    ws.cell(5, 1, "EFD Profit").font = font_body
+    ws.cell(6, 1, "Total parcel quantities").font = font_body
+
+    n = len(rows)
+    last_data = hdr_row + n
+    if n == 0:
+        b2 = ws.cell(2, 2, 0)
+        b2.font = font_body
+        b2.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
+        for rr in (3, 4, 5):
+            c = ws.cell(rr, 2, 0)
+            c.font = font_body
+            c.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
+        b6 = ws.cell(6, 2, 0)
+        b6.font = font_body
+        b6.number_format = _EFD_PARCEL_INVOICE_QTY_FMT
+    else:
+        b2 = ws.cell(2, 2, f"=SUM({lx}{data_start}:{lx}{last_data})")
+        b2.font = font_body
+        b2.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
+        b3 = ws.cell(3, 2, f"=SUM({ly}{data_start}:{ly}{last_data})")
+        b3.font = font_body
+        b3.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
+        b4 = ws.cell(4, 2, f"=SUM({laa}{data_start}:{laa}{last_data})")
+        b4.font = font_body
+        b4.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
+        b5 = ws.cell(5, 2, "=B4-B3")
+        b5.font = font_body
+        b5.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
+        b6 = ws.cell(
+            6,
+            2,
+            f"=COUNTA(A{data_start}:A{last_data})",
+        )
+        b6.font = font_body
+        b6.number_format = _EFD_PARCEL_INVOICE_QTY_FMT
+
+    headers: list[str] = [
+        *_EFD_PARCEL_INVOICE_PREFIX_KEYS,
+        "billing_amount",
+        "Price to EFD",
+        "EFD Revenue",
+        "retail_cost",
+        *_EFD_PARCEL_INVOICE_TAIL_KEYS,
+    ]
+    for col_1, h in enumerate(headers, 1):
+        cell = ws.cell(hdr_row, col_1, h)
+        cell.font = font_hdr
+
+    for i, r in enumerate(rows):
+        excel_row = data_start + i
+        for j, key in enumerate(_EFD_PARCEL_INVOICE_PREFIX_KEYS, 1):
+            v = r[key] if key in r.keys() else None
+            ws.cell(excel_row, j, v).font = font_body
+
+        bill = r["billing_amount"] if "billing_amount" in r.keys() else None
+        cx = ws.cell(excel_row, col_x, bill)
+        cx.font = font_body
+        if bill is not None:
+            try:
+                cx.value = round(float(bill), 2)
+            except (TypeError, ValueError):
+                pass
+        cx.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
+
+        cy = ws.cell(excel_row, col_y, f"={lx}{excel_row}+{adder_lit}")
+        cy.font = font_body
+        cy.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
+
+        cz = ws.cell(excel_row, col_z, f"={laa}{excel_row}-{ly}{excel_row}")
+        cz.font = font_body
+        cz.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
+
+        weight_oz = r["weight_oz"] if "weight_oz" in r.keys() else None
+        zone_raw = r["zone"] if "zone" in r.keys() else None
+        fallback_retail = r["fully_paid_postage"] if "fully_paid_postage" in r.keys() else None
+        ts_raw = r["time_stamp"] if "time_stamp" in r.keys() else None
+        priced = db.compute_retail_cost_for_piece(
+            conn_for_cost,
+            weight_oz=weight_oz,
+            zone_raw=zone_raw,
+            fallback_retail=fallback_retail,
+            ga_rates=ga_rates,
+            pm_rates=_pm_for_billing_row(ts_raw),
+        )
+        retail_val = priced.get("retail")
+        if retail_val is not None:
+            try:
+                retail_val = round(float(retail_val), 2)
+            except (TypeError, ValueError):
+                retail_val = None
+
+        caa = ws.cell(excel_row, col_aa, retail_val)
+        caa.font = font_body
+        caa.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
+
+        tail_start = col_aa + 1
+        for k, key in enumerate(_EFD_PARCEL_INVOICE_TAIL_KEYS):
+            v = r[key] if key in r.keys() else None
+            ws.cell(excel_row, tail_start + k, v).font = font_body
+
+    for col_1 in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(col_1)].width = min(
+            48.0, max(9.0, len(str(headers[col_1 - 1])) * 1.1)
+        )
+
+    last_data_row = last_data if n else hdr_row
+    return title, hdr_row, data_start, last_data_row
 
 
 def efd_parcel_invoice_download_name(
@@ -2100,6 +2553,8 @@ def export_efd_parcel_invoice_xlsx(
     customer_number: int | None,
     show_parents: bool,
     show_main: bool,
+    *,
+    efd_parcel_fee: float = 1.25,
 ) -> tuple[Path, str]:
     """
     EFD Parcel Invoice workbook: summary + line items (same rows as consolidated parcel CSV),
@@ -2109,9 +2564,12 @@ def export_efd_parcel_invoice_xlsx(
     """
     conn = db.get_connection()
     try:
-        ga_rates = db.get_ground_advantage_retail_rates(conn)
-        pm_rates = db.get_priority_mail_retail_rates(conn)
-        rows = db.query_parcel_billing_rows_full(
+        wb = Workbook()
+        ws = wb.active
+        assert ws is not None
+        fee = max(0.0, float(efd_parcel_fee or 0.0))
+        title, _hr, _ds, _ld = fill_efd_parcel_invoice_worksheet(
+            ws,
             conn,
             start_date,
             end_date,
@@ -2119,138 +2577,9 @@ def export_efd_parcel_invoice_xlsx(
             customer_number,
             show_parents,
             show_main,
+            set_sheet_title="EFD Parcel Invoice",
+            price_to_efd_adder=fee,
         )
-        title = db.parcel_summary_title_name(conn, parent_number, customer_number)
-        conn_for_cost = conn
-
-        hdr_row = _EFD_PARCEL_INVOICE_HEADER_ROW
-        data_start = _EFD_PARCEL_INVOICE_DATA_START
-        col_x = 24
-        col_y = 25
-        col_z = 26
-        col_aa = 27
-        lx = get_column_letter(col_x)
-        ly = get_column_letter(col_y)
-        laa = get_column_letter(col_aa)
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "EFD Parcel Invoice"
-        font_body = Font(name="Calibri", size=11)
-        font_hdr = Font(name="Calibri", bold=True, size=11)
-
-        ws.cell(1, 1, title).font = font_body
-        ws.cell(1, 2, _short_mdy(start_date)).font = font_body
-        ws.cell(1, 3, _short_mdy(end_date)).font = font_body
-
-        ws.cell(2, 1, "Parcel Cost").font = font_body
-        ws.cell(3, 1, "Price to EFD").font = font_body
-        ws.cell(4, 1, "Price To customer").font = font_body
-        ws.cell(5, 1, "EFD Profit").font = font_body
-        ws.cell(6, 1, "Total parcel quantities").font = font_body
-
-        n = len(rows)
-        last_data = hdr_row + n
-        if n == 0:
-            b2 = ws.cell(2, 2, 0)
-            b2.font = font_body
-            b2.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
-            for rr in (3, 4, 5):
-                c = ws.cell(rr, 2, 0)
-                c.font = font_body
-                c.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
-            b6 = ws.cell(6, 2, 0)
-            b6.font = font_body
-            b6.number_format = _EFD_PARCEL_INVOICE_QTY_FMT
-        else:
-            b2 = ws.cell(2, 2, f"=SUM({lx}{data_start}:{lx}{last_data})")
-            b2.font = font_body
-            b2.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
-            b3 = ws.cell(3, 2, f"=SUM({ly}{data_start}:{ly}{last_data})")
-            b3.font = font_body
-            b3.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
-            b4 = ws.cell(4, 2, f"=SUM({laa}{data_start}:{laa}{last_data})")
-            b4.font = font_body
-            b4.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
-            b5 = ws.cell(5, 2, "=B4-B3")
-            b5.font = font_body
-            b5.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
-            b6 = ws.cell(
-                6,
-                2,
-                f"=COUNTA(A{data_start}:A{last_data})",
-            )
-            b6.font = font_body
-            b6.number_format = _EFD_PARCEL_INVOICE_QTY_FMT
-
-        headers: list[str] = [
-            *_EFD_PARCEL_INVOICE_PREFIX_KEYS,
-            "billing_amount",
-            "Price to EFD",
-            "EFD Revenue",
-            "retail_cost",
-            *_EFD_PARCEL_INVOICE_TAIL_KEYS,
-        ]
-        for col_1, h in enumerate(headers, 1):
-            cell = ws.cell(hdr_row, col_1, h)
-            cell.font = font_hdr
-
-        for i, r in enumerate(rows):
-            excel_row = data_start + i
-            for j, key in enumerate(_EFD_PARCEL_INVOICE_PREFIX_KEYS, 1):
-                v = r[key] if key in r.keys() else None
-                ws.cell(excel_row, j, v).font = font_body
-
-            bill = r["billing_amount"] if "billing_amount" in r.keys() else None
-            cx = ws.cell(excel_row, col_x, bill)
-            cx.font = font_body
-            if bill is not None:
-                try:
-                    cx.value = round(float(bill), 2)
-                except (TypeError, ValueError):
-                    pass
-            cx.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
-
-            cy = ws.cell(excel_row, col_y, f"={lx}{excel_row}+0.5")
-            cy.font = font_body
-            cy.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
-
-            cz = ws.cell(excel_row, col_z, f"={laa}{excel_row}-0.25-{ly}{excel_row}")
-            cz.font = font_body
-            cz.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
-
-            weight_oz = r["weight_oz"] if "weight_oz" in r.keys() else None
-            zone_raw = r["zone"] if "zone" in r.keys() else None
-            fallback_retail = r["fully_paid_postage"] if "fully_paid_postage" in r.keys() else None
-            priced = db.compute_retail_cost_for_piece(
-                conn_for_cost,
-                weight_oz=weight_oz,
-                zone_raw=zone_raw,
-                fallback_retail=fallback_retail,
-                ga_rates=ga_rates,
-                pm_rates=pm_rates,
-            )
-            retail_val = priced.get("retail")
-            if retail_val is not None:
-                try:
-                    retail_val = round(float(retail_val), 2)
-                except (TypeError, ValueError):
-                    retail_val = None
-
-            caa = ws.cell(excel_row, col_aa, retail_val)
-            caa.font = font_body
-            caa.number_format = _EFD_PARCEL_INVOICE_MONEY_FMT
-
-            tail_start = col_aa + 1
-            for k, key in enumerate(_EFD_PARCEL_INVOICE_TAIL_KEYS):
-                v = r[key] if key in r.keys() else None
-                ws.cell(excel_row, tail_start + k, v).font = font_body
-
-        for col_1 in range(1, len(headers) + 1):
-            ws.column_dimensions[get_column_letter(col_1)].width = min(
-                48.0, max(9.0, len(str(headers[col_1 - 1])) * 1.1)
-            )
-
         scope = parcel_report_scope_label(parent_number, customer_number)
         fd, tmp = tempfile.mkstemp(
             suffix=f"_EFD_Parcel_{scope}_{start_date}_{end_date}.xlsx",
@@ -2260,6 +2589,295 @@ def export_efd_parcel_invoice_xlsx(
         out = Path(tmp)
         wb.save(out)
         return out, title
+    finally:
+        conn.close()
+
+
+# EFD weekly invoice: fixed parent accounts and summary tab layout (Helper Files/EFD4-27 to 5-1.xlsx).
+_EFD_WEEKLY_ACCOUNTS: tuple[tuple[int, str], ...] = (
+    (3901, "BCBS"),
+    (3899, "GEHA"),
+    (3900, "Zinnia"),
+)
+# Shared EFD parent list for weekly invoice and daily volumes exports.
+EFD_REPORT_ACCOUNTS: tuple[tuple[int, str], ...] = _EFD_WEEKLY_ACCOUNTS
+
+_EFD_WEEKLY_MONEY_FMT = "$#,##0.00"
+_EFD_WEEKLY_QTY_FMT = "#,##0"
+_EFD_WEEKLY_SINGLE_POSTAGE_SHEET = "Postage"
+_EFD_WEEKLY_SINGLE_PARCEL_SHEET = "Parcel"
+_EFD_WEEKLY_PARENT_TO_LABEL: dict[int, str] = dict(_EFD_WEEKLY_ACCOUNTS)
+
+
+def efd_report_scope_label(parent_number: int) -> str:
+    """Display scope for filenames, e.g. ``BCBS (3901)``."""
+    label = efd_weekly_summary_label(parent_number)
+    return f"{label} ({int(parent_number)})"
+
+
+def efd_weekly_summary_label(parent_number: int) -> str:
+    """Summary tab label (BCBS, GEHA, Zinnia) for an EFD weekly parent number."""
+    label = _EFD_WEEKLY_PARENT_TO_LABEL.get(int(parent_number))
+    if label is None:
+        allowed = ", ".join(str(p) for p, _ in _EFD_WEEKLY_ACCOUNTS)
+        raise ValueError(
+            f"parent_number must be one of EFD weekly accounts ({allowed}), got {parent_number}"
+        )
+    return label
+
+
+def _efd_weekly_accounts_for_export(
+    parent_number: int | None,
+) -> list[tuple[int, str]]:
+    if parent_number is None:
+        return list(_EFD_WEEKLY_ACCOUNTS)
+    label = _EFD_WEEKLY_PARENT_TO_LABEL.get(int(parent_number))
+    if label is None:
+        allowed = ", ".join(str(p) for p, _ in _EFD_WEEKLY_ACCOUNTS)
+        raise ValueError(
+            f"parent_number must be one of EFD weekly accounts ({allowed}), got {parent_number}"
+        )
+    return [(int(parent_number), label)]
+
+
+def _efd_weekly_postage_sheet_name(parent_number: int, *, combined_sheet_names: bool) -> str:
+    if combined_sheet_names:
+        return f"{parent_number} Postage"[:31]
+    return _EFD_WEEKLY_SINGLE_POSTAGE_SHEET
+
+
+def _efd_weekly_parcel_sheet_name(parent_number: int, *, combined_sheet_names: bool) -> str:
+    if combined_sheet_names:
+        return f"{parent_number} Parcel"[:31]
+    return _EFD_WEEKLY_SINGLE_PARCEL_SHEET
+
+
+def _excel_sheet_ref(sheet_name: str, cell: str) -> str:
+    escaped = str(sheet_name).replace("'", "''")
+    return f"='{escaped}'!{cell}"
+
+
+def efd_weekly_invoice_download_name(start_date: str, end_date: str) -> str:
+    """Example: EFD 4-27 to 5-1.xlsx (month-day when range is within one calendar year)."""
+    try:
+        s = datetime.strptime(start_date, "%Y-%m-%d")
+        e = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        return _safe_filename_piece(f"EFD {_short_mdy(start_date)} to {_short_mdy(end_date)}.xlsx")
+    if start_date == end_date:
+        return _safe_filename_piece(f"EFD {s.month}-{s.day}-{s.year}.xlsx")
+    if s.year == e.year:
+        return _safe_filename_piece(f"EFD {s.month}-{s.day} to {e.month}-{e.day}.xlsx")
+    return _safe_filename_piece(f"EFD {_short_mdy(start_date)} to {_short_mdy(end_date)}.xlsx")
+
+
+def efd_weekly_account_download_name(
+    summary_label: str,
+    start_date: str,
+    end_date: str,
+) -> str:
+    """Example: EFD BCBS 4-27 to 5-1.xlsx"""
+    label = _safe_filename_piece(summary_label.strip() or "Account")
+    try:
+        s = datetime.strptime(start_date, "%Y-%m-%d")
+        e = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        return _safe_filename_piece(
+            f"EFD {label} {_short_mdy(start_date)} to {_short_mdy(end_date)}.xlsx"
+        )
+    if start_date == end_date:
+        return _safe_filename_piece(f"EFD {label} {s.month}-{s.day}-{s.year}.xlsx")
+    if s.year == e.year:
+        return _safe_filename_piece(
+            f"EFD {label} {s.month}-{s.day} to {e.month}-{e.day}.xlsx"
+        )
+    return _safe_filename_piece(
+        f"EFD {label} {_short_mdy(start_date)} to {_short_mdy(end_date)}.xlsx"
+    )
+
+
+def _write_efd_weekly_summary_sheet(
+    ws,
+    account_refs: list[tuple[str, str, str]],
+) -> None:
+    """
+    Summary grid: each account has Flats, Parcels, and Total rows; grand total at bottom.
+
+    ``account_refs``: list of (summary_label, postage_sheet_name, parcel_sheet_name).
+    """
+    font_body = Font(name="Calibri", size=11)
+    font_bold = Font(name="Calibri", bold=True, size=11)
+
+    subtotal_cost_rows: list[int] = []
+    subtotal_qty_rows: list[int] = []
+    row = 1
+    for label, postage_sheet, parcel_sheet in account_refs:
+        flats_row = row
+        ws.cell(row, 1, label).font = font_body
+        ws.cell(row, 2, "Flats").font = font_body
+        c_flats = ws.cell(row, 3, _excel_sheet_ref(postage_sheet, "L31"))
+        c_flats.font = font_body
+        c_flats.number_format = _EFD_WEEKLY_MONEY_FMT
+        d_flats = ws.cell(row, 4, _excel_sheet_ref(postage_sheet, "I32"))
+        d_flats.font = font_body
+        d_flats.number_format = _EFD_WEEKLY_QTY_FMT
+        row += 1
+
+        parcels_row = row
+        ws.cell(row, 1, label).font = font_body
+        ws.cell(row, 2, "Parcels").font = font_body
+        c_parc = ws.cell(row, 3, _excel_sheet_ref(parcel_sheet, "B3"))
+        c_parc.font = font_body
+        c_parc.number_format = _EFD_WEEKLY_MONEY_FMT
+        d_parc = ws.cell(row, 4, _excel_sheet_ref(parcel_sheet, "B6"))
+        d_parc.font = font_body
+        d_parc.number_format = _EFD_WEEKLY_QTY_FMT
+        row += 1
+
+        ws.cell(row, 1, label).font = font_bold
+        ws.cell(row, 2, "Total").font = font_bold
+        c_sub = ws.cell(row, 3, f"=SUM(C{flats_row}:C{parcels_row})")
+        c_sub.font = font_bold
+        c_sub.number_format = _EFD_WEEKLY_MONEY_FMT
+        d_sub = ws.cell(row, 4, f"=SUM(D{flats_row}:D{parcels_row})")
+        d_sub.font = font_bold
+        d_sub.number_format = _EFD_WEEKLY_QTY_FMT
+        subtotal_cost_rows.append(row)
+        subtotal_qty_rows.append(row)
+        row += 1
+
+    if len(account_refs) > 1:
+        cost_refs = ",".join(f"C{r}" for r in subtotal_cost_rows)
+        qty_refs = ",".join(f"D{r}" for r in subtotal_qty_rows)
+        ws.cell(row, 1, "Grand Total").font = font_bold
+        ws.cell(row, 2, "Grand Total").font = font_bold
+        c_grand = ws.cell(row, 3, f"=SUM({cost_refs})")
+        c_grand.font = font_bold
+        c_grand.number_format = _EFD_WEEKLY_MONEY_FMT
+        d_grand = ws.cell(row, 4, f"=SUM({qty_refs})")
+        d_grand.font = font_bold
+        d_grand.number_format = _EFD_WEEKLY_QTY_FMT
+
+    ws.column_dimensions["A"].width = 12.0
+    ws.column_dimensions["B"].width = 12.0
+    ws.column_dimensions["C"].width = 14.0
+    ws.column_dimensions["D"].width = 12.0
+
+
+def _build_efd_weekly_workbook(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    accounts: list[tuple[int, str]],
+    *,
+    combined_sheet_names: bool,
+    discount: float,
+    efd_parcel_fee: float,
+    show_parents: bool,
+    show_main: bool,
+    remove_zeros: bool,
+    hide_costs: bool,
+    hide_savings: bool,
+) -> Workbook:
+    fee = max(0.0, float(efd_parcel_fee or 0.0))
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    account_refs: list[tuple[str, str, str]] = []
+    for parent_number, summary_label in accounts:
+        postage_sheet = _efd_weekly_postage_sheet_name(
+            parent_number, combined_sheet_names=combined_sheet_names
+        )
+        parcel_sheet = _efd_weekly_parcel_sheet_name(
+            parent_number, combined_sheet_names=combined_sheet_names
+        )
+
+        ws_postage = wb.create_sheet(postage_sheet)
+        fill_postage_invoice_worksheet(
+            ws_postage,
+            conn,
+            parent_number,
+            start_date,
+            end_date,
+            discount=discount,
+            show_parents=show_parents,
+            show_main=show_main,
+            remove_zeros=remove_zeros,
+            hide_costs=hide_costs,
+            hide_savings=hide_savings,
+            set_sheet_title=postage_sheet,
+            empty_invoice_if_no_data=True,
+        )
+
+        ws_parcel = wb.create_sheet(parcel_sheet)
+        fill_efd_parcel_invoice_worksheet(
+            ws_parcel,
+            conn,
+            start_date,
+            end_date,
+            parent_number,
+            None,
+            show_parents,
+            show_main,
+            set_sheet_title=parcel_sheet,
+            price_to_efd_adder=fee,
+        )
+
+        account_refs.append((summary_label, postage_sheet, parcel_sheet))
+
+    ws_summary = wb.create_sheet("Summary", 0)
+    _write_efd_weekly_summary_sheet(ws_summary, account_refs)
+    return wb
+
+
+def export_efd_weekly_invoice_xlsx(
+    start_date: str,
+    end_date: str,
+    *,
+    discount: float = 0.10,
+    efd_parcel_fee: float = 1.25,
+    show_parents: bool = True,
+    show_main: bool = True,
+    remove_zeros: bool = False,
+    hide_costs: bool = False,
+    hide_savings: bool = False,
+    parent_number: int | None = None,
+) -> Path:
+    """
+    EFD weekly workbook: Summary plus postage and EFD parcel per account.
+
+    ``parent_number`` None → all three EFD parents in one file (combined sheet names).
+    ``parent_number`` set → single-account file (Summary, Postage, Parcel).
+    """
+    accounts = _efd_weekly_accounts_for_export(parent_number)
+    combined_sheet_names = parent_number is None
+    conn = db.get_connection()
+    try:
+        wb = _build_efd_weekly_workbook(
+            conn,
+            start_date,
+            end_date,
+            accounts,
+            combined_sheet_names=combined_sheet_names,
+            discount=discount,
+            efd_parcel_fee=efd_parcel_fee,
+            show_parents=show_parents,
+            show_main=show_main,
+            remove_zeros=remove_zeros,
+            hide_costs=hide_costs,
+            hide_savings=hide_savings,
+        )
+        if parent_number is None:
+            suffix = f"_EFD_Weekly_{start_date}_{end_date}.xlsx"
+            prefix = "efd_weekly_"
+        else:
+            suffix = f"_EFD_Weekly_{parent_number}_{start_date}_{end_date}.xlsx"
+            prefix = "efd_weekly_acct_"
+        fd, tmp = tempfile.mkstemp(suffix=suffix, prefix=prefix)
+        os.close(fd)
+        out = Path(tmp)
+        wb.save(out)
+        return out
     finally:
         conn.close()
 

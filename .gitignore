@@ -18,3 +18,12 @@ htmlcov/
 # Generated/import artifacts (keep repo lightweight)
 processed/
 reports/
+
+# Local editor / scratch / samples (do not commit)
+.cursor/
+Helper Files/
+Postage Price/
+
+# DB backups / local dumps
+postage.db.bak-*
+*.bak

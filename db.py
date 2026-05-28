@@ -6,9 +6,11 @@ import csv
 import math
 import re
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from allocations import allocate_integer_proportional
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "postage.db"
@@ -55,6 +57,12 @@ INVOICE_EFD_FLAT_MAIL_CLASS = "1CA5DFlt"
 
 # KC presort spec: do not shift these "non-class" metered items into parcels, even if >13 oz.
 KC_PRESORT_METERED_MAIL_CLASSES_UPPER: tuple[str, ...] = ("NOCLASS", "OTHERCLS")
+
+# WS3 flats profit: rows with this rate_type use USPS cost as sell-to (pass-through, no margin).
+WS3_FLATS_SINGLE_PIECE_RATE_TYPE = "Single Piece"
+
+# Profit report / API: max distinct customer numbers in ``profit_accounts`` (CSV or JSON array).
+MAX_PROFIT_ACCOUNT_IDS = 2000
 
 # Postage-derived parcel pricing uses this USPS zone when postage_data has no zone (BM / Pitney).
 DEFAULT_PARCEL_ZONE_FOR_POSTAGE_OVER_13_OZ = 2
@@ -146,6 +154,35 @@ CREATE TABLE IF NOT EXISTS postage_edit_lines (
     FOREIGN KEY (edit_id) REFERENCES postage_edits(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_postage_edit_lines_edit ON postage_edit_lines(edit_id);
+
+CREATE TABLE IF NOT EXISTS billing_edits (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    bill_date         TEXT    NOT NULL,
+    from_account_code INTEGER NOT NULL,
+    to_account_code   INTEGER NOT NULL,
+    mail_class        TEXT    NOT NULL,
+    zone              TEXT    NOT NULL,
+    reason            TEXT,
+    updated_rows      INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_billing_edits_date ON billing_edits(bill_date);
+CREATE INDEX IF NOT EXISTS idx_billing_edits_from ON billing_edits(from_account_code);
+CREATE INDEX IF NOT EXISTS idx_billing_edits_to   ON billing_edits(to_account_code);
+
+CREATE TABLE IF NOT EXISTS billing_edit_lines (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    edit_id            INTEGER NOT NULL,
+    source_billing_id  INTEGER NOT NULL,
+    lb_bucket          INTEGER NOT NULL,
+    weight_oz          REAL    NOT NULL,
+    old_account_code   INTEGER NOT NULL,
+    new_account_code   INTEGER NOT NULL,
+    old_billing_amount REAL,
+    new_billing_amount REAL,
+    FOREIGN KEY (edit_id) REFERENCES billing_edits(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_billing_edit_lines_edit ON billing_edit_lines(edit_id);
 
 CREATE TABLE IF NOT EXISTS flat_rate_costs (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -393,6 +430,7 @@ CREATE INDEX IF NOT EXISTS idx_ground_advantage_retail_effective_date
 
 # Sentinel mail_class for WS3 presort reject totals on the postage dashboard.
 WS3_REJECT_MAIL_CLASS = "Presort rejects"
+WS3_REJECT_ALLOCATED_MAIL_CLASS = "Rejects"
 
 # Invoice / billing: per-piece charge for WS3 presort rejects (editable on System page).
 PRESORT_REJECT_UNIT_COST_KEY = "presort_reject_unit_cost"
@@ -683,6 +721,96 @@ def query_total_presort_reject_count_for_invoice(
     return int(ws3) + int(post)
 
 
+def query_total_presort_reject_counts_by_day_for_invoice(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    parent_number: int,
+    customer_number: int | None,
+    show_parents: bool,
+    show_main: bool,
+) -> dict[str, int]:
+    """
+    Combined presort reject pieces by day (WS3 + postage-derived) for the same scope as the
+    postage invoice.
+
+    Returns: { "YYYY-MM-DD": pieces_int } for dates with rejects (0-count days omitted).
+    """
+    par = "par"
+    # --- WS3 by day
+    ws3_conditions: list[str] = ["r.mail_date BETWEEN ? AND ?"]
+    ws3_params: list[Any] = [start_date, end_date]
+    ws3_conditions.append(f"({par}.parent_number = ? OR {par}.customer_number = ?)")
+    ws3_params.extend([parent_number, parent_number])
+    if customer_number is not None:
+        ep = effective_parent_account_for_ws3(conn, int(customer_number))
+        ws3_conditions.append("r.parent_customer_number = ?")
+        ws3_params.append(ep)
+    if not show_parents:
+        ws3_conditions.append(
+            f"""{par}.customer_number NOT IN (
+            SELECT DISTINCT parent_number FROM customers WHERE parent_number IS NOT NULL
+        )"""
+        )
+    if not show_main:
+        ws3_conditions.append(f"NOT ({par}.parent_number IS NULL AND {par}.parent_name IS NULL)")
+    ws3_where = " AND ".join(ws3_conditions)
+    ws3_rows = conn.execute(
+        f"""
+        SELECT r.mail_date AS d, COALESCE(SUM(r.reject_count), 0) AS cnt
+        FROM ws3_parent_daily_rejects r
+        JOIN customers {par} ON {par}.customer_number = r.parent_customer_number
+        WHERE {ws3_where}
+        GROUP BY r.mail_date
+        """,
+        ws3_params,
+    ).fetchall()
+    out: dict[str, int] = {}
+    for r in ws3_rows:
+        d = str(r["d"])
+        c = int(r["cnt"] or 0)
+        if c:
+            out[d] = out.get(d, 0) + c
+
+    # --- Postage-derived by day
+    post_conditions: list[str] = ["r.file_date BETWEEN ? AND ?"]
+    post_params: list[Any] = [start_date, end_date]
+    post_conditions.append(f"({par}.parent_number = ? OR {par}.customer_number = ?)")
+    post_params.extend([parent_number, parent_number])
+    if customer_number is not None:
+        ep = effective_parent_account_for_ws3(conn, int(customer_number))
+        post_conditions.append("ep.customer_number = ?")
+        post_params.append(ep)
+    if not show_parents:
+        post_conditions.append(
+            f"""{par}.customer_number NOT IN (
+            SELECT DISTINCT parent_number FROM customers WHERE parent_number IS NOT NULL
+        )"""
+        )
+    if not show_main:
+        post_conditions.append(f"NOT ({par}.parent_number IS NULL AND {par}.parent_name IS NULL)")
+    post_where = " AND ".join(post_conditions)
+    post_rows = conn.execute(
+        f"""
+        SELECT r.file_date AS d, COALESCE(SUM(r.reject_count), 0) AS cnt
+        FROM postage_presort_rejects r
+        JOIN customers c ON c.customer_number = r.account_code
+        JOIN customers ep ON ep.customer_number = COALESCE(c.parent_number, c.customer_number)
+        JOIN customers {par} ON {par}.customer_number = ep.customer_number
+        WHERE {post_where}
+        GROUP BY r.file_date
+        """,
+        post_params,
+    ).fetchall()
+    for r in post_rows:
+        d = str(r["d"])
+        c = int(r["cnt"] or 0)
+        if c:
+            out[d] = out.get(d, 0) + c
+
+    return out
+
+
 def seed_flat_retail_rates_if_empty(
     conn: sqlite3.Connection, rows: list[dict[str, float]] | None = None
 ) -> dict[str, Any]:
@@ -779,7 +907,11 @@ def list_parent_customers(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def list_customers_dropdown(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """All customers with kind for account dropdown: parent | child | standalone."""
+    """All customers with kind for account dropdown: parent | child | standalone.
+
+    Each row includes ``parent_number`` when the customer is a child (else ``None``),
+    so UIs can expand a parent selection to all child account numbers.
+    """
     cur = conn.execute(
         "SELECT DISTINCT parent_number FROM customers WHERE parent_number IS NOT NULL"
     )
@@ -800,11 +932,13 @@ def list_customers_dropdown(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             kind = "child"
         else:
             kind = "standalone"
+        pn_raw = r["parent_number"]
         out.append(
             {
                 "customer_number": cn,
                 "customer_name": r["customer_name"] or "",
                 "kind": kind,
+                "parent_number": int(pn_raw) if pn_raw is not None else None,
             }
         )
     return out
@@ -1050,6 +1184,87 @@ def effective_parent_account_for_ws3(conn: sqlite3.Connection, customer_number: 
     return int(r["customer_number"])
 
 
+def normalize_profit_account_ids(
+    conn: sqlite3.Connection,
+    raw_ids: list[int],
+    *,
+    max_ids: int = MAX_PROFIT_ACCOUNT_IDS,
+) -> list[int]:
+    """
+    Dedupe, sort, cap length; keep only IDs that exist in ``customers``.
+
+    Returns the empty list if every input was unknown (caller may treat as error).
+    """
+    seen: set[int] = set()
+    out: list[int] = []
+    for x in raw_ids:
+        i = int(x)
+        if i in seen:
+            continue
+        seen.add(i)
+        row = conn.execute(
+            "SELECT 1 FROM customers WHERE customer_number = ?",
+            (i,),
+        ).fetchone()
+        if row:
+            out.append(i)
+        if len(out) >= max_ids:
+            break
+    out.sort()
+    return out
+
+
+def parse_profit_account_ids_from_json_list(conn: sqlite3.Connection, items: list[Any]) -> list[int]:
+    """
+    Parse ``profit_account_ids`` from a JSON array of integers (POST body).
+
+    Raises ``ValueError`` on invalid entries, empty list, unknown customers-only result,
+    or more than ``MAX_PROFIT_ACCOUNT_IDS`` distinct values.
+    """
+    if not items:
+        raise ValueError("profit_account_ids must be a non-empty array")
+    ids_in: list[int] = []
+    for x in items:
+        try:
+            ids_in.append(int(x))
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"invalid profit_account_ids entry: {x!r}") from e
+    if len(set(ids_in)) > MAX_PROFIT_ACCOUNT_IDS:
+        raise ValueError(
+            f"profit_account_ids may include at most {MAX_PROFIT_ACCOUNT_IDS} distinct customer numbers"
+        )
+    norm = normalize_profit_account_ids(conn, ids_in, max_ids=len(ids_in) + 1)
+    if not norm:
+        raise ValueError("profit_account_ids must include at least one valid customer_number")
+    return norm
+
+
+def parse_profit_accounts_csv(conn: sqlite3.Connection, raw: str | None) -> list[int] | None:
+    """
+    Parse ``profit_accounts`` query string (comma-separated ints) into normalized IDs.
+
+    Returns ``None`` when ``raw`` is empty. Raises ``ValueError`` on invalid tokens or
+    when no normalized IDs remain.
+    """
+    if raw is None or not str(raw).strip():
+        return None
+    parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+    ids_in: list[int] = []
+    for p in parts:
+        try:
+            ids_in.append(int(p))
+        except ValueError as e:
+            raise ValueError(f"invalid profit_accounts value: {p!r}") from e
+    if len(set(ids_in)) > MAX_PROFIT_ACCOUNT_IDS:
+        raise ValueError(
+            f"profit_accounts may include at most {MAX_PROFIT_ACCOUNT_IDS} distinct customer numbers"
+        )
+    norm = normalize_profit_account_ids(conn, ids_in, max_ids=len(ids_in) + 1)
+    if not norm:
+        raise ValueError("profit_accounts must include at least one valid customer_number")
+    return norm
+
+
 def _ws3_scope_where_clause(
     conn: sqlite3.Connection,
     start_date: str,
@@ -1059,6 +1274,7 @@ def _ws3_scope_where_clause(
     show_parents: bool,
     show_main: bool,
     *,
+    profit_account_ids: list[int] | None = None,
     run_alias: str = "r",
     profile_alias: str = "p",
     parent_customer_alias: str = "par",
@@ -1070,6 +1286,8 @@ def _ws3_scope_where_clause(
     - Date range filters by `ws3_mail_runs.mail_date`
     - Account scope uses `ws3_profiles.parent_customer_number` joined to `customers` as `par`
     - When `customer_number` is provided, we constrain to the effective parent account.
+    - When ``profit_account_ids`` is non-empty, scope is the union of WS3 parents for those accounts
+      (via ``effective_parent_account_for_ws3``); single ``parent_number`` / ``customer_number`` are ignored.
     - `show_parents` / `show_main` filters apply to the `customers` row representing the parent account.
     """
     ra = run_alias
@@ -1079,16 +1297,25 @@ def _ws3_scope_where_clause(
     conditions: list[str] = [f"{ra}.mail_date BETWEEN ? AND ?"]
     params: list[Any] = [start_date, end_date]
 
-    # Parent scope mirrors postage_scope_where_clause (on the parent account row).
-    if parent_number is not None:
-        conditions.append(f"({par}.parent_number = ? OR {par}.customer_number = ?)")
-        params.extend([parent_number, parent_number])
+    if profit_account_ids:
+        parents = sorted(
+            {effective_parent_account_for_ws3(conn, int(i)) for i in profit_account_ids}
+        )
+        if parents:
+            ph = ",".join("?" * len(parents))
+            conditions.append(f"{pa}.parent_customer_number IN ({ph})")
+            params.extend(parents)
+    else:
+        # Parent scope mirrors postage_scope_where_clause (on the parent account row).
+        if parent_number is not None:
+            conditions.append(f"({par}.parent_number = ? OR {par}.customer_number = ?)")
+            params.extend([parent_number, parent_number])
 
-    # Child scope: constrain to the effective WS3 parent account.
-    if customer_number is not None:
-        ep = effective_parent_account_for_ws3(conn, int(customer_number))
-        conditions.append(f"{pa}.parent_customer_number = ?")
-        params.append(ep)
+        # Child scope: constrain to the effective WS3 parent account.
+        if customer_number is not None:
+            ep = effective_parent_account_for_ws3(conn, int(customer_number))
+            conditions.append(f"{pa}.parent_customer_number = ?")
+            params.append(ep)
 
     if not show_parents:
         conditions.append(
@@ -1112,13 +1339,16 @@ def query_ws3_flats_profit_detail(
     show_parents: bool,
     show_main: bool,
     sell_to_rate: float,
+    profit_account_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Detail-level WS3 flats profit rows over the date range and account scope.
 
     Profit is computed at the WS3 sort (rate_type) level:
-      profit_per_piece = sell_to_rate - usps_cost_per_piece
+      profit_per_piece = effective_sell - usps_cost_per_piece
       total_profit = profit_per_piece * num_pieces
+    For rate_type ``WS3_FLATS_SINGLE_PIECE_RATE_TYPE``, effective_sell = usps_cost_per_piece
+    (pass-through at cost). Otherwise effective_sell = sell_to_rate.
     """
     where_sql, params = _ws3_scope_where_clause(
         conn,
@@ -1128,6 +1358,7 @@ def query_ws3_flats_profit_detail(
         customer_number,
         show_parents,
         show_main,
+        profit_account_ids=profit_account_ids,
         run_alias="r",
         profile_alias="p",
         parent_customer_alias="par",
@@ -1147,9 +1378,26 @@ def query_ws3_flats_profit_detail(
             d.pcs_rejected,
             d.postage_claimed,
             d.usps_cost_per_piece,
-            ? AS sell_to_rate,
-            ROUND(? - d.usps_cost_per_piece, 4) AS profit_per_piece,
-            ROUND((? - d.usps_cost_per_piece) * d.num_pieces, 2) AS total_profit
+            CASE
+                WHEN d.rate_type = ? THEN d.usps_cost_per_piece
+                ELSE ?
+            END AS sell_to_rate,
+            ROUND(
+                CASE
+                    WHEN d.rate_type = ? THEN d.usps_cost_per_piece
+                    ELSE ?
+                END - d.usps_cost_per_piece,
+                4
+            ) AS profit_per_piece,
+            ROUND(
+                (
+                    CASE
+                        WHEN d.rate_type = ? THEN d.usps_cost_per_piece
+                        ELSE ?
+                    END - d.usps_cost_per_piece
+                ) * d.num_pieces,
+                2
+            ) AS total_profit
         FROM ws3_mail_detail d
         JOIN ws3_mail_runs r ON r.run_id = d.run_id
         JOIN ws3_profiles p ON p.id = d.profile_id
@@ -1161,7 +1409,15 @@ def query_ws3_flats_profit_detail(
           AND d.num_pieces > 0
         ORDER BY r.mail_date, nc.customer_name COLLATE NOCASE, d.customer_code, d.id
         """,
-        [float(sell_to_rate), float(sell_to_rate), float(sell_to_rate), *params],
+        [
+            WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
+            float(sell_to_rate),
+            WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
+            float(sell_to_rate),
+            WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
+            float(sell_to_rate),
+            *params,
+        ],
     )
     out: list[dict[str, Any]] = []
     for r in cur.fetchall():
@@ -1201,11 +1457,13 @@ def query_ws3_flats_profit_rate_type_summary(
     show_parents: bool,
     show_main: bool,
     sell_to_rate: float,
+    profit_account_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """
     WS3 flats profit summary grouped by `rate_type` (sort level) over the range.
 
     Uses weighted average USPS cost per piece (weighted by num_pieces).
+    Sell-to / profit for ``WS3_FLATS_SINGLE_PIECE_RATE_TYPE`` use pass-through at USPS cost.
     """
     where_sql, params = _ws3_scope_where_clause(
         conn,
@@ -1215,6 +1473,7 @@ def query_ws3_flats_profit_rate_type_summary(
         customer_number,
         show_parents,
         show_main,
+        profit_account_ids=profit_account_ids,
         run_alias="r",
         profile_alias="p",
         parent_customer_alias="par",
@@ -1226,10 +1485,40 @@ def query_ws3_flats_profit_rate_type_summary(
             SUM(d.num_pieces) AS total_pieces,
             ROUND(SUM(d.usps_cost_per_piece * d.num_pieces) / NULLIF(SUM(d.num_pieces), 0), 4)
               AS avg_usps_cost_per_piece,
-            ? AS sell_to_rate,
-            ROUND(? - (SUM(d.usps_cost_per_piece * d.num_pieces) / NULLIF(SUM(d.num_pieces), 0)), 4)
-              AS avg_profit_per_piece,
-            ROUND(SUM((? - d.usps_cost_per_piece) * d.num_pieces), 2) AS total_profit
+            ROUND(
+                SUM(
+                    (
+                        CASE
+                            WHEN d.rate_type = ? THEN d.usps_cost_per_piece
+                            ELSE ?
+                        END
+                    ) * d.num_pieces
+                ) / NULLIF(SUM(d.num_pieces), 0),
+                4
+            ) AS sell_to_rate,
+            ROUND(
+                SUM(
+                    (
+                        CASE
+                            WHEN d.rate_type = ? THEN d.usps_cost_per_piece
+                            ELSE ?
+                        END
+                    ) * d.num_pieces
+                ) / NULLIF(SUM(d.num_pieces), 0)
+                - SUM(d.usps_cost_per_piece * d.num_pieces) / NULLIF(SUM(d.num_pieces), 0),
+                4
+            ) AS avg_profit_per_piece,
+            ROUND(
+                SUM(
+                    (
+                        CASE
+                            WHEN d.rate_type = ? THEN d.usps_cost_per_piece
+                            ELSE ?
+                        END - d.usps_cost_per_piece
+                    ) * d.num_pieces
+                ),
+                2
+            ) AS total_profit
         FROM ws3_mail_detail d
         JOIN ws3_mail_runs r ON r.run_id = d.run_id
         JOIN ws3_profiles p ON p.id = d.profile_id
@@ -1241,7 +1530,15 @@ def query_ws3_flats_profit_rate_type_summary(
         GROUP BY d.rate_type
         ORDER BY total_pieces DESC, d.rate_type
         """,
-        [float(sell_to_rate), float(sell_to_rate), float(sell_to_rate), *params],
+        [
+            WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
+            float(sell_to_rate),
+            WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
+            float(sell_to_rate),
+            WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
+            float(sell_to_rate),
+            *params,
+        ],
     )
     out: list[dict[str, Any]] = []
     for r in cur.fetchall():
@@ -1276,8 +1573,9 @@ def query_ws3_flats_profit_totals(
     show_parents: bool,
     show_main: bool,
     sell_to_rate: float,
+    profit_account_ids: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Overall totals for WS3 flats profit over the range/scope."""
+    """Overall totals for WS3 flats profit over the range/scope (Single Piece pass-through at USPS cost)."""
     where_sql, params = _ws3_scope_where_clause(
         conn,
         start_date,
@@ -1286,6 +1584,7 @@ def query_ws3_flats_profit_totals(
         customer_number,
         show_parents,
         show_main,
+        profit_account_ids=profit_account_ids,
         run_alias="r",
         profile_alias="p",
         parent_customer_alias="par",
@@ -1296,7 +1595,17 @@ def query_ws3_flats_profit_totals(
             COUNT(DISTINCT p.parent_customer_number) AS parent_accounts,
             COUNT(DISTINCT r.mail_date) AS run_days,
             COALESCE(SUM(d.num_pieces), 0) AS total_pieces,
-            ROUND(SUM((? - d.usps_cost_per_piece) * d.num_pieces), 2) AS total_profit
+            ROUND(
+                SUM(
+                    (
+                        CASE
+                            WHEN d.rate_type = ? THEN d.usps_cost_per_piece
+                            ELSE ?
+                        END - d.usps_cost_per_piece
+                    ) * d.num_pieces
+                ),
+                2
+            ) AS total_profit
         FROM ws3_mail_detail d
         JOIN ws3_mail_runs r ON r.run_id = d.run_id
         JOIN ws3_profiles p ON p.id = d.profile_id
@@ -1306,7 +1615,7 @@ def query_ws3_flats_profit_totals(
           AND d.num_pieces IS NOT NULL
           AND d.num_pieces > 0
         """,
-        [float(sell_to_rate), *params],
+        [WS3_FLATS_SINGLE_PIECE_RATE_TYPE, float(sell_to_rate), *params],
     ).fetchone()
     if not row:
         return {"parent_accounts": 0, "run_days": 0, "total_pieces": 0, "total_profit": 0.0}
@@ -1327,6 +1636,7 @@ def query_parcel_profit_totals(
     customer_number: int | None,
     show_parents: bool,
     show_main: bool,
+    profit_account_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """
     Totals for Parcel Profit block, based on billing_records within the selected date range + scope.
@@ -1334,12 +1644,14 @@ def query_parcel_profit_totals(
     Uses the same scope/date filters as parcel billing queries (_parcel_billing_filters).
     """
     where_sql, params = _parcel_billing_filters(
+        conn,
         start_date,
         end_date,
         parent_number,
         customer_number,
         show_parents,
         show_main,
+        profit_account_ids,
     )
     row = conn.execute(
         f"""
@@ -1366,6 +1678,79 @@ def query_parcel_profit_totals(
         "total_final_postage": round(float(row["total_final_postage"] or 0.0), 2),
         "total_fully_paid_postage": round(float(row["total_fully_paid_postage"] or 0.0), 2),
         "total_billing_amount": round(float(row["total_billing_amount"] or 0.0), 2),
+    }
+
+
+def parcel_profit_from_raw(raw: dict[str, Any], *, parcel_fee_per_piece: float = 1.25) -> dict[str, Any]:
+    """
+    Parcel Profit lines + computed fields from ``query_parcel_profit_totals`` output.
+
+    Single-piece full-rate: one parcel with billing, final, and fully-paid totals aligned
+    within $0.005 skips the per-piece fee and zeroes Lineage Revenue / EFD Profit.
+    """
+    parcel_count = int(raw.get("parcel_count") or 0)
+    total_final_postage = float(raw.get("total_final_postage") or 0.0)
+    total_fully_paid_postage = float(raw.get("total_fully_paid_postage") or 0.0)
+    total_billing_amount = float(raw.get("total_billing_amount") or 0.0)
+    fee_pp = max(0.0, float(parcel_fee_per_piece or 0.0))
+
+    _money_eps = 0.005
+    single_full_rate = (
+        parcel_count == 1
+        and abs(total_billing_amount - total_final_postage) <= _money_eps
+        and abs(total_fully_paid_postage - total_billing_amount) <= _money_eps
+    )
+    if single_full_rate:
+        postage_fee = 0.0
+        lineage_revenue = 0.0
+        efd_profit = 0.0
+    else:
+        postage_fee = round(float(parcel_count) * fee_pp, 2)
+        lineage_revenue = round(total_billing_amount - total_final_postage + postage_fee, 2)
+        efd_profit = round(total_fully_paid_postage - total_billing_amount - postage_fee, 2)
+
+    lines: list[dict[str, Any]] = [
+        {"line_no": 1, "label": "Parcel count", "kind": "int", "value": parcel_count},
+        {"line_no": 3, "label": "Final Postage total", "kind": "money", "value": round(total_final_postage, 2)},
+        {
+            "line_no": 4,
+            "label": "Fully Paid Postage total",
+            "kind": "money",
+            "value": round(total_fully_paid_postage, 2),
+        },
+        {
+            "line_no": 5,
+            "label": "Billing Amount total",
+            "kind": "money",
+            "value": round(total_billing_amount, 2),
+        },
+        {
+            "line_no": 6,
+            "label": f"Postage fee (qty × ${fee_pp:.2f})",
+            "kind": "money",
+            "value": postage_fee,
+        },
+        {
+            "line_no": 7,
+            "label": "Lineage Revenue",
+            "kind": "money",
+            "value": lineage_revenue,
+        },
+        {
+            "line_no": 8,
+            "label": "EFD Profit",
+            "kind": "money",
+            "value": efd_profit,
+        },
+    ]
+    return {
+        "computed": {
+            "postage_fee": postage_fee,
+            "lineage_revenue": lineage_revenue,
+            "efd_profit": efd_profit,
+            "single_full_rate_pass_through": single_full_rate,
+        },
+        "lines": lines,
     }
 
 
@@ -1785,6 +2170,163 @@ def backfill_postage_uplift_othercls_1120_as_presort_rejects(
     }
 
 
+def _allocate_presort_rejects_into_efd_rows(
+    rows: list[dict[str, Any]],
+    *,
+    hide_costs: bool,
+    remove_zeros: bool,
+) -> list[dict[str, Any]]:
+    """
+    Transform postage dashboard rows in-memory:
+    - Take daily presort rejects (mail_class == WS3_REJECT_MAIL_CLASS) per (date, parent_number)
+    - Allocate them across that day's INVOICE_EFD_FLAT_MAIL_CLASS rows (child × oz) proportional
+      to `1CA5DFlt` piece volume for that day.
+    - Subtract allocated pieces from the `1CA5DFlt` row(s)
+    - Add new synthetic rows mail_class == WS3_REJECT_ALLOCATED_MAIL_CLASS with allocated buckets
+    - Remove the original single presort reject row when fully allocated; keep remainder (if any).
+    """
+    oz_keys = [f"oz_{i}" for i in range(14)] + ["oz_13plus"]
+    efd_cls = INVOICE_EFD_FLAT_MAIL_CLASS
+
+    # Index key info for quick lookup.
+    rejects_by_key: dict[tuple[str, int], int] = {}
+    for r in rows:
+        if str(r.get("mail_class") or "") != WS3_REJECT_MAIL_CLASS:
+            continue
+        date = str(r.get("date") or "")
+        if not date or date == "Combined":
+            continue
+        pn = int(r.get("parent_number") or 0)
+        if pn <= 0:
+            continue
+        rejects_by_key[(date, pn)] = rejects_by_key.get((date, pn), 0) + int(
+            r.get("total_qty") or 0
+        )
+
+    if not rejects_by_key:
+        return rows
+
+    # Build a mapping from (date, parent, child) -> row index for EFD class.
+    efd_row_idx_by_key: dict[tuple[str, int, int], int] = {}
+    for idx, r in enumerate(rows):
+        if str(r.get("mail_class") or "") != efd_cls:
+            continue
+        date = str(r.get("date") or "")
+        if not date or date == "Combined":
+            continue
+        pn = int(r.get("parent_number") or 0)
+        cn = int(r.get("child_number") or 0)
+        if pn <= 0 or cn <= 0:
+            continue
+        efd_row_idx_by_key[(date, pn, cn)] = idx
+
+    allocated_rows: list[dict[str, Any]] = []
+    updated_reject_rows: dict[tuple[str, int], int] = {}
+
+    for (date, pn), rej_total in rejects_by_key.items():
+        if rej_total <= 0:
+            continue
+
+        # Collect cell weights: one entry per (child, oz) with weight = existing efd pieces.
+        cells: list[tuple[int, int, int]] = []  # (child, oz, existing_qty)
+        for (d, p, child), idx in efd_row_idx_by_key.items():
+            if d != date or p != pn:
+                continue
+            r = rows[idx]
+            for oz in range(1, 14):
+                q = int(r.get(f"oz_{oz}") or 0)
+                if q > 0:
+                    cells.append((child, oz, q))
+
+        if not cells:
+            # Nothing to allocate against: keep the original reject row as-is.
+            continue
+
+        max_alloc = sum(q for _, _, q in cells)
+        alloc_total = min(int(rej_total), int(max_alloc))
+        remainder = int(rej_total) - int(alloc_total)
+
+        weights = [float(q) for _, _, q in cells]
+        amounts = allocate_integer_proportional(int(alloc_total), weights)
+
+        alloc_by_child: dict[int, dict[int, int]] = {}
+        for (child, oz, _), amt in zip(cells, amounts):
+            a = int(amt or 0)
+            if a <= 0:
+                continue
+            alloc_by_child.setdefault(child, {})[oz] = alloc_by_child.setdefault(child, {}).get(
+                oz, 0
+            ) + a
+
+        # Apply subtraction to EFD rows and build allocated synthetic rows.
+        for child, by_oz in alloc_by_child.items():
+            idx = efd_row_idx_by_key.get((date, pn, child))
+            if idx is None:
+                continue
+            base = rows[idx]
+            child_alloc_total = 0
+            for oz, a in by_oz.items():
+                child_alloc_total += int(a)
+                k = f"oz_{int(oz)}"
+                base[k] = int(base.get(k) or 0) - int(a)
+            base["total_qty"] = int(base.get("total_qty") or 0) - int(child_alloc_total)
+
+            # Construct allocated row with the same grouping keys.
+            item: dict[str, Any] = {
+                "date": date,
+                "parent_name": base.get("parent_name"),
+                "parent_number": pn,
+                "child_name": base.get("child_name"),
+                "child_number": child,
+                "mail_class": WS3_REJECT_ALLOCATED_MAIL_CLASS,
+                **{k: 0 for k in oz_keys},
+                "total_qty": int(child_alloc_total),
+            }
+            for oz, a in by_oz.items():
+                item[f"oz_{int(oz)}"] = int(a)
+            if not hide_costs:
+                item["total_cost"] = 0.0
+                item["metered_cost"] = 0.0
+                item["retail_cost"] = 0.0
+            if not (remove_zeros and all(int(item.get(k) or 0) == 0 for k in oz_keys)):
+                allocated_rows.append(item)
+
+        # Record what happens to the original reject row.
+        if remainder > 0:
+            updated_reject_rows[(date, pn)] = remainder
+        else:
+            updated_reject_rows[(date, pn)] = 0
+
+    # Rebuild row list:
+    # - drop allocated-away reject rows
+    # - keep remainder reject rows (adjusted)
+    # - drop any EFD rows that went to all-zero when remove_zeros is set
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        mc = str(r.get("mail_class") or "")
+        date = str(r.get("date") or "")
+        pn = int(r.get("parent_number") or 0)
+        if mc == WS3_REJECT_MAIL_CLASS and date and date != "Combined" and pn > 0:
+            if (date, pn) in updated_reject_rows:
+                rem = int(updated_reject_rows[(date, pn)] or 0)
+                if rem <= 0:
+                    continue
+                # Keep the row, but update count.
+                r2 = dict(r)
+                r2["total_qty"] = rem
+                out.append(r2)
+                continue
+        if remove_zeros and mc == efd_cls:
+            if all(int(r.get(f"oz_{i}") or 0) == 0 for i in range(14)) and int(
+                r.get("oz_13plus") or 0
+            ) == 0:
+                continue
+        out.append(r)
+
+    out.extend(allocated_rows)
+    return out
+
+
 def query_postage(
     conn: sqlite3.Connection,
     start_date: str,
@@ -1798,6 +2340,7 @@ def query_postage(
     hide_costs: bool,
     kc_presort: bool = False,
     efd: bool = False,
+    allocate_presort_rejects: bool = False,
 ) -> dict[str, Any]:
     _ = efd  # reserved for future reporting checks
     date_sel = "p.file_date" if not consolidate else "NULL"
@@ -1883,9 +2426,6 @@ def query_postage(
     rows_raw = [dict(r) for r in cur.fetchall()]
 
     rows: list[dict[str, Any]] = []
-    total_pieces = 0
-    total_cost_sum = 0.0
-    total_retail_sum = 0.0
 
     for r in rows_raw:
         oz_keys = [f"oz_{i}" for i in range(14)] + ["oz_13plus"]
@@ -1920,9 +2460,6 @@ def query_postage(
             item["metered_cost"] = tc_r
             item["retail_cost"] = tr_r
         rows.append(item)
-        total_pieces += tq
-        total_cost_sum += tc
-        total_retail_sum += trc
 
     rej_rows = _ws3_reject_rows_for_postage(
         conn,
@@ -1940,6 +2477,11 @@ def query_postage(
         rows.append(rj)
         # Presort rejects are informational only; do not add to total_pieces (already metered).
 
+    if allocate_presort_rejects and not consolidate:
+        rows = _allocate_presort_rejects_into_efd_rows(
+            rows, hide_costs=hide_costs, remove_zeros=remove_zeros
+        )
+
     rows.sort(
         key=lambda x: (
             x["date"] == "Combined",
@@ -1950,18 +2492,21 @@ def query_postage(
         )
     )
 
-    out: dict[str, Any] = {
-        "total_records": len(rows),
-        "total_pieces": total_pieces,
-        "total_cost": round(total_cost_sum, 2),
-        "total_metered_cost": round(total_cost_sum, 2),
-        "total_retail_cost": round(total_retail_sum, 2),
-        "rows": rows,
-    }
-    if hide_costs:
-        out.pop("total_cost", None)
-        out.pop("total_metered_cost", None)
-        out.pop("total_retail_cost", None)
+    def _is_informational(r: dict[str, Any]) -> bool:
+        return str(r.get("mail_class") or "") == WS3_REJECT_MAIL_CLASS
+
+    total_pieces = sum(int(r.get("total_qty") or 0) for r in rows if not _is_informational(r))
+    out: dict[str, Any] = {"total_records": len(rows), "total_pieces": total_pieces, "rows": rows}
+    if not hide_costs:
+        total_cost_sum = sum(
+            float(r.get("total_cost") or 0.0) for r in rows if not _is_informational(r)
+        )
+        total_retail_sum = sum(
+            float(r.get("retail_cost") or 0.0) for r in rows if not _is_informational(r)
+        )
+        out["total_cost"] = round(total_cost_sum, 2)
+        out["total_metered_cost"] = round(total_cost_sum, 2)
+        out["total_retail_cost"] = round(total_retail_sum, 2)
     return out
 
 
@@ -2318,6 +2863,337 @@ def apply_postage_row_update(
     }
 
 
+def _parse_lb_bucket_editor_key(key: str) -> int | None:
+    try:
+        b = int(key)
+    except (TypeError, ValueError):
+        return None
+    if 1 <= b <= 11:
+        return b
+    return None
+
+
+def _fetch_billing_records_for_parcel_row(
+    conn: sqlite3.Connection,
+    bill_date: str,
+    account_code: int,
+    mail_class: str,
+    zone: str | None,
+) -> list[dict[str, Any]]:
+    """Billing rows matching one parcels dashboard row (one piece per record)."""
+    ts_date = _billing_ts_date_sql("br.time_stamp")
+    zone_s = zone if zone is not None else ""
+    cur = conn.execute(
+        f"""
+        SELECT br.id, br.weight_oz, br.billing_amount, br.custom_account_code
+        FROM billing_records br
+        WHERE {ts_date} = ?
+          AND br.custom_account_code = ?
+          AND br.usps_mail_class = ?
+          AND COALESCE(br.zone, '') = ?
+          AND br.weight_oz IS NOT NULL AND br.weight_oz > 0
+        ORDER BY br.id
+        """,
+        (bill_date, int(account_code), str(mail_class), str(zone_s)),
+    )
+    out: list[dict[str, Any]] = []
+    for r in cur.fetchall():
+        woz = float(r["weight_oz"])
+        lb = _parcel_lb_bucket(woz)
+        if lb is None:
+            continue
+        out.append(
+            {
+                "id": int(r["id"]),
+                "weight_oz": woz,
+                "billing_amount": float(r["billing_amount"] or 0.0),
+                "lb_bucket": int(lb),
+                "custom_account_code": int(r["custom_account_code"] or 0),
+            }
+        )
+    return out
+
+
+def _postage_over_13_exists_for_parcel_edit(
+    conn: sqlite3.Connection,
+    bill_date: str,
+    account_code: int,
+    mail_class: str,
+    zone: str | None,
+) -> bool:
+    """True when the parcels row is sourced from postage (over 13 oz), not billing."""
+    if str(zone or "") != str(DEFAULT_PARCEL_ZONE_FOR_POSTAGE_OVER_13_OZ):
+        return False
+    rows = _postage_over_13_parcel_scope_rows(
+        conn,
+        bill_date,
+        bill_date,
+        None,
+        int(account_code),
+        True,
+        True,
+        consolidate=False,
+    )
+    for r in rows:
+        if int(r["child_number"] or 0) != int(account_code):
+            continue
+        if str(r["mail_class"] or "") != str(mail_class):
+            continue
+        bd = r["bill_date"]
+        if bd is None:
+            continue
+        iso = iso_date_from_postage_file_date(bd)
+        if iso == bill_date or str(bd) == bill_date:
+            return True
+    return False
+
+
+def get_billing_row_details(
+    conn: sqlite3.Connection,
+    bill_date: str,
+    account_code: int,
+    mail_class: str,
+    zone: str | None,
+) -> list[dict[str, Any]]:
+    """
+    Underlying billing_records for one parcels table row, grouped by lb bucket (1–10, 11 = 10+).
+    """
+    records = _fetch_billing_records_for_parcel_row(
+        conn, bill_date, account_code, mail_class, zone
+    )
+    if not records:
+        if _postage_over_13_exists_for_parcel_edit(
+            conn, bill_date, account_code, mail_class, zone
+        ):
+            raise ValueError(
+                "This row is from flats postage (over 13 oz). Edit it on the Postage tab."
+            )
+        return []
+
+    buckets: dict[int, dict[str, Any]] = {}
+    for rec in records:
+        lb = int(rec["lb_bucket"])
+        if lb not in buckets:
+            buckets[lb] = {
+                "lb_bucket": lb,
+                "pieces": 0,
+                "sample_weight_oz": rec["weight_oz"],
+                "billing_amount_sum": 0.0,
+            }
+        buckets[lb]["pieces"] += 1
+        buckets[lb]["billing_amount_sum"] += float(rec["billing_amount"] or 0.0)
+
+    out: list[dict[str, Any]] = []
+    for lb in sorted(buckets.keys()):
+        b = buckets[lb]
+        out.append(
+            {
+                "lb_bucket": b["lb_bucket"],
+                "pieces": int(b["pieces"]),
+                "sample_weight_oz": float(b["sample_weight_oz"]),
+                "billing_amount_sum": round(float(b["billing_amount_sum"]), 2),
+            }
+        )
+    return out
+
+
+def _billing_row_update_plan(
+    conn: sqlite3.Connection,
+    bill_date: str,
+    from_account_code: int,
+    mail_class: str,
+    zone: str | None,
+    to_account_code: int,
+    pieces_by_bucket: dict[str, Any] | None,
+) -> dict[str, Any]:
+    records = _fetch_billing_records_for_parcel_row(
+        conn, bill_date, from_account_code, mail_class, zone
+    )
+    if not records:
+        if _postage_over_13_exists_for_parcel_edit(
+            conn, bill_date, from_account_code, mail_class, zone
+        ):
+            raise ValueError(
+                "This row is from flats postage (over 13 oz). Edit it on the Postage tab."
+            )
+        return {
+            "ok": True,
+            "to_unmatched_account": 0,
+            "rows": [],
+            "ids_to_update": [],
+            "summary": {"source_rows": 0, "updated": 0},
+        }
+
+    by_bucket: dict[int, list[dict[str, Any]]] = {}
+    for rec in records:
+        lb = int(rec["lb_bucket"])
+        by_bucket.setdefault(lb, []).append(rec)
+
+    normalized: dict[int, int] = {}
+    if pieces_by_bucket:
+        for k, v in pieces_by_bucket.items():
+            lb = _parse_lb_bucket_editor_key(str(k))
+            if lb is None:
+                continue
+            try:
+                pv = int(v)
+            except (TypeError, ValueError):
+                continue
+            if pv < 0:
+                raise ValueError("pieces cannot be negative")
+            normalized[lb] = pv
+
+    to_unmatched = 0 if _customer_exists(conn, to_account_code) else 1
+    lines: list[dict[str, Any]] = []
+    ids_to_update: list[int] = []
+    updated = 0
+
+    for lb in sorted(by_bucket.keys()):
+        recs = by_bucket[lb]
+        available = len(recs)
+        move_n = int(normalized.get(lb, available))
+        if move_n > available:
+            raise ValueError(
+                f"Cannot move {move_n} pieces for lb bucket {lb}; only {available} available"
+            )
+        if move_n <= 0:
+            continue
+        chosen = recs[:move_n]
+        for rec in chosen:
+            rid = int(rec["id"])
+            ids_to_update.append(rid)
+            updated += 1
+            lines.append(
+                {
+                    "source_billing_id": rid,
+                    "lb_bucket": lb,
+                    "weight_oz": float(rec["weight_oz"]),
+                    "old_account_code": int(from_account_code),
+                    "new_account_code": int(to_account_code),
+                    "old_billing_amount": round(float(rec["billing_amount"] or 0.0), 2),
+                    "new_billing_amount": round(float(rec["billing_amount"] or 0.0), 2),
+                }
+            )
+
+    return {
+        "ok": True,
+        "to_unmatched_account": to_unmatched,
+        "rows": lines,
+        "ids_to_update": ids_to_update,
+        "summary": {
+            "source_rows": len(records),
+            "updated": updated,
+        },
+    }
+
+
+def preview_billing_row_update(
+    conn: sqlite3.Connection,
+    bill_date: str,
+    from_account_code: int,
+    mail_class: str,
+    zone: str | None,
+    to_account_code: int,
+    pieces_by_bucket: dict[str, Any] | None,
+) -> dict[str, Any]:
+    plan = _billing_row_update_plan(
+        conn,
+        bill_date=bill_date,
+        from_account_code=from_account_code,
+        mail_class=mail_class,
+        zone=zone,
+        to_account_code=to_account_code,
+        pieces_by_bucket=pieces_by_bucket,
+    )
+    return {
+        "ok": plan["ok"],
+        "to_unmatched_account": plan.get("to_unmatched_account", 0),
+        "rows": plan.get("rows") or [],
+        "summary": plan.get("summary") or {"source_rows": 0, "updated": 0},
+    }
+
+
+def apply_billing_row_update(
+    conn: sqlite3.Connection,
+    bill_date: str,
+    from_account_code: int,
+    mail_class: str,
+    zone: str | None,
+    to_account_code: int,
+    pieces_by_bucket: dict[str, Any] | None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    plan = _billing_row_update_plan(
+        conn,
+        bill_date=bill_date,
+        from_account_code=from_account_code,
+        mail_class=mail_class,
+        zone=zone,
+        to_account_code=to_account_code,
+        pieces_by_bucket=pieces_by_bucket,
+    )
+    lines = plan.get("rows") or []
+    to_unmatched = int(plan.get("to_unmatched_account") or 0)
+
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO billing_edits (
+            bill_date, from_account_code, to_account_code, mail_class, zone, reason, updated_rows
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            bill_date,
+            int(from_account_code),
+            int(to_account_code),
+            str(mail_class),
+            str(zone if zone is not None else ""),
+            (reason or "").strip() or None,
+            int(plan["summary"]["updated"]),
+        ),
+    )
+    edit_id = int(cur.lastrowid)
+
+    updated_count = 0
+
+    for ln in lines:
+        rid = int(ln["source_billing_id"])
+        cur.execute(
+            """
+            UPDATE billing_records
+            SET custom_account_code = ?, unmatched_account = ?
+            WHERE id = ?
+            """,
+            (int(to_account_code), to_unmatched, rid),
+        )
+        if cur.rowcount:
+            updated_count += 1
+        cur.execute(
+            """
+            INSERT INTO billing_edit_lines (
+                edit_id, source_billing_id, lb_bucket, weight_oz,
+                old_account_code, new_account_code, old_billing_amount, new_billing_amount
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                edit_id,
+                rid,
+                int(ln["lb_bucket"]),
+                float(ln["weight_oz"]),
+                int(ln["old_account_code"]),
+                int(ln["new_account_code"]),
+                float(ln["old_billing_amount"]),
+                float(ln["new_billing_amount"]),
+            ),
+        )
+
+    return {
+        "ok": True,
+        "edit_id": edit_id,
+        "summary": {"updated": updated_count},
+    }
+
+
 def _parcel_lb_bucket(weight_oz: float | None) -> int | None:
     if weight_oz is None or weight_oz <= 0:
         return None
@@ -2333,14 +3209,27 @@ def parcel_weight_lb_int(weight_oz: float | None) -> int | None:
 
 
 def _parcel_billing_filters(
+    conn: sqlite3.Connection,
     start_date: str,
     end_date: str,
     parent_number: int | None,
     customer_number: int | None,
     show_parents: bool,
     show_main: bool,
+    profit_account_ids: list[int] | None = None,
 ) -> tuple[str, list[Any]]:
-    """Shared WHERE clause (no leading WHERE) for parcel billing: date range, weight, account scope."""
+    """
+    Shared WHERE clause (no leading WHERE) for parcel billing: date range, weight, account scope.
+
+    Account scope:
+
+    - ``profit_account_ids``: same family rollup as WS3/flats (``effective_parent_account_for_ws3``
+      per id, then ``parent_number IN (parents) OR customer_number IN (parents)`` on ``customers``).
+    - Toolbar ``customer_number`` without ``parent_number``: family rollup via
+      ``effective_parent_account_for_ws3`` (same effective-parent window as WS3 child selection).
+    - When both ``parent_number`` and ``customer_number`` are set, the legacy AND with
+      ``br.custom_account_code`` is preserved.
+    """
     ts_date = _billing_ts_date_sql("br.time_stamp")
     conditions = [
         f"{ts_date} BETWEEN ? AND ?",
@@ -2348,14 +3237,34 @@ def _parcel_billing_filters(
     ]
     params: list[Any] = [start_date, end_date]
 
-    if parent_number is not None:
-        conditions.append(
-            "(c.customer_number IS NOT NULL AND (c.parent_number = ? OR c.customer_number = ?))"
+    if profit_account_ids:
+        parents = sorted(
+            {effective_parent_account_for_ws3(conn, int(i)) for i in profit_account_ids}
         )
-        params.extend([parent_number, parent_number])
-    if customer_number is not None:
-        conditions.append("br.custom_account_code = ?")
-        params.append(customer_number)
+        if parents:
+            ph = ",".join("?" * len(parents))
+            conditions.append(
+                "(c.customer_number IS NOT NULL AND "
+                f"(c.parent_number IN ({ph}) OR c.customer_number IN ({ph})))"
+            )
+            params.extend(parents)
+            params.extend(parents)
+    else:
+        if parent_number is not None:
+            conditions.append(
+                "(c.customer_number IS NOT NULL AND (c.parent_number = ? OR c.customer_number = ?))"
+            )
+            params.extend([parent_number, parent_number])
+        if customer_number is not None:
+            if parent_number is not None:
+                conditions.append("br.custom_account_code = ?")
+                params.append(customer_number)
+            else:
+                ep = effective_parent_account_for_ws3(conn, int(customer_number))
+                conditions.append(
+                    "(c.customer_number IS NOT NULL AND (c.parent_number = ? OR c.customer_number = ?))"
+                )
+                params.extend([ep, ep])
 
     matched_filters: list[str] = []
     if not show_parents:
@@ -2404,12 +3313,14 @@ def query_parcel_report_rows(
 ) -> list[dict[str, Any]]:
     """One row per billing piece for BC Priority parcel export, plus one row per postage piece over 13 oz."""
     where_sql, params = _parcel_billing_filters(
+        conn,
         start_date,
         end_date,
         parent_number,
         customer_number,
         show_parents,
         show_main,
+        None,
     )
     cur = conn.execute(
         f"""
@@ -2477,6 +3388,7 @@ def query_parcel_billing_rows_full(
     customer_number: int | None,
     show_parents: bool,
     show_main: bool,
+    profit_account_ids: list[int] | None = None,
 ) -> list[sqlite3.Row]:
     """
     Full raw billing rows in scope, including all billing_records columns.
@@ -2484,12 +3396,14 @@ def query_parcel_billing_rows_full(
     This is intended for the consolidated parcel CSV export (raw payload).
     """
     where_sql, params = _parcel_billing_filters(
+        conn,
         start_date,
         end_date,
         parent_number,
         customer_number,
         show_parents,
         show_main,
+        profit_account_ids,
     )
     cur = conn.execute(
         f"""
@@ -2679,6 +3593,94 @@ def _load_retail_matrix_rates(
     return rate_by_zone_lb, weights_sorted
 
 
+def iso_date_from_billing_timestamp(ts_raw: Any) -> str | None:
+    """Normalize billing `time_stamp` (e.g. M/D/YYYY HH:MM) to ISO date; None if unrecognized."""
+    if ts_raw is None:
+        return None
+    s = str(ts_raw).strip()
+    if not s:
+        return None
+    cal = s.split()[0] if " " in s else s
+    cal = cal.replace("\\", "/").replace("-", "/")
+    for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(cal, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def iso_date_from_postage_file_date(raw: Any) -> str | None:
+    """Best-effort ISO date string from `postage_data.file_date`."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        pass
+    s2 = s.replace("\\", "/").replace("-", "/")
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s2.split()[0], fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _build_rate_maps_from_priority_rows(rows: list[sqlite3.Row]) -> tuple[
+    dict[tuple[int, int], float], dict[int, list[int]]
+]:
+    rate_by_zone_lb: dict[tuple[int, int], float] = {}
+    weights_by_zone: dict[int, set[int]] = {}
+    for r in rows:
+        try:
+            z = int(r["zone"])
+            lb = int(round(float(r["weight_max"])))
+            price = float(r["price"])
+        except (TypeError, ValueError):
+            continue
+        if z < 1 or z > 9 or lb <= 0:
+            continue
+        rate_by_zone_lb[(z, lb)] = price
+        weights_by_zone.setdefault(z, set()).add(lb)
+    weights_sorted: dict[int, list[int]] = {
+        z: sorted(list(wset)) for z, wset in weights_by_zone.items()
+    }
+    return rate_by_zone_lb, weights_sorted
+
+
+def _load_priority_mail_rates_as_of(
+    conn: sqlite3.Connection,
+    *,
+    as_of_date: str,
+) -> tuple[dict[tuple[int, int], float], dict[int, list[int]]]:
+    """Latest matrix revision on or before as_of_date (per zone × weight_max)."""
+    cur = conn.execute(
+        """
+        WITH ranked AS (
+          SELECT zone, weight_max, price,
+            ROW_NUMBER() OVER (
+              PARTITION BY zone, weight_max
+              ORDER BY
+                CASE WHEN effective_date IS NULL THEN 1 ELSE 0 END,
+                effective_date DESC
+            ) AS rn
+          FROM priority_mail_retail
+          WHERE row_type = 'matrix'
+            AND weight_unit = 'lb'
+            AND zone IS NOT NULL AND weight_max IS NOT NULL AND price IS NOT NULL
+            AND (effective_date IS NULL OR effective_date <= ?)
+        )
+        SELECT zone, weight_max, price FROM ranked WHERE rn = 1
+        """,
+        (str(as_of_date),),
+    )
+    return _build_rate_maps_from_priority_rows(list(cur.fetchall()))
+
+
 def get_ground_advantage_retail_rates(
     conn: sqlite3.Connection,
 ) -> tuple[dict[tuple[int, int], float], dict[int, list[int]]]:
@@ -2688,9 +3690,15 @@ def get_ground_advantage_retail_rates(
 
 def get_priority_mail_retail_rates(
     conn: sqlite3.Connection,
+    *,
+    as_of_date: str | None = None,
 ) -> tuple[dict[tuple[int, int], float], dict[int, list[int]]]:
-    """(zone, lb) -> Priority Mail retail price, and per-zone available weights."""
-    return _load_retail_matrix_rates(conn, table="priority_mail_retail", weight_unit="lb")
+    """(zone, lb) -> Priority Mail retail price, and per-zone available weights.
+
+    Uses the latest tariff with effective_date on or before as_of_date when given;
+    otherwise uses today's calendar date."""
+    od = str(as_of_date) if as_of_date is not None else date.today().isoformat()
+    return _load_priority_mail_rates_as_of(conn, as_of_date=od)
 
 
 def _retail_price_for_zone_lb(
@@ -2724,6 +3732,7 @@ def compute_retail_cost_for_piece(
     fallback_retail: float | None = None,
     ga_rates: tuple[dict[tuple[int, int], float], dict[int, list[int]]] | None = None,
     pm_rates: tuple[dict[tuple[int, int], float], dict[int, list[int]]] | None = None,
+    as_of_date: str | None = None,
 ) -> dict[str, Any]:
     """
     Retail costing rule (parcels): Priority Mail retail matrix for all weights.
@@ -2739,7 +3748,7 @@ def compute_retail_cost_for_piece(
     retail: float | None = None
     if z is not None and lb is not None and service is not None:
         if pm_rates is None:
-            pm_rates = get_priority_mail_retail_rates(conn)
+            pm_rates = get_priority_mail_retail_rates(conn, as_of_date=as_of_date)
         retail = _retail_price_for_zone_lb(
             pm_rates[0], pm_rates[1], zone=int(z), lb=int(lb)
         )
@@ -2772,19 +3781,32 @@ def compute_parcel_report_af_hm_sections(
 
     Customer **name** is ``customers.customer_name`` for ``custom_account_code``, not billing ``account_name``.
     """
-    pm_rates = get_priority_mail_retail_rates(conn)
+    pm_by_day: dict[str, tuple[dict[tuple[int, int], float], dict[int, list[int]]]] = {}
+
+    def _pm_rates_for_billing_piece(ts_raw: Any) -> tuple[
+        dict[tuple[int, int], float], dict[int, list[int]]
+    ]:
+        d_iso = iso_date_from_billing_timestamp(ts_raw)
+        od = d_iso if d_iso is not None else end_date
+        if od not in pm_by_day:
+            pm_by_day[od] = get_priority_mail_retail_rates(conn, as_of_date=od)
+        return pm_by_day[od]
+
     where_sql, params = _parcel_billing_filters(
+        conn,
         start_date,
         end_date,
         parent_number,
         customer_number,
         show_parents,
         show_main,
+        None,
     )
     cur = conn.execute(
         f"""
         SELECT br.custom_account_code, c.customer_name AS db_customer_name,
-               br.zone, br.weight_oz, br.fully_paid_postage, br.billing_amount
+               br.zone, br.weight_oz, br.fully_paid_postage, br.billing_amount,
+               br.time_stamp
         FROM billing_records br
         LEFT JOIN customers c ON br.custom_account_code = c.customer_number
         WHERE {where_sql}
@@ -2807,12 +3829,13 @@ def compute_parcel_report_af_hm_sections(
         if not name:
             name = f"Account {acc}" if acc is not None else "(no name)"
 
+        pm_piece = _pm_rates_for_billing_piece(row["time_stamp"])
         priced = compute_retail_cost_for_piece(
             conn,
             weight_oz=row["weight_oz"],
             zone_raw=row["zone"],
             fallback_retail=fp,
-            pm_rates=pm_rates,
+            pm_rates=pm_piece,
         )
         z = priced["zone"]
         lb = priced["lb"]
@@ -2874,12 +3897,17 @@ def compute_parcel_report_af_hm_sections(
         if not name:
             name = f"Account {acc}" if acc is not None else "(no name)"
         fp = (float(pr["total_cost"] or 0.0) / pieces) if pieces else 0.0
+        fd_iso = iso_date_from_postage_file_date(pr["bill_date"])
+        od_pm = fd_iso if fd_iso is not None else end_date
+        if od_pm not in pm_by_day:
+            pm_by_day[od_pm] = get_priority_mail_retail_rates(conn, as_of_date=od_pm)
+        pm_piece = pm_by_day[od_pm]
         priced = compute_retail_cost_for_piece(
             conn,
             weight_oz=woz,
             zone_raw=z_post,
             fallback_retail=fp,
-            pm_rates=pm_rates,
+            pm_rates=pm_piece,
         )
         z = priced["zone"]
         lb = priced["lb"]
@@ -2994,14 +4022,24 @@ def query_parcel_over_10lb_lines(
     show_main: bool,
 ) -> list[dict[str, Any]]:
     """One row per billing piece with integer lb > 10 (11–100); base = Priority retail (fallback: fully_paid_postage)."""
-    pm_rates = get_priority_mail_retail_rates(conn)
+    pm_by_day: dict[str, tuple[dict[tuple[int, int], float], dict[int, list[int]]]] = {}
+
+    def _rates_for_piece(ts_raw: Any) -> tuple[dict[tuple[int, int], float], dict[int, list[int]]]:
+        od = iso_date_from_billing_timestamp(ts_raw)
+        od = od if od is not None else end_date
+        if od not in pm_by_day:
+            pm_by_day[od] = get_priority_mail_retail_rates(conn, as_of_date=od)
+        return pm_by_day[od]
+
     where_sql, params = _parcel_billing_filters(
+        conn,
         start_date,
         end_date,
         parent_number,
         customer_number,
         show_parents,
         show_main,
+        None,
     )
     cur = conn.execute(
         f"""
@@ -3024,12 +4062,13 @@ def query_parcel_over_10lb_lines(
         if lbs is None or lbs <= 10:
             continue
         fp = float(row["fully_paid_postage"] or 0.0)
+        pm_piece = _rates_for_piece(row["time_stamp"])
         priced = compute_retail_cost_for_piece(
             conn,
             weight_oz=row["weight_oz"],
             zone_raw=row["zone"],
             fallback_retail=fp,
-            pm_rates=pm_rates,
+            pm_rates=pm_piece,
         )
         z = priced["zone"]
         if z is None:
@@ -3066,12 +4105,17 @@ def query_parcel_over_10lb_lines(
         if lbs is None or lbs <= 10:
             continue
         fp = (float(pr["total_cost"] or 0.0) / pieces) if pieces else 0.0
+        fd_iso = iso_date_from_postage_file_date(pr["bill_date"])
+        od_pm = fd_iso if fd_iso is not None else end_date
+        if od_pm not in pm_by_day:
+            pm_by_day[od_pm] = get_priority_mail_retail_rates(conn, as_of_date=od_pm)
+        pm_piece = pm_by_day[od_pm]
         priced = compute_retail_cost_for_piece(
             conn,
             weight_oz=woz,
             zone_raw=z_post,
             fallback_retail=fp,
-            pm_rates=pm_rates,
+            pm_rates=pm_piece,
         )
         z = priced["zone"]
         if z is None:
@@ -3102,13 +4146,17 @@ def parcel_summary_title_name(
             "SELECT customer_name FROM customers WHERE customer_number = ?",
             (parent_number,),
         ).fetchone()
-        return (r["customer_name"] or "").strip() or f"Account {parent_number}"
+        if r is not None:
+            return (r["customer_name"] or "").strip() or f"Account {parent_number}"
+        return f"Account {parent_number}"
     if customer_number is not None:
         r = conn.execute(
             "SELECT customer_name FROM customers WHERE customer_number = ?",
             (customer_number,),
         ).fetchone()
-        return (r["customer_name"] or "").strip() or f"Account {customer_number}"
+        if r is not None:
+            return (r["customer_name"] or "").strip() or f"Account {customer_number}"
+        return f"Account {customer_number}"
     return "All Accounts"
 
 
@@ -3183,19 +4231,27 @@ def query_parcel_zone_summary(
     **Costs** (customer spend) = Σ ((retail − parcel_discount) × quantity), floored at 0 per piece.
     **Savings** = parcel_discount × piece count (same scope as costs).
     """
-    pm_rates = get_priority_mail_retail_rates(conn)
     parcel_discount = max(0.0, float(parcel_discount or 0.0))
+    pm_by_day: dict[str, tuple[dict[tuple[int, int], float], dict[int, list[int]]]] = {}
+
+    def _pm_for(od: str) -> tuple[dict[tuple[int, int], float], dict[int, list[int]]]:
+        if od not in pm_by_day:
+            pm_by_day[od] = get_priority_mail_retail_rates(conn, as_of_date=od)
+        return pm_by_day[od]
+
     where_sql, params = _parcel_billing_filters(
+        conn,
         start_date,
         end_date,
         parent_number,
         customer_number,
         show_parents,
         show_main,
+        None,
     )
     cur = conn.execute(
         f"""
-        SELECT br.zone, br.weight_oz, br.fully_paid_postage
+        SELECT br.zone, br.weight_oz, br.fully_paid_postage, br.time_stamp
         FROM billing_records br
         LEFT JOIN customers c ON br.custom_account_code = c.customer_number
         WHERE {where_sql}
@@ -3204,6 +4260,8 @@ def query_parcel_zone_summary(
     )
 
     agg: dict[tuple[int, int], int] = {}
+    sum_pri: dict[tuple[int, int], float] = {}
+    sum_efd: dict[tuple[int, int], float] = {}
     total_pieces = 0
     total_cost = 0.0
     total_savings = 0.0
@@ -3214,11 +4272,13 @@ def query_parcel_zone_summary(
         if z is None or b is None:
             continue
         lb_int = int(b)
+        d_iso = iso_date_from_billing_timestamp(row["time_stamp"])
+        pm_r = _pm_for(d_iso if d_iso is not None else end_date)
         if lb_int > 10:
             # Heavy parcels are excluded from the 1–10 lb zone matrix (they appear in the heavy block),
             # but they still contribute to footer totals so totals match invoice roll-ups.
             total_pieces += 1
-            rt = _retail_price_for_zone_lb(pm_rates[0], pm_rates[1], zone=int(z), lb=int(lb_int))
+            rt = _retail_price_for_zone_lb(pm_r[0], pm_r[1], zone=int(z), lb=int(lb_int))
             if rt is None:
                 rt = float(row["fully_paid_postage"] or 0.0)
             rtf = float(rt)
@@ -3227,14 +4287,17 @@ def query_parcel_zone_summary(
             continue
         total_pieces += 1
         lb_row = lb_int
-        agg[(z, lb_row)] = agg.get((z, lb_row), 0) + 1
-        rt = _retail_price_for_zone_lb(pm_rates[0], pm_rates[1], zone=int(z), lb=int(lb_row))
+        key = (int(z), lb_row)
+        agg[key] = agg.get(key, 0) + 1
+        rt = _retail_price_for_zone_lb(pm_r[0], pm_r[1], zone=int(z), lb=int(lb_row))
         if rt is None:
             # Fallback so totals don't silently drop pieces with missing rate cells.
             rt = float(row["fully_paid_postage"] or 0.0)
         rtf = float(rt)
         total_cost += max(0.0, rtf - parcel_discount)
         total_savings += parcel_discount
+        sum_pri[key] = sum_pri.get(key, 0.0) + rtf
+        sum_efd[key] = sum_efd.get(key, 0.0) + max(0.0, rtf - parcel_discount)
 
     z_conv = DEFAULT_PARCEL_ZONE_FOR_POSTAGE_OVER_13_OZ
     for pr in _postage_over_13_parcel_scope_rows(
@@ -3257,11 +4320,13 @@ def query_parcel_zone_summary(
         if b is None:
             continue
         lb_int = int(b)
+        fd_iso = iso_date_from_postage_file_date(pr["bill_date"])
+        pm_r = _pm_for(fd_iso if fd_iso is not None else end_date)
         if lb_int > 10:
             # Heavy parcels are excluded from the 1–10 lb zone matrix (they appear in the heavy block),
             # but they still contribute to footer totals so totals match invoice roll-ups.
             total_pieces += pieces
-            rt = _retail_price_for_zone_lb(pm_rates[0], pm_rates[1], zone=int(z_conv), lb=int(lb_int))
+            rt = _retail_price_for_zone_lb(pm_r[0], pm_r[1], zone=int(z_conv), lb=int(lb_int))
             if rt is None:
                 rt = (float(pr["total_cost"] or 0.0) / pieces) if pieces else 0.0
             rtf = float(rt)
@@ -3271,23 +4336,40 @@ def query_parcel_zone_summary(
         lb_row = lb_int
         total_pieces += pieces
         rt = _retail_price_for_zone_lb(
-            pm_rates[0], pm_rates[1], zone=int(z_conv), lb=int(lb_row)
+            pm_r[0], pm_r[1], zone=int(z_conv), lb=int(lb_row)
         )
         if rt is None:
             rt = (float(pr["total_cost"] or 0.0) / pieces) if pieces else 0.0
         rtf = float(rt)
         total_cost += max(0.0, rtf - parcel_discount) * pieces
         total_savings += parcel_discount * pieces
-        agg[(z_conv, lb_row)] = agg.get((z_conv, lb_row), 0) + pieces
+        key = (int(z_conv), lb_row)
+        agg[key] = agg.get(key, 0) + pieces
+        piece_efd = max(0.0, rtf - parcel_discount)
+        sum_pri[key] = sum_pri.get(key, 0.0) + rtf * pieces
+        sum_efd[key] = sum_efd.get(key, 0.0) + piece_efd * pieces
+
+    # Tariff printed on invoice/grid for rows with zero count (export + UI reference pricing).
+    pm_rates_invoice = _pm_for(end_date)
 
     def cell(zone: int, lb: int) -> dict[str, Any]:
         c = agg.get((zone, lb), 0)
-        rt = _retail_price_for_zone_lb(pm_rates[0], pm_rates[1], zone=int(zone), lb=int(lb))
-        pri = round(float(rt), 2) if rt is not None else None
-        ef = None if pri is None else round(max(0.0, float(pri) - parcel_discount), 2)
         if hide_costs:
             return {"count": c, "priority": None, "efd": None}
-        return {"count": c, "priority": pri, "efd": ef}
+        if c > 0:
+            spr = sum_pri.get((zone, lb), 0.0)
+            sef = sum_efd.get((zone, lb), 0.0)
+            pri = round(spr / float(c), 2)
+            ef = round(sef / float(c), 2)
+            return {"count": c, "priority": pri, "efd": ef}
+        rt = _retail_price_for_zone_lb(
+            pm_rates_invoice[0], pm_rates_invoice[1], zone=int(zone), lb=int(lb)
+        )
+        if rt is None:
+            return {"count": 0, "priority": None, "efd": None}
+        pri = round(float(rt), 2)
+        ef = round(max(0.0, float(rt) - parcel_discount), 2)
+        return {"count": 0, "priority": pri, "efd": ef}
 
     blocks_spec = [
         {"zone_a": 1, "zone_b": 3},
@@ -3368,12 +4450,14 @@ def query_parcels(
 ) -> dict[str, Any]:
     ts_date = _billing_ts_date_sql("br.time_stamp")
     where_sql, params = _parcel_billing_filters(
+        conn,
         start_date,
         end_date,
         parent_number,
         customer_number,
         show_parents,
         show_main,
+        None,
     )
 
     date_sel = f"{ts_date}" if not consolidate else "NULL"
@@ -3393,7 +4477,8 @@ def query_parcels(
         br.zone,
         br.weight_oz,
         br.billing_amount,
-        br.fully_paid_postage
+        br.fully_paid_postage,
+        br.time_stamp
     FROM billing_records br
     LEFT JOIN customers c ON br.custom_account_code = c.customer_number
     WHERE {where_sql}
@@ -3402,7 +4487,19 @@ def query_parcels(
     cur = conn.execute(sql, params)
     raw = cur.fetchall()
 
-    pm_rates = get_priority_mail_retail_rates(conn)
+    pm_by_day: dict[str, tuple[dict[tuple[int, int], float], dict[int, list[int]]]] = {}
+
+    def _parcel_pm_rates_for_billing_row(r: sqlite3.Row) -> tuple[
+        dict[tuple[int, int], float], dict[int, list[int]]
+    ]:
+        if consolidate:
+            od = end_date
+        else:
+            ts_d = iso_date_from_billing_timestamp(r["time_stamp"])
+            od = ts_d if ts_d is not None else end_date
+        if od not in pm_by_day:
+            pm_by_day[od] = get_priority_mail_retail_rates(conn, as_of_date=od)
+        return pm_by_day[od]
 
     agg: dict[tuple[Any, ...], dict[str, Any]] = {}
 
@@ -3436,12 +4533,13 @@ def query_parcels(
                 "total_retail": 0.0,
             }
         a = agg[key]
+        pm_piece = _parcel_pm_rates_for_billing_row(r)
         priced = compute_retail_cost_for_piece(
             conn,
             weight_oz=r["weight_oz"],
             zone_raw=r["zone"],
             fallback_retail=float(r["fully_paid_postage"] or 0.0),
-            pm_rates=pm_rates,
+            pm_rates=pm_piece,
         )
         retail = float(priced["retail"] or 0.0)
         a["total_qty"] += 1
@@ -3502,12 +4600,19 @@ def query_parcels(
                 "total_retail": 0.0,
             }
         a = agg[key]
+        if consolidate:
+            od_pm = end_date
+        else:
+            fd_iso = iso_date_from_postage_file_date(pr["bill_date"])
+            od_pm = fd_iso if fd_iso is not None else end_date
+        if od_pm not in pm_by_day:
+            pm_by_day[od_pm] = get_priority_mail_retail_rates(conn, as_of_date=od_pm)
         retail_one = _postage_over_13_per_piece_retail(
             conn,
             weight_oz=woz,
             pieces=pieces,
             total_cost=float(pr["total_cost"] or 0.0),
-            pm_rates=pm_rates,
+            pm_rates=pm_by_day[od_pm],
         )
         a["total_qty"] += pieces
         a["total_billed"] += retail_one * pieces
@@ -3569,6 +4674,91 @@ def query_parcels(
         out.pop("total_billed", None)
         out.pop("total_retail", None)
     return out
+
+
+def _business_days_in_range(start_date: str, end_date: str) -> list[str]:
+    """ISO dates (YYYY-MM-DD) for Mon–Fri inclusive between start and end."""
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    days: list[str] = []
+    d = start
+    while d <= end:
+        if d.weekday() < 5:
+            days.append(d.isoformat())
+        d += timedelta(days=1)
+    return days
+
+
+def query_report_readiness(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+) -> dict[str, Any]:
+    """
+  For each business day in [start_date, end_date], check postage (BM import),
+  parcel billing (mailing date on billing_records), and WS3 presort (mail_date).
+    """
+    expected = _business_days_in_range(start_date, end_date)
+    expected_set = set(expected)
+
+    postage_days = {
+        r[0]
+        for r in conn.execute(
+            """
+            SELECT DISTINCT file_date FROM postage_imports
+            WHERE file_date BETWEEN ? AND ?
+            """,
+            (start_date, end_date),
+        ).fetchall()
+    }
+
+    ts_date = _billing_ts_date_sql("time_stamp")
+    parcel_days = {
+        r[0]
+        for r in conn.execute(
+            f"""
+            SELECT DISTINCT {ts_date} AS d
+            FROM billing_records
+            WHERE {ts_date} BETWEEN ? AND ?
+            """,
+            (start_date, end_date),
+        ).fetchall()
+        if r[0]
+    }
+
+    ws3_days = {
+        r[0]
+        for r in conn.execute(
+            """
+            SELECT DISTINCT mail_date FROM ws3_mail_runs
+            WHERE mail_date BETWEEN ? AND ?
+            """,
+            (start_date, end_date),
+        ).fetchall()
+    }
+
+    missing_postage = sorted(expected_set - postage_days)
+    missing_parcel = sorted(expected_set - parcel_days)
+    missing_ws3 = sorted(expected_set - ws3_days)
+
+    ready = (
+        len(expected) > 0
+        and not missing_postage
+        and not missing_parcel
+        and not missing_ws3
+    )
+
+    return {
+        "ready": ready,
+        "start_date": start_date,
+        "end_date": end_date,
+        "business_day_count": len(expected),
+        "missing": {
+            "postage": missing_postage,
+            "parcel": missing_parcel,
+            "ws3_presort": missing_ws3,
+        },
+    }
 
 
 def query_summary(

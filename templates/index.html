@@ -53,6 +53,10 @@
           </span>
         </label>
       </div>
+      <div class="readiness-bar" id="reportReadinessBar" role="status" aria-live="polite">
+        <span class="readiness-dot" id="reportReadinessDot" aria-hidden="true"></span>
+        <span class="readiness-label" id="reportReadinessLabel">Checking reports…</span>
+      </div>
       <div class="controls-row controls-options">
         <label class="check"><input type="checkbox" id="showParents" checked /> Show Parent Accounts</label>
         <label class="check"><input type="checkbox" id="showMain" checked /> Show standalone accounts</label>
@@ -61,15 +65,16 @@
         </p>
         <label class="check"><input type="checkbox" id="kcPresort" /> KC presort</label>
         <label class="check"><input type="checkbox" id="efd" /> EFD</label>
+        <label class="check"><input type="checkbox" id="allocatePresortRejects" /> Allocate presort rejects</label>
         <label class="check"><input type="checkbox" id="consolidate" /> Consolidate Date &amp; Mailclass</label>
-        <label class="check"><input type="checkbox" id="removeZeros" /> Remove Zero Count Rows</label>
+        <label class="check"><input type="checkbox" id="removeZeros" checked /> Remove Zero Count Rows</label>
         <label class="check"><input type="checkbox" id="hideCosts" /> Hide Costs</label>
+        <label class="check"><input type="checkbox" id="hideCustomerNumbers" checked /> Hide Customer Numbers</label>
         <button type="button" class="btn btn-primary" id="btnLoad">&#9654; Load All</button>
       </div>
     </section>
 
     <div class="toolbar-exports">
-      <label class="check"><input type="checkbox" id="removeCustomerNumbers" checked /> Remove Customer Numbers</label>
       <label class="export-discount">
         <span class="export-discount-label">Flats discount ($)</span>
         <input
@@ -79,6 +84,17 @@
           step="0.01"
           value="0.10"
           aria-label="Flats discount in dollars per piece"
+        />
+      </label>
+      <label class="export-discount">
+        <span class="export-discount-label">Price to reseller ($)</span>
+        <input
+          type="number"
+          id="resellerDiscount"
+          min="0"
+          step="0.01"
+          value="0.23"
+          aria-label="Flats discount to EFD (reseller) in dollars per piece for profit report"
         />
       </label>
       <label class="export-discount">
@@ -101,7 +117,7 @@
         <span class="export-btn-spinner hidden" aria-hidden="true"></span>
       </button>
       <button type="button" class="btn btn-export" id="btnExportProfitReport">
-        <span class="export-btn-label">&#128229; Export Profit Report (Flats)</span>
+        <span class="export-btn-label">&#128229; Export Profit Report</span>
         <span class="export-btn-spinner hidden" aria-hidden="true"></span>
       </button>
       <button type="button" class="btn btn-export" id="btnExportParcelsCsv">
@@ -118,6 +134,14 @@
       </button>
       <button type="button" class="btn btn-export" id="btnExportEfdParcelInvoice">
         <span class="export-btn-label">&#128196; EFD Parcel Invoice</span>
+        <span class="export-btn-spinner hidden" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="btn btn-export" id="btnExportEfdWeeklyInvoice">
+        <span class="export-btn-label">&#128229; Export EFD Weekly Invoice</span>
+        <span class="export-btn-spinner hidden" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="btn btn-export" id="btnExportEfdDailyReport">
+        <span class="export-btn-label">&#128229; Export EFD Daily Report</span>
         <span class="export-btn-spinner hidden" aria-hidden="true"></span>
       </button>
       <button type="button" class="btn btn-export" id="btnExportConsolidatedVolumes">
@@ -138,7 +162,7 @@
       <button type="button" class="tab active" data-tab="postage" role="tab" aria-selected="true">&#128238; Postage</button>
       <button type="button" class="tab" data-tab="parcels" role="tab" aria-selected="false">&#128230; Parcels</button>
       <button type="button" class="tab" data-tab="summary" role="tab" aria-selected="false">&#128203; Import Summary</button>
-      <button type="button" class="tab" data-tab="profitFlats" role="tab" aria-selected="false">&#128200; Profit Report (Flats)</button>
+      <button type="button" class="tab" data-tab="profitFlats" role="tab" aria-selected="false">&#128200; Profit report</button>
     </nav>
 
     <div id="errorBanner" class="error-banner hidden" role="alert"></div>
@@ -157,6 +181,10 @@
 
     <section id="tabParcels" class="tab-panel hidden" role="tabpanel">
       <div class="summary-bar" id="summaryParcels"></div>
+      <div class="table-actions">
+        <button type="button" class="btn btn-edit" id="btnEditParcel" disabled>Edit selected row</button>
+        <span class="table-actions-hint" id="parcelEditHint">Select a row to edit transactions.</span>
+      </div>
       <div class="table-wrap loading-wrap" id="wrapParcels">
         <div class="spinner hidden" id="spinParcels"></div>
         <div class="table-scroll" id="tableParcels"></div>
@@ -221,6 +249,53 @@
     </section>
 
     <section id="tabProfitFlats" class="tab-panel hidden" role="tabpanel">
+      <div class="profit-scope-panel">
+        <h3 class="summary-section-heading">Profit scope</h3>
+        <p class="controls-hint profit-scope-hint">
+          With no accounts below, profit uses the toolbar <strong>Select Account</strong> (and optional search).
+          The add list matches the main account selector (including search). Choosing a <strong>parent company</strong>
+          adds that parent and <strong>all child accounts</strong> under it in one step.
+        </p>
+        <div class="profit-scope-controls">
+          <label class="field grow">
+            <span class="field-label">Add account</span>
+            <span class="input-wrap">
+              <span class="input-icon" aria-hidden="true">&#128203;</span>
+              <select id="profitAccountPick" aria-label="Add account to profit scope"></select>
+            </span>
+          </label>
+          <label class="field export-discount">
+            <span class="field-label">Parcel Reseller ($/pc)</span>
+            <span class="input-wrap">
+              <input
+                type="number"
+                id="parcelFee"
+                min="0"
+                step="0.01"
+                value="1.25"
+                aria-label="Parcel reseller per piece for parcel profit preview and postage fee computations"
+              />
+            </span>
+          </label>
+          <label class="field export-discount">
+            <span class="field-label">Parcel fee to EFD ($/pc)</span>
+            <span class="input-wrap">
+              <input
+                type="number"
+                id="efdParcelFee"
+                min="0"
+                step="0.01"
+                value="1.25"
+                aria-label="Per-piece parcel fee added to billing for Price to EFD on EFD Parcel Invoice and profit report Summary"
+              />
+            </span>
+          </label>
+          <button type="button" class="btn" id="btnProfitUseToolbar">Use toolbar account</button>
+          <button type="button" class="btn" id="btnProfitClearAccounts">Clear accounts</button>
+        </div>
+        <div id="profitAccountChips" class="profit-chip-row" aria-live="polite"></div>
+        <p id="profitScopeCapWarning" class="profit-scope-warning hidden" role="status"></p>
+      </div>
       <div class="summary-bar" id="summaryProfitFlats"></div>
       <div id="profitFlatsError" class="error-banner hidden" role="alert"></div>
       <div class="table-wrap loading-wrap" id="wrapProfitFlats">
@@ -274,6 +349,49 @@
       <div class="modal-footer">
         <button type="button" class="btn" id="btnPreviewPostageEdit">Preview changes</button>
         <button type="button" class="btn btn-primary" id="btnApplyPostageEdit" disabled>Apply update</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay hidden" id="parcelEditOverlay" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="modal" role="document" aria-labelledby="parcelEditTitle">
+      <div class="modal-header">
+        <h2 class="modal-title" id="parcelEditTitle">Edit Parcel Transactions</h2>
+        <button type="button" class="btn btn-modal-close" id="btnCloseParcelEdit" aria-label="Close">&#10005;</button>
+      </div>
+      <div class="modal-body">
+        <div class="edit-context" id="parcelEditContext"></div>
+
+        <div class="edit-grid">
+          <label class="field">
+            <span class="field-label">New account #</span>
+            <span class="input-wrap">
+              <span class="input-icon" aria-hidden="true">&#128203;</span>
+              <input type="text" id="parcelEditAccount" placeholder="Enter customer number..." />
+            </span>
+          </label>
+          <label class="field grow">
+            <span class="field-label">Reason (optional)</span>
+            <span class="input-wrap">
+              <span class="input-icon" aria-hidden="true">&#9998;</span>
+              <input type="text" id="parcelEditReason" placeholder="Why is this being updated?" />
+            </span>
+          </label>
+        </div>
+
+        <div class="edit-weights">
+          <div class="edit-weights-head">
+            <h3 class="edit-weights-title">Pieces by lb bucket</h3>
+            <p class="edit-weights-hint">Set how many pieces to reassign per weight bucket. Defaults to all pieces in each bucket.</p>
+          </div>
+          <div class="table-scroll short" id="parcelEditBuckets"></div>
+        </div>
+
+        <div class="edit-preview hidden" id="parcelEditPreview"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn" id="btnPreviewParcelEdit">Preview changes</button>
+        <button type="button" class="btn btn-primary" id="btnApplyParcelEdit" disabled>Apply update</button>
       </div>
     </div>
   </div>

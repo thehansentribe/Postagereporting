@@ -8,6 +8,7 @@ import time
 import traceback
 from datetime import date as date_cls
 from pathlib import Path
+from typing import Any
 
 import db
 import importer
@@ -147,10 +148,18 @@ def row_count_from_result(result: dict) -> int:
     )
 
 
-def scan_once() -> None:
+def scan_once() -> dict[str, Any]:
+    """
+    Process pending files in ``input/`` and ``watch/incoming/``.
+
+    Returns ``{"processed": [{"file", "rows"}, ...], "failed": [{"file", "error"}, ...]}``.
+    """
     global _last_scan_ts
     ensure_dirs()
     _last_scan_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    processed: list[dict[str, Any]] = []
+    failed: list[dict[str, str]] = []
 
     candidates: list[Path] = []
     seen: set[str] = set()
@@ -167,6 +176,9 @@ def scan_once() -> None:
             if p.name.startswith("."):
                 continue
             candidates.append(p)
+
+    if not candidates:
+        return {"processed": processed, "failed": failed}
 
     ts = _last_scan_ts
     dest_day = PROCESSED / date_cls.today().isoformat()
@@ -191,6 +203,7 @@ def scan_once() -> None:
                 target = dest_day / f"{stem}_{int(time.time())}{suf}"
             shutil.move(str(fpath), str(target))
             _log_line(f"{fts} | OK | {fpath.name} | {n} rows")
+            processed.append({"file": fpath.name, "rows": n})
         except Exception as e:
             try:
                 shutil.move(str(fpath), str(FAILED / fpath.name))
@@ -200,6 +213,9 @@ def scan_once() -> None:
             with open(err_log, "w", encoding="utf-8") as el:
                 el.write(f"Failed at {fts}\n{traceback.format_exc()}")
             _log_line(f"{fts} | FAIL | {fpath.name} | {e}")
+            failed.append({"file": fpath.name, "error": str(e)})
+
+    return {"processed": processed, "failed": failed}
 
 
 def watch_loop(interval_sec: int = 60) -> None:

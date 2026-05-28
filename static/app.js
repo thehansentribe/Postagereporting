@@ -11,11 +11,15 @@
     lastProfitFlats: { key: null, payload: null },
     /** Selected Postage row key for edit workflow */
     selectedPostage: null,
+    /** Selected Parcels row key for edit workflow */
+    selectedParcel: null,
     sortPostage: { key: "date", dir: 1 },
     sortParcel: { key: "date", dir: 1 },
     consolidatedDefaultsTouched: { removeZeros: false },
     /** @type {{ parent: { customer_number: number; customer_name: string; kind: string }[]; child: ...[]; standalone: ...[] }} */
     accountsByKind: { parent: [], child: [], standalone: [] },
+    /** Customer numbers for combined Profit tab scope (optional; empty = toolbar account). */
+    profitAccountIds: [],
   };
 
   function fmtMoney(n) {
@@ -35,6 +39,14 @@
     const discRaw = ($("parcelDiscount") && $("parcelDiscount").value) || "";
     let discount = discRaw.trim() === "" ? 0.25 : parseFloat(discRaw);
     if (Number.isNaN(discount)) discount = 0.25;
+    return discount;
+  }
+
+  /** Flats discount to EFD (reseller) for profit report export (Summary B8). */
+  function parseResellerDiscount() {
+    const discRaw = ($("resellerDiscount") && $("resellerDiscount").value) || "";
+    let discount = discRaw.trim() === "" ? 0.23 : parseFloat(discRaw);
+    if (Number.isNaN(discount)) discount = 0.23;
     return discount;
   }
 
@@ -94,11 +106,238 @@
     p.set("show_main", $("showMain").checked ? "true" : "false");
     p.set("kc_presort", $("kcPresort") && $("kcPresort").checked ? "true" : "false");
     p.set("efd", $("efd") && $("efd").checked ? "true" : "false");
+    p.set(
+      "allocate_presort_rejects",
+      $("allocatePresortRejects") && $("allocatePresortRejects").checked ? "true" : "false",
+    );
     p.set("consolidate", $("consolidate").checked ? "true" : "false");
     p.set("remove_zeros", $("removeZeros").checked ? "true" : "false");
     p.set("hide_costs", $("hideCosts").checked ? "true" : "false");
     p.set("hide_savings", "false");
     return p;
+  }
+
+  function parseProfitParcelFee() {
+    const raw = ($("parcelFee") && $("parcelFee").value) || "";
+    let v = raw.trim() === "" ? 1.25 : parseFloat(raw);
+    if (Number.isNaN(v) || v < 0) v = 1.25;
+    return v;
+  }
+
+  function parseEfdParcelFee() {
+    const raw = ($("efdParcelFee") && $("efdParcelFee").value) || "";
+    let v = raw.trim() === "" ? 1.25 : parseFloat(raw);
+    if (Number.isNaN(v) || v < 0) v = 1.25;
+    return v;
+  }
+
+  /** Keep in sync with ``db.MAX_PROFIT_ACCOUNT_IDS`` (profit_accounts / profit_account_ids cap). */
+  const PROFIT_ACCOUNT_IDS_MAX = 2000;
+  const PROFIT_IDS_POST_MIN_COUNT = 80;
+  const PROFIT_IDS_POST_MIN_CSV_CHARS = 2048;
+
+  function sortedProfitAccountIds() {
+    return [...new Set((state.profitAccountIds || []).map((x) => Math.trunc(Number(x))))]
+      .filter((n) => Number.isFinite(n) && !Number.isNaN(n))
+      .sort((a, b) => a - b);
+  }
+
+  function profitAccountsUsePost() {
+    const ids = sortedProfitAccountIds();
+    if (ids.length === 0) return false;
+    if (ids.length > PROFIT_IDS_POST_MIN_COUNT) return true;
+    const csv = ids.join(",");
+    if (csv.length > PROFIT_IDS_POST_MIN_CSV_CHARS) return true;
+    return false;
+  }
+
+  function profitPostJsonBody(extra) {
+    return Object.assign(
+      {
+        start_date: $("startDate").value,
+        end_date: $("endDate").value,
+        show_parents: $("showParents").checked,
+        show_main: $("showMain").checked,
+        profit_account_ids: sortedProfitAccountIds(),
+        parcel_fee: parseProfitParcelFee(),
+        efd_parcel_fee: parseEfdParcelFee(),
+      },
+      extra || {}
+    );
+  }
+
+  /**
+   * Query string for Profit tab APIs and profit export: dates, show flags, optional
+   * ``profit_accounts`` CSV, ``parcel_fee``, and ``efd_parcel_fee``; falls back to toolbar account when chips are empty.
+   */
+  function profitQueryParams() {
+    const base = queryParams();
+    const p = new URLSearchParams();
+    for (const [k, v] of base.entries()) {
+      if (k === "parent_number" || k === "customer_number") continue;
+      p.append(k, v);
+    }
+    const ids = (state.profitAccountIds || [])
+      .map((x) => Math.trunc(Number(x)))
+      .filter((n) => Number.isFinite(n) && !Number.isNaN(n));
+    if (ids.length > 0) {
+      const sorted = [...new Set(ids)].sort((a, b) => a - b);
+      p.set("profit_accounts", sorted.join(","));
+    } else {
+      if (base.has("parent_number")) p.set("parent_number", base.get("parent_number"));
+      if (base.has("customer_number")) p.set("customer_number", base.get("customer_number"));
+    }
+    p.set("parcel_fee", String(parseProfitParcelFee()));
+    p.set("efd_parcel_fee", String(parseEfdParcelFee()));
+    return p;
+  }
+
+  function invalidateProfitCache() {
+    state.lastProfitFlats = { key: null, payload: null };
+  }
+
+  function profitTabIsActive() {
+    const t = document.querySelector('.tab[data-tab="profitFlats"]');
+    return !!(t && t.classList.contains("active"));
+  }
+
+  function onProfitScopeChanged() {
+    invalidateProfitCache();
+    if (profitTabIsActive()) {
+      Promise.all([loadProfitFlats(), loadProfitParcels()]).catch(() => {});
+    }
+  }
+
+  function accountRowByCustomerNumber(customerNumber, kind) {
+    const n = Math.trunc(Number(customerNumber));
+    if (Number.isNaN(n)) return null;
+    const buckets = kind ? [kind] : ["parent", "child", "standalone"];
+    for (const bk of buckets) {
+      const row = (state.accountsByKind[bk] || []).find((r) => Math.trunc(Number(r.customer_number)) === n);
+      if (row) return { ...row, kind: row.kind || bk };
+    }
+    return null;
+  }
+
+  /**
+   * Customer numbers to add for profit scope: a parent row expands to that parent # plus every child #.
+   */
+  function profitAccountIdsForRow(row) {
+    if (!row || row.customer_number == null) return [];
+    const n = Math.trunc(Number(row.customer_number));
+    if (Number.isNaN(n)) return [];
+    const kind = row.kind || "";
+    if (kind !== "parent") return [n];
+    const children = state.accountsByKind.child || [];
+    const childIds = children
+      .filter((c) => c.parent_number != null && Math.trunc(Number(c.parent_number)) === n)
+      .map((c) => Math.trunc(Number(c.customer_number)))
+      .filter((x) => !Number.isNaN(x));
+    return [...new Set([n, ...childIds])].sort((a, b) => a - b);
+  }
+
+  function mergeProfitAccountIds(ids) {
+    for (const id of ids) {
+      const m = Math.trunc(Number(id));
+      if (Number.isNaN(m)) continue;
+      if (!state.profitAccountIds.includes(m)) state.profitAccountIds.push(m);
+    }
+    renderProfitAccountChips();
+    onProfitScopeChanged();
+  }
+
+  function renderProfitAccountChips() {
+    const box = $("profitAccountChips");
+    if (!box) return;
+    const sorted = [...new Set((state.profitAccountIds || []).map((x) => Math.trunc(Number(x))))]
+      .filter((n) => Number.isFinite(n) && !Number.isNaN(n))
+      .sort((a, b) => a - b);
+    state.profitAccountIds = sorted;
+    const capWarn = $("profitScopeCapWarning");
+    if (capWarn) {
+      if (sorted.length > PROFIT_ACCOUNT_IDS_MAX) {
+        capWarn.textContent = `Too many accounts selected (${sorted.length}). Maximum is ${PROFIT_ACCOUNT_IDS_MAX} for profit load and export. Remove some accounts.`;
+        capWarn.classList.remove("hidden");
+      } else if (sorted.length === PROFIT_ACCOUNT_IDS_MAX) {
+        capWarn.textContent = `You are at the maximum of ${PROFIT_ACCOUNT_IDS_MAX} accounts for profit scope.`;
+        capWarn.classList.remove("hidden");
+      } else {
+        capWarn.textContent = "";
+        capWarn.classList.add("hidden");
+      }
+    }
+    let h = "";
+    if (!sorted.length) {
+      h = `<span class="profit-chip-empty">Using toolbar / search account scope.</span>`;
+    } else {
+      for (const id of sorted) {
+        h += `<span class="profit-chip"><span class="profit-chip-label">${escapeHtml(String(id))}</span>`;
+        h += `<button type="button" class="profit-chip-remove" data-id="${id}" aria-label="Remove account ${id}">&times;</button></span>`;
+      }
+    }
+    box.innerHTML = h;
+    box.querySelectorAll(".profit-chip-remove").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const n = parseInt(btn.getAttribute("data-id"), 10);
+        if (Number.isNaN(n)) return;
+        state.profitAccountIds = state.profitAccountIds.filter((x) => Math.trunc(x) !== n);
+        renderProfitAccountChips();
+        onProfitScopeChanged();
+      });
+    });
+  }
+
+  /** Same grouping / search filter as ``#selectAccount`` (see ``populateAccountSelect``). */
+  function populateProfitAccountPick(filterRaw) {
+    const sel = $("profitAccountPick");
+    if (!sel) return;
+    sel.innerHTML = "";
+    const z = document.createElement("option");
+    z.value = "";
+    z.textContent = "Add account…";
+    sel.appendChild(z);
+
+    const qLower = String(filterRaw || "")
+      .trim()
+      .toLowerCase();
+    const qDigits = qLower.replace(/\D/g, "");
+    const filterActive = qLower.length > 0 || qDigits.length > 0;
+    const order = ["parent", "child", "standalone"];
+    const labels = {
+      parent: "Parent companies",
+      child: "Child accounts",
+      standalone: "Standalone (no parent company)",
+    };
+
+    if (filterActive) {
+      const merged = order.flatMap((k) => state.accountsByKind[k] || []);
+      const filtered = filterAccountRows(merged, qLower, qDigits);
+      filtered.sort((a, b) =>
+        a.customer_name.localeCompare(b.customer_name, undefined, { sensitivity: "base" })
+      );
+      filtered.forEach((row) => {
+        const opt = document.createElement("option");
+        opt.value = String(row.customer_number);
+        opt.textContent = accountRowLabel(row);
+        opt.setAttribute("data-kind", row.kind);
+        sel.appendChild(opt);
+      });
+    } else {
+      for (const kind of order) {
+        const rows = state.accountsByKind[kind] || [];
+        if (!rows.length) continue;
+        const og = document.createElement("optgroup");
+        og.label = labels[kind];
+        rows.forEach((row) => {
+          const opt = document.createElement("option");
+          opt.value = String(row.customer_number);
+          opt.textContent = accountRowLabel(row);
+          opt.setAttribute("data-kind", row.kind);
+          og.appendChild(opt);
+        });
+        sel.appendChild(og);
+      }
+    }
   }
 
   /** Same as queryParams but force postage costs on (for consolidated flats column W). */
@@ -191,8 +430,14 @@
     el.innerHTML = parts.join("");
   }
 
-  const POSTAGE_STICKY_WIDTHS = [90, 140, 140, 100];
-  const PARCEL_STICKY_WIDTHS = [90, 140, 140, 120, 55];
+  function postageStickyWidths(hideCustomerNumbers) {
+    return hideCustomerNumbers ? [90, 140, 140, 100] : [90, 140, 140, 70, 100];
+  }
+  function parcelStickyWidths(hideCustomerNumbers) {
+    return hideCustomerNumbers
+      ? [90, 140, 140, 120, 55]
+      : [90, 140, 140, 70, 120, 55];
+  }
 
   function stickyLeft(index, widths) {
     let x = 0;
@@ -205,33 +450,27 @@
     return hideCosts ? 1 : 3;
   }
 
-  /** Shared column layout for Postage grid (no parent/child #, no savings). */
-  function postageTableColumns(hideCosts) {
+  /** Shared column layout for Postage grid (no savings). */
+  function postageTableColumns(hideCosts, hideCustomerNumbers) {
     const ozKeys = [];
     for (let i = 0; i <= 12; i++) ozKeys.push(`oz_${i}`);
     ozKeys.push("oz_13", "oz_13plus");
-    const headerKeys = [
-      "date",
-      "parent_name",
-      "child_name",
-      "mail_class",
-      ...ozKeys,
-      "total_qty",
-    ];
-    if (!hideCosts) {
-      headerKeys.push("metered_cost", "retail_cost");
+    const headerKeys = ["date", "parent_name", "child_name"];
+    const headers = ["Date", "Parent Name", "Child Name"];
+    if (!hideCustomerNumbers) {
+      headerKeys.push("child_number");
+      headers.push("Child Number");
     }
-    const headers = [
-      "Date",
-      "Parent Name",
-      "Child Name",
+    headerKeys.push("mail_class", ...ozKeys, "total_qty");
+    headers.push(
       "Class",
       ...Array.from({ length: 13 }, (_, i) => `${i} oz`),
       "13 oz",
       "13+ oz",
-      "Total Qty",
-    ];
+      "Total Qty"
+    );
     if (!hideCosts) {
+      headerKeys.push("metered_cost", "retail_cost");
       headers.push("Metered cost", "Retail cost");
     }
     return { headerKeys, headers };
@@ -310,25 +549,47 @@
     return out;
   }
 
-  function parcelCsvColumns(costsHidden) {
+  function parcelTableColumns(hideCosts, hideCustomerNumbers) {
     const lbKeys = [];
     for (let i = 1; i <= 10; i++) lbKeys.push(`lb_${i}`);
     lbKeys.push("lb_10plus");
-    const headerKeys = [
-      "date",
-      "parent_name",
-      "child_name",
-      ...lbKeys,
-      "total_qty",
-    ];
-    const headers = [
-      "Date",
-      "Parent Name",
-      "Child Name",
+    const headerKeys = ["date", "parent_name", "child_name"];
+    const headers = ["Date", "Parent Name", "Child Name"];
+    if (!hideCustomerNumbers) {
+      headerKeys.push("child_number");
+      headers.push("Child Number");
+    }
+    headerKeys.push("mail_class", "zone", ...lbKeys, "total_qty");
+    headers.push(
+      "Mail Class",
+      "Zone",
       ...Array.from({ length: 10 }, (_, i) => `${i + 1} lb`),
       "10+ lb",
-      "Total Qty",
-    ];
+      "Total Qty"
+    );
+    if (!hideCosts) {
+      headerKeys.push("total_retail");
+      headers.push("Retail Cost");
+    }
+    return { headerKeys, headers };
+  }
+
+  function parcelCsvColumns(costsHidden, hideCustomerNumbers) {
+    const lbKeys = [];
+    for (let i = 1; i <= 10; i++) lbKeys.push(`lb_${i}`);
+    lbKeys.push("lb_10plus");
+    const headerKeys = ["date", "parent_name", "child_name"];
+    const headers = ["Date", "Parent Name", "Child Name"];
+    if (!hideCustomerNumbers) {
+      headerKeys.push("child_number");
+      headers.push("Child Number");
+    }
+    headerKeys.push(...lbKeys, "total_qty");
+    headers.push(
+      ...Array.from({ length: 10 }, (_, i) => `${i + 1} lb`),
+      "10+ lb",
+      "Total Qty"
+    );
     if (!costsHidden) {
       headerKeys.push("total_retail");
       headers.push("Retail Cost");
@@ -342,6 +603,7 @@
       if (v == null || v === "") return "";
       return csvMoneyRounded(v);
     }
+    if (k === "child_number") return fmtId(v);
     if (k.startsWith("lb_") || k === "total_qty") return String(Number(v) || 0);
     if (typeof v === "number") return String(v);
     return v != null ? String(v) : "";
@@ -397,10 +659,11 @@
    * @param {object|null} data parcel API payload
    * @param {boolean} includeMoney when true, append Retail Cost column
    */
-  function buildParcelsCsvLinesFromData(data, includeMoney) {
+  function buildParcelsCsvLinesFromData(data, includeMoney, hideCustomerNumbers) {
     if (!data || !(data.rows || []).length) return null;
     const aggregated = aggregateParcelRowsForCsv(data.rows || []);
-    const { headerKeys, headers } = parcelCsvColumns(!includeMoney);
+    const hideNums = hideCustomerNumbers ?? $("hideCustomerNumbers")?.checked ?? true;
+    const { headerKeys, headers } = parcelCsvColumns(!includeMoney, hideNums);
     const lines = [headers.map((h) => csvEscape(h)).join(",")];
     for (const row of aggregated) {
       lines.push(headerKeys.map((k) => csvEscape(parcelCsvCell(row, k))).join(","));
@@ -409,7 +672,11 @@
   }
 
   function buildParcelsCsvLines() {
-    return buildParcelsCsvLinesFromData(state.parcelData, !$("hideCosts").checked);
+    return buildParcelsCsvLinesFromData(
+      state.parcelData,
+      !$("hideCosts").checked,
+      $("hideCustomerNumbers")?.checked ?? true
+    );
   }
 
   function exportScopeLabel() {
@@ -429,6 +696,30 @@
     const mm = String(parseInt(m[2], 10));
     const dd = String(parseInt(m[3], 10));
     return `${mm}-${dd}-${y}`;
+  }
+
+  function fmtDisplayDate(isoDate) {
+    if (!isoDate) return "";
+    const d = new Date(String(isoDate).trim() + "T12:00:00");
+    if (Number.isNaN(d.getTime())) return String(isoDate).trim();
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+  }
+
+  function formatMissingDates(isoDates, maxShow = 5) {
+    const list = isoDates || [];
+    const shown = list.slice(0, maxShow).map(fmtDisplayDate);
+    let s = shown.join(", ");
+    const rest = list.length - maxShow;
+    if (rest > 0) s += (s ? ", " : "") + `and ${rest} more`;
+    return s;
+  }
+
+  function formatReadinessRangeLabel(start, end, count) {
+    if (!count) return "";
+    if (start === end) {
+      return `${count} business day: ${fmtDisplayDate(start)}`;
+    }
+    return `${count} business days: ${fmtDisplayDate(start)} – ${fmtDisplayDate(end)}`;
   }
 
   function safeFilename(name) {
@@ -471,8 +762,7 @@
 
   async function downloadConsolidatedVolumesXlsx() {
     const p = queryParams();
-    const removeCustomerNumbers = $("removeCustomerNumbers");
-    p.set("remove_customer_numbers", removeCustomerNumbers && removeCustomerNumbers.checked ? "true" : "false");
+    p.set("hide_customer_numbers", $("hideCustomerNumbers")?.checked ? "true" : "false");
     if (!state.consolidatedDefaultsTouched.removeZeros) {
       p.set("remove_zeros", "true");
     }
@@ -499,7 +789,9 @@
 
   function buildPostageTableFixed(container, data) {
     const hideCosts = $("hideCosts").checked;
-    const { headerKeys, headers } = postageTableColumns(hideCosts);
+    const hideCustomerNumbers = $("hideCustomerNumbers")?.checked ?? true;
+    const stickyWidths = postageStickyWidths(hideCustomerNumbers);
+    const { headerKeys, headers } = postageTableColumns(hideCosts, hideCustomerNumbers);
     const trailingCols = postageTrailingColumnCount(hideCosts);
     if (!headerKeys.includes(state.sortPostage.key)) state.sortPostage.key = "date";
 
@@ -510,7 +802,7 @@
     }));
     const rows = sortRows(rowsWithSavings, state.sortPostage.key, state.sortPostage.dir);
 
-    const nSticky = POSTAGE_STICKY_WIDTHS.length;
+    const nSticky = stickyWidths.length;
     let html = "<table class='data-table'><thead><tr>";
     headers.forEach((h, i) => {
       const k = headerKeys[i];
@@ -519,7 +811,7 @@
         state.sortPostage.key === k ? (state.sortPostage.dir === 1 ? "sort-asc" : "sort-desc") : "";
       const st =
         i < nSticky
-          ? ` style="left:${stickyLeft(i, POSTAGE_STICKY_WIDTHS)}px;min-width:${POSTAGE_STICKY_WIDTHS[i]}px;width:${POSTAGE_STICKY_WIDTHS[i]}px"`
+          ? ` style="left:${stickyLeft(i, stickyWidths)}px;min-width:${stickyWidths[i]}px;width:${stickyWidths[i]}px"`
           : i >= nSticky && i < headers.length - trailingCols
             ? " style='min-width:55px;width:55px'"
             : "";
@@ -553,11 +845,12 @@
           const cellClass = i < nSticky ? "sticky-col" : "";
           const st =
             i < nSticky
-              ? ` style="left:${stickyLeft(i, POSTAGE_STICKY_WIDTHS)}px;min-width:${POSTAGE_STICKY_WIDTHS[i]}px;width:${POSTAGE_STICKY_WIDTHS[i]}px"`
+              ? ` style="left:${stickyLeft(i, stickyWidths)}px;min-width:${stickyWidths[i]}px;width:${stickyWidths[i]}px"`
               : "";
           let inner;
           if (k === "metered_cost" || k === "retail_cost")
             inner = v != null && v !== "" ? fmtMoney(v) : "\u2014";
+          else if (k === "child_number") inner = fmtId(v);
           else if (k === "total_qty") inner = `<strong>${fmtInt(n)}</strong>`;
           else if (isOz || typeof v === "number") inner = fmtInt(Number(v) || 0);
           else inner = v != null ? String(v) : "";
@@ -575,7 +868,7 @@
         const childNumRaw = tr.getAttribute("data-child-number") || "";
         const mailClass = tr.getAttribute("data-mail-class") || "";
         if (!date || date === "Combined") return;
-        if (mailClass === "Presort rejects") return;
+        if (mailClass === "Presort rejects" || mailClass === "Rejects") return;
         const cn = parseInt(childNumRaw, 10);
         if (Number.isNaN(cn) || !mailClass) return;
         state.selectedPostage = { date, child_number: cn, mail_class: mailClass };
@@ -662,36 +955,15 @@
 
   function buildParcelTable(container, data) {
     const hide = $("hideCosts").checked;
-    const lbKeys = [];
-    for (let i = 1; i <= 10; i++) lbKeys.push(`lb_${i}`);
-    lbKeys.push("lb_10plus");
-    const headerKeys = [
-      "date",
-      "parent_name",
-      "child_name",
-      "mail_class",
-      "zone",
-      ...lbKeys,
-      "total_qty",
-    ];
-    if (!hide) headerKeys.push("total_retail");
-    const headers = [
-      "Date",
-      "Parent Name",
-      "Child Name",
-      "Mail Class",
-      "Zone",
-      ...Array.from({ length: 10 }, (_, i) => `${i + 1} lb`),
-      "10+ lb",
-      "Total Qty",
-    ];
-    if (!hide) headers.push("Retail Cost");
+    const hideCustomerNumbers = $("hideCustomerNumbers")?.checked ?? true;
+    const stickyWidths = parcelStickyWidths(hideCustomerNumbers);
+    const { headerKeys, headers } = parcelTableColumns(hide, hideCustomerNumbers);
 
     if (!headerKeys.includes(state.sortParcel.key)) state.sortParcel.key = "date";
 
     const rows = sortRows(data.rows || [], state.sortParcel.key, state.sortParcel.dir);
 
-    const nParcSticky = PARCEL_STICKY_WIDTHS.length;
+    const nParcSticky = stickyWidths.length;
     let html = "<table class='data-table'><thead><tr>";
     headers.forEach((h, i) => {
       const k = headerKeys[i];
@@ -700,7 +972,7 @@
         state.sortParcel.key === k ? (state.sortParcel.dir === 1 ? "sort-asc" : "sort-desc") : "";
       const st =
         i < nParcSticky
-          ? ` style="left:${stickyLeft(i, PARCEL_STICKY_WIDTHS)}px;min-width:${PARCEL_STICKY_WIDTHS[i]}px;width:${PARCEL_STICKY_WIDTHS[i]}px"`
+          ? ` style="left:${stickyLeft(i, stickyWidths)}px;min-width:${stickyWidths[i]}px;width:${stickyWidths[i]}px"`
           : i >= nParcSticky && i < headers.length - (hide ? 1 : 2)
             ? " style='min-width:55px;width:55px'"
             : "";
@@ -712,7 +984,24 @@
       html += `<tr><td colspan="${headers.length}" class="empty-state">No data found for the selected date range and filters.</td></tr>`;
     } else {
       rows.forEach((row) => {
-        html += "<tr>";
+        const rowKey = {
+          date: row.date,
+          child_number: row.child_number,
+          mail_class: row.mail_class,
+          zone: row.zone != null ? String(row.zone) : "",
+        };
+        const isSel =
+          state.selectedParcel &&
+          state.selectedParcel.date === rowKey.date &&
+          String(state.selectedParcel.child_number) === String(rowKey.child_number) &&
+          state.selectedParcel.mail_class === rowKey.mail_class &&
+          state.selectedParcel.zone === rowKey.zone;
+        const trCls = isSel ? " class='row-selected'" : "";
+        html += `<tr${trCls} data-date="${escapeHtml(row.date)}" data-child-number="${escapeHtml(
+          String(row.child_number ?? "")
+        )}" data-mail-class="${escapeHtml(row.mail_class || "")}" data-zone="${escapeHtml(
+          rowKey.zone
+        )}">`;
         headerKeys.forEach((k, i) => {
           const v = row[k];
           const isLb = k.startsWith("lb_");
@@ -721,10 +1010,11 @@
           const cellClass = i < nParcSticky ? "sticky-col" : "";
           const st =
             i < nParcSticky
-              ? ` style="left:${stickyLeft(i, PARCEL_STICKY_WIDTHS)}px;min-width:${PARCEL_STICKY_WIDTHS[i]}px;width:${PARCEL_STICKY_WIDTHS[i]}px"`
+              ? ` style="left:${stickyLeft(i, stickyWidths)}px;min-width:${stickyWidths[i]}px;width:${stickyWidths[i]}px"`
               : "";
           let inner;
           if (k === "total_retail") inner = fmtMoney(v);
+          else if (k === "child_number") inner = fmtId(v);
           else if (k === "total_qty") inner = `<strong>${fmtInt(n)}</strong>`;
           else if (isLb || typeof v === "number") inner = fmtInt(Number(v) || 0);
           else inner = v != null ? String(v) : "";
@@ -735,6 +1025,22 @@
     }
     html += "</tbody></table>";
     container.innerHTML = html;
+
+    container.querySelectorAll("tbody tr[data-date]").forEach((tr) => {
+      tr.addEventListener("click", () => {
+        const date = tr.getAttribute("data-date") || "";
+        const childNumRaw = tr.getAttribute("data-child-number") || "";
+        const mailClass = tr.getAttribute("data-mail-class") || "";
+        const zone = tr.getAttribute("data-zone") || "";
+        if (!date || date === "Combined") return;
+        const cn = parseInt(childNumRaw, 10);
+        if (Number.isNaN(cn) || !mailClass) return;
+        state.selectedParcel = { date, child_number: cn, mail_class: mailClass, zone };
+        const btn = $("btnEditParcel");
+        if (btn) btn.disabled = false;
+        buildParcelTable(container, data);
+      });
+    });
 
     container.querySelectorAll("thead th[data-key]").forEach((th) => {
       th.addEventListener("click", () => {
@@ -840,13 +1146,18 @@
       const k = row.kind;
       if (state.accountsByKind[k]) state.accountsByKind[k].push(row);
     });
-    populateAccountSelect($("searchCustomer").value);
+    const searchVal = $("searchCustomer").value;
+    populateAccountSelect(searchVal);
+    populateProfitAccountPick(searchVal);
+    renderProfitAccountChips();
   }
 
   async function loadAll() {
     $("errorBanner").classList.add("hidden");
     state.selectedPostage = null;
+    state.selectedParcel = null;
     if ($("btnEditPostage")) $("btnEditPostage").disabled = true;
+    if ($("btnEditParcel")) $("btnEditParcel").disabled = true;
     const q = queryParams();
     $("spinPostage").classList.remove("hidden");
     $("spinParcels").classList.remove("hidden");
@@ -898,6 +1209,54 @@
       $("spinPostage").classList.add("hidden");
       $("spinParcels").classList.add("hidden");
       if ($("btnExportFlatsSavings")) $("btnExportFlatsSavings").hidden = $("hideCosts").checked;
+      refreshReportReadiness();
+    }
+  }
+
+  async function refreshReportReadiness() {
+    const dot = $("reportReadinessDot");
+    const label = $("reportReadinessLabel");
+    if (!dot || !label) return;
+    try {
+      const r = await fetch("/api/reports/readiness?" + queryParams().toString());
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "Readiness check failed");
+
+      const count = j.business_day_count || 0;
+      if (count === 0) {
+        dot.classList.remove("ready");
+        label.textContent = "No business days in this date range (weekends only).";
+        return;
+      }
+
+      if (j.ready) {
+        dot.classList.add("ready");
+        label.textContent = `All reports ready (${formatReadinessRangeLabel(
+          j.start_date,
+          j.end_date,
+          count
+        )})`;
+        return;
+      }
+
+      dot.classList.remove("ready");
+      const parts = [];
+      const missing = j.missing || {};
+      if ((missing.postage || []).length) {
+        parts.push(`Postage (${formatMissingDates(missing.postage)})`);
+      }
+      if ((missing.parcel || []).length) {
+        parts.push(`Parcel (${formatMissingDates(missing.parcel)})`);
+      }
+      if ((missing.ws3_presort || []).length) {
+        parts.push(`WS3 presort (${formatMissingDates(missing.ws3_presort)})`);
+      }
+      label.textContent = parts.length
+        ? `Missing: ${parts.join("; ")}`
+        : "Reports incomplete for this date range.";
+    } catch {
+      dot.classList.remove("ready");
+      label.textContent = "Report readiness unavailable";
     }
   }
 
@@ -1072,10 +1431,23 @@
   async function loadProfitParcels() {
     const container = $("parcelProfitBlock");
     if (!container) return;
-    const p = queryParams();
+    if (sortedProfitAccountIds().length > PROFIT_ACCOUNT_IDS_MAX) {
+      container.innerHTML = `<p class='empty-state'>Too many profit accounts (max ${PROFIT_ACCOUNT_IDS_MAX}).</p>`;
+      return;
+    }
+    const p = profitQueryParams();
     const key = p.toString();
     try {
-      const r = await fetch("/api/profit/parcels?" + key);
+      let r;
+      if (profitAccountsUsePost()) {
+        r = await fetch("/api/profit/parcels", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(profitPostJsonBody({})),
+        });
+      } else {
+        r = await fetch("/api/profit/parcels?" + key);
+      }
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(j.error || "Parcel profit failed");
       buildParcelProfitLines(container, j.lines || []);
@@ -1091,6 +1463,17 @@
       parts.push(`<span>Retail rate: ${fmtMoney(meta.retail_rate)}</span>`);
       parts.push(`<span>Flats discount: ${fmtMoney(meta.discount)}</span>`);
       parts.push(`<span>Sell-to rate: ${fmtMoney(meta.sell_to_rate)}</span>`);
+      if (meta.profit_accounts && meta.profit_accounts.length) {
+        parts.push(
+          `<span>Profit accounts: ${meta.profit_accounts.map((x) => fmtId(x)).join(", ")}</span>`
+        );
+      }
+      if (meta.parcel_fee != null && meta.parcel_fee !== "") {
+        parts.push(`<span>Parcel Reseller: ${fmtMoney(meta.parcel_fee)}/pc</span>`);
+      }
+      if (meta.efd_parcel_fee != null && meta.efd_parcel_fee !== "") {
+        parts.push(`<span>Parcel fee to EFD: ${fmtMoney(meta.efd_parcel_fee)}/pc</span>`);
+      }
     }
     if (totals) {
       parts.push(`<span>Run days: ${fmtInt(totals.run_days || 0)}</span>`);
@@ -1213,7 +1596,20 @@
     if (err) err.classList.add("hidden");
     if (spin) spin.classList.remove("hidden");
 
-    const p = queryParams();
+    const idCount = sortedProfitAccountIds().length;
+    if (idCount > PROFIT_ACCOUNT_IDS_MAX) {
+      if (err) {
+        err.textContent = `Too many profit accounts (${idCount}). Maximum is ${PROFIT_ACCOUNT_IDS_MAX}.`;
+        err.classList.remove("hidden");
+      }
+      if (sum) sum.innerHTML = "";
+      if (tblSum) buildProfitRateTypeTable(tblSum, []);
+      if (tblDet) buildProfitDetailTable(tblDet, []);
+      if (spin) spin.classList.add("hidden");
+      return;
+    }
+
+    const p = profitQueryParams();
     p.set("discount", String(parseFlatsDiscount()));
     const key = p.toString();
     try {
@@ -1224,7 +1620,16 @@
         if (tblDet) buildProfitDetailTable(tblDet, j.detail || []);
         return;
       }
-      const r = await fetch("/api/profit/flats?" + key);
+      let r;
+      if (profitAccountsUsePost()) {
+        r = await fetch("/api/profit/flats", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(profitPostJsonBody({ discount: parseFlatsDiscount() })),
+        });
+      } else {
+        r = await fetch("/api/profit/flats?" + key);
+      }
       const j = await r.json().catch(() => ({}));
       if (!r.ok) {
         const msg = j.error || "Profit report failed";
@@ -1449,6 +1854,212 @@
     if (ev.target && ev.target.id === "postageEditOverlay") setPostageEditOpen(false);
   });
 
+  function setParcelEditOpen(open) {
+    const overlay = $("parcelEditOverlay");
+    if (!overlay) return;
+    overlay.classList.toggle("hidden", !open);
+    overlay.setAttribute("aria-hidden", open ? "false" : "true");
+    if (!open) {
+      $("parcelEditPreview")?.classList.add("hidden");
+      if ($("btnApplyParcelEdit")) $("btnApplyParcelEdit").disabled = true;
+      if ($("parcelEditBuckets")) $("parcelEditBuckets").innerHTML = "";
+      if ($("parcelEditContext")) $("parcelEditContext").textContent = "";
+      if ($("parcelEditAccount")) $("parcelEditAccount").value = "";
+      if ($("parcelEditReason")) $("parcelEditReason").value = "";
+    }
+  }
+
+  function selectedParcelRowFromState() {
+    const sel = state.selectedParcel;
+    if (!sel || !state.parcelData) return null;
+    const rows = state.parcelData.rows || [];
+    return rows.find(
+      (r) =>
+        r.date === sel.date &&
+        String(r.child_number) === String(sel.child_number) &&
+        r.mail_class === sel.mail_class &&
+        (r.zone != null ? String(r.zone) : "") === sel.zone
+    );
+  }
+
+  function parcelLbBucketLabel(lbBucket) {
+    const b = Number(lbBucket);
+    if (b === 11) return "10+ lb";
+    if (b >= 1 && b <= 10) return `${b} lb`;
+    return String(lbBucket);
+  }
+
+  function parcelEditContextHtml(row) {
+    const parts = [
+      `<strong>Date:</strong> ${escapeHtml(row.date || "")}`,
+      `<strong>Child:</strong> ${escapeHtml(row.child_name || "")} (${fmtId(row.child_number)})`,
+      `<strong>Class:</strong> ${escapeHtml(row.mail_class || "")}`,
+      `<strong>Zone:</strong> ${escapeHtml(row.zone != null ? String(row.zone) : "")}`,
+      `<strong>Total Qty:</strong> ${fmtInt(Number(row.total_qty) || 0)}`,
+    ];
+    if (!$("hideCosts")?.checked && row.total_retail != null) {
+      parts.push(`<strong>Retail cost:</strong> ${fmtMoney(row.total_retail)}`);
+    }
+    return parts.join(" &nbsp;·&nbsp; ");
+  }
+
+  function renderParcelBucketEditor(rows) {
+    let h =
+      "<table class='data-table'><thead><tr><th>Lb bucket</th><th class='num'>Pieces</th><th class='num'>Billing amount</th></tr></thead><tbody>";
+    if (!rows.length) {
+      h += "<tr><td colspan='3' class='empty-state'>No underlying rows found.</td></tr>";
+    } else {
+      rows.forEach((r) => {
+        const bucket = String(r.lb_bucket);
+        const pieces = Number(r.pieces) || 0;
+        const cost = r.billing_amount_sum != null ? fmtMoney(r.billing_amount_sum) : "\u2014";
+        h += `<tr data-lb-bucket="${escapeHtml(bucket)}">
+          <td>${escapeHtml(parcelLbBucketLabel(bucket))}</td>
+          <td class="num"><input class="edit-piece-input" type="number" min="0" step="1" value="${pieces}" data-lb-bucket="${escapeHtml(
+            bucket
+          )}" /></td>
+          <td class="num">${cost}</td>
+        </tr>`;
+      });
+    }
+    h += "</tbody></table>";
+    return h;
+  }
+
+  async function openParcelEdit() {
+    const row = selectedParcelRowFromState();
+    if (!row) return;
+    if (row.date === "Combined" || $("consolidate")?.checked) {
+      alert('Disable "Consolidate Date & Mailclass" to edit a specific day.');
+      return;
+    }
+    $("parcelEditContext").innerHTML = parcelEditContextHtml(row);
+    setParcelEditOpen(true);
+    $("parcelEditPreview")?.classList.add("hidden");
+    if ($("btnApplyParcelEdit")) $("btnApplyParcelEdit").disabled = true;
+    try {
+      const p = new URLSearchParams();
+      p.set("bill_date", row.date);
+      p.set("account_code", String(row.child_number));
+      p.set("mail_class", String(row.mail_class || ""));
+      p.set("zone", row.zone != null ? String(row.zone) : "");
+      const r = await fetch("/api/parcels/row-details?" + p.toString());
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "Failed to load row details");
+      const details = j.rows || [];
+      $("parcelEditBuckets").innerHTML = renderParcelBucketEditor(details);
+      const acct = $("parcelEditAccount");
+      if (acct) acct.value = String(row.child_number);
+    } catch (e) {
+      alert(String(e.message || e));
+      setParcelEditOpen(false);
+    }
+  }
+
+  function readPiecesByBucketFromEditor() {
+    const out = {};
+    document.querySelectorAll("#parcelEditBuckets input[data-lb-bucket]").forEach((inp) => {
+      const bucket = inp.getAttribute("data-lb-bucket");
+      const v = inp.value;
+      if (!bucket) return;
+      const n = parseInt(String(v || "0"), 10);
+      out[bucket] = Number.isNaN(n) ? 0 : Math.max(0, n);
+    });
+    return out;
+  }
+
+  function renderParcelEditPreview(preview) {
+    const s = preview.summary || {};
+    const from = state.selectedParcel?.child_number;
+    const to = $("parcelEditAccount")?.value?.trim();
+    const mc = state.selectedParcel?.mail_class;
+    const z = state.selectedParcel?.zone;
+    const dt = state.selectedParcel?.date;
+    const msg = `Notice: You are about to reassign ${s.updated || 0} piece(s) for ${dt} (${mc}, zone ${z || ""}) from account ${from} → ${to}. Source billing rows: ${s.source_rows || 0}.`;
+    return escapeHtml(msg);
+  }
+
+  $("btnPreviewParcelEdit")?.addEventListener("click", async () => {
+    const row = selectedParcelRowFromState();
+    if (!row) return;
+    const toRaw = $("parcelEditAccount")?.value?.trim() || "";
+    const to = parseInt(toRaw, 10);
+    if (Number.isNaN(to)) {
+      alert("Enter a valid new account number.");
+      return;
+    }
+    const pieces_by_bucket = readPiecesByBucketFromEditor();
+    const payload = {
+      bill_date: row.date,
+      from_account_code: row.child_number,
+      to_account_code: to,
+      mail_class: row.mail_class,
+      zone: row.zone != null ? String(row.zone) : "",
+      pieces_by_bucket,
+    };
+    try {
+      const r = await fetch("/api/parcels/row-preview-update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "Preview failed");
+      const box = $("parcelEditPreview");
+      if (box) {
+        box.innerHTML = renderParcelEditPreview(j);
+        box.classList.remove("hidden");
+      }
+      if ($("btnApplyParcelEdit")) $("btnApplyParcelEdit").disabled = false;
+    } catch (e) {
+      alert(String(e.message || e));
+    }
+  });
+
+  $("btnApplyParcelEdit")?.addEventListener("click", async () => {
+    const row = selectedParcelRowFromState();
+    if (!row) return;
+    const toRaw = $("parcelEditAccount")?.value?.trim() || "";
+    const to = parseInt(toRaw, 10);
+    if (Number.isNaN(to)) {
+      alert("Enter a valid new account number.");
+      return;
+    }
+    const pieces_by_bucket = readPiecesByBucketFromEditor();
+    const payload = {
+      bill_date: row.date,
+      from_account_code: row.child_number,
+      to_account_code: to,
+      mail_class: row.mail_class,
+      zone: row.zone != null ? String(row.zone) : "",
+      pieces_by_bucket,
+      reason: $("parcelEditReason")?.value || "",
+    };
+    try {
+      const btn = $("btnApplyParcelEdit");
+      if (btn) btn.disabled = true;
+      const r = await fetch("/api/parcels/row-apply-update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "Apply failed");
+      setParcelEditOpen(false);
+      await loadAll();
+      alert(`Update applied. Reassigned: ${j.summary?.updated || 0} piece(s).`);
+    } catch (e) {
+      alert(String(e.message || e));
+      if ($("btnApplyParcelEdit")) $("btnApplyParcelEdit").disabled = false;
+    }
+  });
+
+  $("btnEditParcel")?.addEventListener("click", () => openParcelEdit());
+  $("btnCloseParcelEdit")?.addEventListener("click", () => setParcelEditOpen(false));
+  $("parcelEditOverlay")?.addEventListener("click", (ev) => {
+    if (ev.target && ev.target.id === "parcelEditOverlay") setParcelEditOpen(false);
+  });
+
   function filenameFromContentDisposition(cd) {
     if (!cd) return null;
     const mStar = cd.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
@@ -1466,6 +2077,8 @@
   }
 
   $("btnLoad").addEventListener("click", () => loadAll());
+  $("startDate").addEventListener("change", () => refreshReportReadiness());
+  $("endDate").addEventListener("change", () => refreshReportReadiness());
   function refreshPostageFromDiscount() {
     if (state.postageData) {
       renderPostageAndParcelSummaryBar($("summaryPostage"), state.postageData, state.parcelData);
@@ -1496,11 +2109,28 @@
   }
   $("invoiceDiscount")?.addEventListener("input", refreshPostageFromDiscount);
   $("invoiceDiscount")?.addEventListener("change", refreshPostageFromDiscount);
+  $("allocatePresortRejects")?.addEventListener("change", () => loadAll());
   $("removeZeros")?.addEventListener("change", () => loadAll());
   $("hideCosts")?.addEventListener("change", applyHideCostsToUi);
+  $("hideCustomerNumbers")?.addEventListener("change", applyHideCostsToUi);
   $("btnScan").addEventListener("click", async () => {
     try {
-      await fetch("/api/scan", { method: "POST" });
+      const r = await fetch("/api/scan", { method: "POST" });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.error) {
+        $("errorBanner").textContent = String(j.error || r.statusText || "Scan failed");
+        $("errorBanner").classList.remove("hidden");
+        await refreshWatcher();
+        await refreshReportReadiness();
+        return;
+      }
+      if (j.ok === false && (j.failed || []).length) {
+        const parts = (j.failed || []).map((x) => `${x.file}: ${x.error}`);
+        $("errorBanner").textContent = parts.join("\n");
+        $("errorBanner").classList.remove("hidden");
+      } else {
+        $("errorBanner").classList.add("hidden");
+      }
       await refreshWatcher();
       await loadAll();
     } catch (e) {
@@ -1554,6 +2184,7 @@
       const p = queryParams();
       p.set("sort_key", state.sortPostage.key || "date");
       p.set("sort_dir", String(state.sortPostage.dir || 1));
+      p.set("hide_customer_numbers", $("hideCustomerNumbers")?.checked ? "true" : "false");
       const r = await fetch("/api/export/flats-grid-csv?" + p.toString());
       if (!r.ok) {
         const j = await r.json().catch(() => ({}));
@@ -1581,12 +2212,31 @@
   });
 
   $("btnExportProfitReport")?.addEventListener("click", async () => {
-    const q = queryParams();
+    if (sortedProfitAccountIds().length > PROFIT_ACCOUNT_IDS_MAX) {
+      alert(`Too many profit accounts (max ${PROFIT_ACCOUNT_IDS_MAX}). Remove some before exporting.`);
+      return;
+    }
+    const q = profitQueryParams();
     q.set("discount", String(parseFlatsDiscount()));
+    q.set("discount_efd", String(parseResellerDiscount()));
     const btn = $("btnExportProfitReport");
     setExportLoading(btn, true);
     try {
-      const r = await fetch("/api/export/profit-report-xlsx?" + q.toString());
+      let r;
+      if (profitAccountsUsePost()) {
+        r = await fetch("/api/export/profit-report-xlsx", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(
+            profitPostJsonBody({
+              discount: parseFlatsDiscount(),
+              discount_efd: parseResellerDiscount(),
+            })
+          ),
+        });
+      } else {
+        r = await fetch("/api/export/profit-report-xlsx?" + q.toString());
+      }
       if (!r.ok) {
         const j = await r.json().catch(() => ({}));
         throw new Error(j.error || "Export failed");
@@ -1620,6 +2270,7 @@
   $("btnExportParcelsXlsx").addEventListener("click", async () => {
     const q = queryParams();
     q.set("hide_costs", "false");
+    q.set("hide_customer_numbers", $("hideCustomerNumbers")?.checked ? "true" : "false");
     const btn = $("btnExportParcelsXlsx");
     setExportLoading(btn, true);
     try {
@@ -1672,6 +2323,7 @@
 
   $("btnExportEfdParcelInvoice").addEventListener("click", async () => {
     const q = queryParams();
+    q.set("efd_parcel_fee", String(parseEfdParcelFee()));
     const btn = $("btnExportEfdParcelInvoice");
     setExportLoading(btn, true);
     try {
@@ -1689,6 +2341,130 @@
       a.download = name;
       a.click();
       URL.revokeObjectURL(a.href);
+    } catch (e) {
+      alert(String(e.message || e));
+    } finally {
+      setExportLoading(btn, false);
+    }
+  });
+
+  const EFD_WEEKLY_EXPORT_PARENTS = [null, 3901, 3899, 3900];
+
+  function efdWeeklyExportBaseQuery() {
+    const q = queryParams();
+    q.delete("parent_number");
+    q.delete("customer_number");
+    q.set("discount", String(parseFlatsDiscount()));
+    q.set("efd_parcel_fee", String(parseEfdParcelFee()));
+    return q;
+  }
+
+  async function downloadEfdWeeklyInvoiceExport(queryString, defaultName) {
+    const r = await fetch("/api/export/efd-weekly-invoice-xlsx?" + queryString);
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.error || "Export failed");
+    }
+    const blob = await r.blob();
+    const name =
+      filenameFromContentDisposition(r.headers.get("Content-Disposition") || "") ||
+      defaultName;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  $("btnExportEfdWeeklyInvoice").addEventListener("click", async () => {
+    const btn = $("btnExportEfdWeeklyInvoice");
+    setExportLoading(btn, true);
+    try {
+      const baseQ = efdWeeklyExportBaseQuery();
+      for (let i = 0; i < EFD_WEEKLY_EXPORT_PARENTS.length; i++) {
+        const pn = EFD_WEEKLY_EXPORT_PARENTS[i];
+        const q = new URLSearchParams(baseQ.toString());
+        if (pn != null) q.set("parent_number", String(pn));
+        const defaultName =
+          pn == null ? "efd_weekly_invoice.xlsx" : `efd_weekly_${pn}.xlsx`;
+        await downloadEfdWeeklyInvoiceExport(q.toString(), defaultName);
+        if (i < EFD_WEEKLY_EXPORT_PARENTS.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 400));
+        }
+      }
+    } catch (e) {
+      alert(String(e.message || e));
+    } finally {
+      setExportLoading(btn, false);
+    }
+  });
+
+  const EFD_DAILY_VOLUME_PARENTS = [
+    { parent_number: 3901, label: "BCBS" },
+    { parent_number: 3899, label: "GEHA" },
+    { parent_number: 3900, label: "Zinnia" },
+  ];
+
+  function efdDailyVolumesBaseQuery() {
+    const p = queryParams();
+    p.delete("parent_number");
+    p.delete("customer_number");
+    p.set("hide_customer_numbers", $("hideCustomerNumbers")?.checked ? "true" : "false");
+    if (!state.consolidatedDefaultsTouched.removeZeros) {
+      p.set("remove_zeros", "true");
+    }
+    p.set("parcel_discount", String(parseParcelDiscount()));
+    return p;
+  }
+
+  async function downloadEfdDailyVolumesExport(queryString, defaultName) {
+    const r = await fetch("/api/export/efd-daily-volumes-xlsx?" + queryString);
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.error || "Export failed");
+    }
+    const blob = await r.blob();
+    const name =
+      filenameFromContentDisposition(r.headers.get("Content-Disposition") || "") ||
+      defaultName;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  $("btnExportEfdDailyReport").addEventListener("click", async () => {
+    const btn = $("btnExportEfdDailyReport");
+    setExportLoading(btn, true);
+    const failed = [];
+    let downloaded = 0;
+    try {
+      const baseQ = efdDailyVolumesBaseQuery();
+      for (let i = 0; i < EFD_DAILY_VOLUME_PARENTS.length; i++) {
+        const { parent_number: pn, label } = EFD_DAILY_VOLUME_PARENTS[i];
+        const q = new URLSearchParams(baseQ.toString());
+        q.set("parent_number", String(pn));
+        q.set("account_scope", `${label} (${pn})`);
+        const defaultName = `efd_daily_${label}_${pn}.xlsx`;
+        try {
+          await downloadEfdDailyVolumesExport(q.toString(), defaultName);
+          downloaded += 1;
+          if (downloaded < EFD_DAILY_VOLUME_PARENTS.length) {
+            await new Promise((resolve) => setTimeout(resolve, 400));
+          }
+        } catch (e) {
+          failed.push(label);
+        }
+      }
+      if (failed.length > 0) {
+        const missing = failed.join(", ");
+        const got = EFD_DAILY_VOLUME_PARENTS.length - failed.length;
+        alert(
+          `Not all EFD daily reports were generated (${got} of ${EFD_DAILY_VOLUME_PARENTS.length}). ` +
+            `No data available for: ${missing}.`
+        );
+      }
     } catch (e) {
       alert(String(e.message || e));
     } finally {
@@ -1771,11 +2547,51 @@
   let searchDebounce;
   $("searchCustomer").addEventListener("input", () => {
     clearTimeout(searchDebounce);
-    searchDebounce = setTimeout(() => populateAccountSelect($("searchCustomer").value), 150);
+    searchDebounce = setTimeout(() => {
+      const v = $("searchCustomer").value;
+      populateAccountSelect(v);
+      populateProfitAccountPick(v);
+    }, 150);
   });
   $("searchCustomer").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") loadAll();
   });
+
+  $("profitAccountPick")?.addEventListener("change", () => {
+    const sel = $("profitAccountPick");
+    if (!sel || !sel.value) return;
+    const opt = sel.selectedOptions[0];
+    const n = parseInt(sel.value, 10);
+    const kind = opt?.getAttribute("data-kind") || "";
+    if (Number.isNaN(n)) return;
+    const row = accountRowByCustomerNumber(n, kind);
+    mergeProfitAccountIds(
+      profitAccountIdsForRow(row || { customer_number: n, kind: kind || "standalone" })
+    );
+    sel.value = "";
+  });
+
+  $("btnProfitUseToolbar")?.addEventListener("click", () => {
+    const acc = $("selectAccount");
+    const opt = acc?.selectedOptions[0];
+    if (!opt || !opt.value) return;
+    const n = parseInt(opt.value, 10);
+    const kind = opt.getAttribute("data-kind") || "";
+    if (Number.isNaN(n)) return;
+    const row = accountRowByCustomerNumber(n, kind);
+    mergeProfitAccountIds(
+      profitAccountIdsForRow(row || { customer_number: n, kind: kind || "standalone" })
+    );
+  });
+
+  $("btnProfitClearAccounts")?.addEventListener("click", () => {
+    state.profitAccountIds = [];
+    renderProfitAccountChips();
+    onProfitScopeChanged();
+  });
+
+  $("parcelFee")?.addEventListener("change", () => onProfitScopeChanged());
+  $("efdParcelFee")?.addEventListener("change", () => onProfitScopeChanged());
 
   $("btnRunSummary").addEventListener("click", () => runSummary());
   $("sumCustUnmatchedOnly").addEventListener("change", () => refreshSummaryCustomerViews());
@@ -1796,7 +2612,7 @@
   if ($("summaryProfitFlats")) $("summaryProfitFlats").textContent = "";
   if ($("tableProfitFlatsRateType"))
     $("tableProfitFlatsRateType").innerHTML =
-      "<p class='empty-state'>Select <strong>Profit Report (Flats)</strong> tab to load.</p>";
+      "<p class='empty-state'>Select the <strong>Profit Report</strong> tab to load.</p>";
   if ($("tableProfitFlatsDetail")) $("tableProfitFlatsDetail").innerHTML = "";
   if ($("parcelProfitBlock")) $("parcelProfitBlock").innerHTML = "";
   $("spinPostage").classList.add("hidden");
@@ -1811,4 +2627,5 @@
 
   setInterval(refreshWatcher, 30000);
   refreshWatcher();
+  refreshReportReadiness();
 })();

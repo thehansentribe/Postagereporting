@@ -14,19 +14,58 @@ def _seed_retail_matrix_rates(
     *,
     table: str,
     rows: list[tuple[int, int, float]],
+    effective_date: str | None = "2000-01-01",
 ) -> None:
     """
     Insert minimal retail matrix rows for tests.
 
     Each row is (zone, lb, price) and is stored as row_type='matrix', weight_unit='lb', weight_max=<lb>.
+    ``effective_date`` is set for Priority Mail versioned lookups (default is on or before typical test dates).
     """
     conn.executemany(
         f"""
-        INSERT INTO {table} (row_type, zone, weight_unit, weight_max, price)
-        VALUES ('matrix', ?, 'lb', ?, ?)
+        INSERT INTO {table} (effective_date, row_type, zone, weight_unit, weight_max, price)
+        VALUES (?, 'matrix', ?, 'lb', ?, ?)
         """,
-        [(int(z), float(lb), float(price)) for (z, lb, price) in rows],
+        [
+            (effective_date, int(z), float(lb), float(price))
+            for (z, lb, price) in rows
+        ],
     )
+
+
+def test_get_priority_mail_retail_rates_tariff_as_of_effective_dates(monkeypatch):
+    """Latest matrix row wins per zone×lb when effective_date ≤ as_of."""
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "pm_tariff.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", p)
+        dbmod.init_db()
+        conn = dbmod.get_connection()
+        try:
+            conn.executemany(
+                """
+                INSERT INTO priority_mail_retail (
+                    effective_date, row_type, zone, weight_unit, weight_max, price,
+                    sort_group, sort_order
+                ) VALUES (?, 'matrix', ?, 'lb', ?, ?, 1, ?)
+                """,
+                [
+                    ("2020-01-01", 2, 1.0, 10.0, 0),
+                    ("2026-04-27", 2, 1.0, 20.0, 1),
+                ],
+            )
+            conn.commit()
+            assert dbmod.get_priority_mail_retail_rates(conn, as_of_date="2026-04-01")[0][
+                (2, 1)
+            ] == 10.0
+            assert dbmod.get_priority_mail_retail_rates(conn, as_of_date="2026-04-27")[0][
+                (2, 1)
+            ] == 20.0
+            assert dbmod.get_priority_mail_retail_rates(conn, as_of_date="2027-01-01")[0][
+                (2, 1)
+            ] == 20.0
+        finally:
+            conn.close()
 
 
 def test_init_and_summary_empty(monkeypatch):
@@ -846,6 +885,117 @@ def test_postage_row_edit_preview_and_apply_merge(monkeypatch):
             conn.close()
 
 
+def test_billing_row_edit_preview_and_apply_partial_buckets(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "billing_edit.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", p)
+        dbmod.init_db()
+        conn = dbmod.get_connection()
+        try:
+            conn.executemany(
+                """
+                INSERT INTO customers (customer_number, customer_name, parent_number, parent_name)
+                VALUES (?, ?, NULL, NULL)
+                """,
+                [(100, "FromAcct"), (200, "ToAcct")],
+            )
+            conn.execute(
+                "INSERT INTO billing_imports (billing_id, file_name, row_count) VALUES ('b1', 'b.csv', 5)"
+            )
+            # 3 pieces at 1 lb (16 oz), 2 pieces at 2 lb (20 oz) — same day/account/class/zone.
+            conn.executemany(
+                """
+                INSERT INTO billing_records (
+                    billing_import_id, custom_account_code, time_stamp,
+                    weight_oz, usps_mail_class, billing_amount, zone
+                ) VALUES (1, 100, '2/10/2026 10:00', ?, 'Priority', 5.0, '3')
+                """,
+                [(16.0,), (16.0,), (16.0,), (20.0,), (20.0,)],
+            )
+            conn.commit()
+
+            details = dbmod.get_billing_row_details(
+                conn,
+                bill_date="2026-02-10",
+                account_code=100,
+                mail_class="Priority",
+                zone="3",
+            )
+            assert len(details) == 2
+            by_lb = {int(d["lb_bucket"]): int(d["pieces"]) for d in details}
+            assert by_lb[1] == 3
+            assert by_lb[2] == 2
+
+            pieces_by_bucket = {"1": 2, "2": 2}
+
+            prev = dbmod.preview_billing_row_update(
+                conn,
+                bill_date="2026-02-10",
+                from_account_code=100,
+                mail_class="Priority",
+                zone="3",
+                to_account_code=200,
+                pieces_by_bucket=pieces_by_bucket,
+            )
+            assert prev["ok"] is True
+            assert prev["summary"]["source_rows"] == 5
+            assert prev["summary"]["updated"] == 4
+
+            with conn:
+                out = dbmod.apply_billing_row_update(
+                    conn,
+                    bill_date="2026-02-10",
+                    from_account_code=100,
+                    mail_class="Priority",
+                    zone="3",
+                    to_account_code=200,
+                    pieces_by_bucket=pieces_by_bucket,
+                    reason="Wrong account on parcel billing",
+                )
+            assert out["ok"] is True
+            assert out["summary"]["updated"] == 4
+
+            on_200 = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM billing_records
+                WHERE custom_account_code = 200 AND usps_mail_class = 'Priority'
+                """
+            ).fetchone()
+            assert int(on_200["n"]) == 4
+
+            on_100 = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM billing_records
+                WHERE custom_account_code = 100 AND usps_mail_class = 'Priority'
+                """
+            ).fetchone()
+            assert int(on_100["n"]) == 1
+
+            edits = conn.execute("SELECT * FROM billing_edits").fetchall()
+            assert len(edits) == 1
+            assert edits[0]["from_account_code"] == 100
+            assert edits[0]["to_account_code"] == 200
+            assert edits[0]["mail_class"] == "Priority"
+            assert edits[0]["zone"] == "3"
+            assert edits[0]["reason"] == "Wrong account on parcel billing"
+            assert int(edits[0]["updated_rows"]) == 4
+
+            lines = conn.execute(
+                "SELECT lb_bucket, old_account_code, new_account_code FROM billing_edit_lines ORDER BY id"
+            ).fetchall()
+            assert len(lines) == 4
+            assert all(ln["old_account_code"] == 100 for ln in lines)
+            assert all(ln["new_account_code"] == 200 for ln in lines)
+            lb_counts = {}
+            for ln in lines:
+                lb = int(ln["lb_bucket"])
+                lb_counts[lb] = lb_counts.get(lb, 0) + 1
+            assert lb_counts[1] == 2
+            assert lb_counts[2] == 2
+        finally:
+            conn.close()
+
+
 def test_query_parcel_over_10lb_lines_filters_and_base(monkeypatch):
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "o10lb.db"
@@ -1459,6 +1609,106 @@ def test_query_postage_reject_flats_use_retail_efd_class_uses_imported_cost(monk
     assert post["total_retail_cost"] == pytest.approx(5 * r2 + 5 * r2 + 2 * r2, rel=1e-9)
 
 
+def test_query_postage_allocate_presort_rejects_by_day(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "alloc.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", p)
+        dbmod.init_db()
+        conn = dbmod.get_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO customers (customer_number, customer_name, parent_number, parent_name)
+                VALUES (100, 'Parent', NULL, NULL),
+                       (101, 'Child A', 100, 'Parent'),
+                       (102, 'Child B', 100, 'Parent')
+                """
+            )
+            conn.execute(
+                "INSERT INTO postage_imports (file_name, file_date, row_count) VALUES ('p.csv', '2026-04-01', 4)"
+            )
+            # Child A: 100 @ 5oz, 200 @ 6oz
+            conn.executemany(
+                """
+                INSERT INTO postage_data (
+                    import_id, file_date, account_code, mail_class,
+                    weight_oz, pieces, total_cost, unmatched_account
+                ) VALUES (1, '2026-04-01', ?, '1CA5DFlt', ?, ?, 0.0, 0)
+                """,
+                [
+                    (101, 5.0, 100),
+                    (101, 6.0, 200),
+                ],
+            )
+            # Child B: 100 @ 6oz
+            conn.execute(
+                """
+                INSERT INTO postage_data (
+                    import_id, file_date, account_code, mail_class,
+                    weight_oz, pieces, total_cost, unmatched_account
+                ) VALUES (1, '2026-04-01', 102, '1CA5DFlt', 6.0, 100, 0.0, 0)
+                """
+            )
+            # 4 presort rejects for the parent on that day
+            conn.execute(
+                """
+                INSERT INTO ws3_parent_daily_rejects (mail_date, parent_customer_number, reject_count)
+                VALUES ('2026-04-01', 100, 4)
+                """
+            )
+            conn.commit()
+
+            base = dbmod.query_postage(
+                conn,
+                "2026-04-01",
+                "2026-04-01",
+                100,
+                None,
+                True,
+                True,
+                False,
+                False,
+                True,
+            )
+            assert any(r.get("mail_class") == "Presort rejects" for r in base["rows"])
+
+            alloc = dbmod.query_postage(
+                conn,
+                "2026-04-01",
+                "2026-04-01",
+                100,
+                None,
+                True,
+                True,
+                False,
+                False,
+                True,
+                allocate_presort_rejects=True,
+            )
+        finally:
+            conn.close()
+
+    rows = alloc["rows"]
+    assert not any(r.get("mail_class") == "Presort rejects" for r in rows)
+    by_key = {(r["child_number"], r["mail_class"]): r for r in rows}
+
+    # Allocation is proportional across all `1CA5DFlt` cells for the day:
+    # Total weights: ChildA 5oz=100, ChildA 6oz=200, ChildB 6oz=100 => 400 total.
+    # Rejects=4 => exact allocation: ChildA 5oz=1, ChildA 6oz=2, ChildB 6oz=1.
+    a_efd = by_key[(101, "1CA5DFlt")]
+    b_efd = by_key[(102, "1CA5DFlt")]
+    a_rej = by_key[(101, "Rejects")]
+    b_rej = by_key[(102, "Rejects")]
+
+    assert int(a_rej["oz_5"]) == 1
+    assert int(a_rej["oz_6"]) == 2
+    assert int(a_rej["total_qty"]) == 3
+    assert int(b_rej["oz_6"]) == 1
+    assert int(b_rej["total_qty"]) == 1
+    assert int(a_efd["oz_5"]) + int(a_efd["oz_6"]) == int(a_efd["total_qty"]) == 297
+    assert int(b_efd["oz_6"]) == int(b_efd["total_qty"]) == 99
+
+
 def test_postage_invoice_efd_1ca5dflt_in_i_reject_flats_in_k_and_cost_center(monkeypatch):
     """Column I = max(0, EFD − WS3); K = IMB + WS3; J = G; N = I×(G−H); CC savings = (C−D)×($G$14−$H$14)."""
     with tempfile.TemporaryDirectory() as td:
@@ -1536,7 +1786,7 @@ def test_postage_invoice_efd_1ca5dflt_in_i_reject_flats_in_k_and_cost_center(mon
 
 
 def test_postage_invoice_ws3_distributed_per_oz_and_cost_centers(monkeypatch):
-    """WS3 rejects split by joint flat volume; J = G; N = I×(G−H); CC savings use (C−D)×($G$14−$H$14)."""
+    """WS3 rejects allocated by-day across 1CA5DFlt; J = G; N = I×(G−H); CC savings use (C−D)×($G$14−$H$14)."""
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "ws3_inv.db"
         monkeypatch.setattr(dbmod, "DB_PATH", p)
@@ -1573,7 +1823,7 @@ def test_postage_invoice_ws3_distributed_per_oz_and_cost_centers(monkeypatch):
             conn.execute(
                 """
                 INSERT INTO ws3_parent_daily_rejects (mail_date, parent_customer_number, reject_count)
-                VALUES ('2026-09-10', 600, 50)
+                VALUES ('2026-09-01', 600, 50)
                 """
             )
             conn.commit()
@@ -1619,14 +1869,13 @@ def test_postage_invoice_ws3_distributed_per_oz_and_cost_centers(monkeypatch):
             assert int(ws.cell(row_601, 3).value) == 10
             assert int(ws.cell(row_602, 3).value) == 90
             efd_rate = round(max(0.0, retail_2 - 0.1), 4)
-            raw_601 = retail_2 * 15.0
-            raw_602 = efd_rate * 45.0 + retail_2 * 45.0
-            l_parent = efd_rate * 40.0 + retail_2 * 60.0
-            scale = l_parent / (raw_601 + raw_602)
-            expect_601 = round(raw_601 * scale, 2)
-            expect_602 = round(raw_602 * scale, 2)
-            assert int(ws.cell(row_601, 4).value) == 15
-            assert int(ws.cell(row_602, 4).value) == 45
+            # Dept 601 has only non-EFD flats: all 10 pieces stay as IMB rejects; WS3 allocates only to 1CA5DFlt.
+            raw_601 = retail_2 * 10.0
+            raw_602 = efd_rate * 40.0 + retail_2 * 50.0
+            expect_601 = round(raw_601, 2)
+            expect_602 = round(raw_602, 2)
+            assert int(ws.cell(row_601, 4).value) == 10
+            assert int(ws.cell(row_602, 4).value) == 50
             assert float(ws.cell(row_601, 5).value) == pytest.approx(expect_601, rel=1e-9)
             assert float(ws.cell(row_602, 5).value) == pytest.approx(expect_602, rel=1e-9)
             f601 = f"=(C{row_601}-D{row_601})*($G$14-$H$14)"
@@ -1659,13 +1908,21 @@ def test_postage_invoice_postage_derived_presort_rejects_allocated_into_weight_g
             conn.execute(
                 "INSERT INTO postage_imports (file_name, file_date, row_count) VALUES ('p.csv', '2026-10-01', 1)"
             )
-            # Only 2oz flats volume so all allocated rejects should land on the 2oz row.
+            # Only 2oz EFD flats volume so all allocated rejects should land on the 2oz row.
             conn.execute(
                 """
                 INSERT INTO postage_data (
                     import_id, file_date, account_code, mail_class,
                     weight_oz, pieces, total_cost, unmatched_account
                 ) VALUES (1, '2026-10-01', 701, '1ClFlat', 2.0, 100, 190.0, 0)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO postage_data (
+                    import_id, file_date, account_code, mail_class,
+                    weight_oz, pieces, total_cost, unmatched_account
+                ) VALUES (1, '2026-10-01', 701, '1CA5DFlt', 2.0, 100, 0.0, 0)
                 """
             )
             # Postage-derived presort rejects (no WS3 rows).
@@ -1708,3 +1965,71 @@ def test_postage_invoice_postage_derived_presort_rejects_allocated_into_weight_g
             assert int(ws.cell(row_701, 4).value) == 112
         finally:
             out.unlink(missing_ok=True)
+
+
+def test_postage_invoice_remove_zeros_filters_cost_centers(monkeypatch):
+    """remove_zeros=True omits all-zero cost center rows; False keeps every child."""
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "cc_remove_zeros.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", p)
+        dbmod.init_db()
+        conn = dbmod.get_connection()
+        try:
+            dbmod.upsert_flat_retail_rates(conn, dbmod.DEFAULT_FLATS_RETAIL_RATES)
+            conn.executemany(
+                """
+                INSERT INTO customers (customer_number, customer_name, parent_number, parent_name)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (800, "Parent Eight", None, None),
+                    (801, "Child Active", 800, "Parent Eight"),
+                    (802, "Child Empty", 800, "Parent Eight"),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO postage_imports (file_name, file_date, row_count) VALUES ('p.csv', '2026-11-01', 1)"
+            )
+            conn.execute(
+                """
+                INSERT INTO postage_data (
+                    import_id, file_date, account_code, mail_class,
+                    weight_oz, pieces, total_cost, unmatched_account
+                ) VALUES (1, '2026-11-01', 801, '1CA5DFlt', 2.0, 5, 8.50, 0)
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        def cost_center_numbers(remove_zeros: bool) -> set[int]:
+            out = exports_mod.export_postage_invoice(
+                parent_number=800,
+                start_date="2026-11-01",
+                end_date="2026-11-30",
+                discount=0.1,
+                customer_number=None,
+                show_parents=True,
+                show_main=True,
+                remove_zeros=remove_zeros,
+            )
+            try:
+                from openpyxl import load_workbook
+
+                wb = load_workbook(out)
+                ws = wb.active
+                found: set[int] = set()
+                for r in range(34, 80):
+                    v = ws.cell(r, 1).value
+                    if v in (None, "Totals", "—"):
+                        continue
+                    try:
+                        found.add(int(v))
+                    except (TypeError, ValueError):
+                        pass
+                return found
+            finally:
+                out.unlink(missing_ok=True)
+
+        assert cost_center_numbers(remove_zeros=True) == {801}
+        assert cost_center_numbers(remove_zeros=False) == {800, 801, 802}

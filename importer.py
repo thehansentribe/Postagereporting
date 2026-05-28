@@ -309,6 +309,18 @@ def import_bm_csv(
     conn.execute("PRAGMA foreign_keys = ON")
     cur = conn.cursor()
 
+    conflict = cur.execute(
+        "SELECT file_name FROM postage_imports WHERE file_date = ? AND file_name != ?",
+        (file_date, file_name),
+    ).fetchone()
+    if conflict:
+        other = conflict[0]
+        conn.close()
+        raise ValueError(
+            f"Postage for {file_date} is already imported from {other}. "
+            f"Delete that import from the database or remove the conflicting file before importing {file_name}."
+        )
+
     existing = cur.execute(
         "SELECT id FROM postage_imports WHERE file_name = ?", (file_name,)
     ).fetchone()
@@ -670,6 +682,112 @@ def import_customers_csv(csv_path: str, db_path: Path | str) -> dict[str, Any]:
     return {"rows_imported": count, "warnings": warnings}
 
 
+def _raw_export_normalize_lookup_key(name: str) -> str:
+    """Normalize customer display name for Parent Company → column A VLOOKUP-style match."""
+    return " ".join(name.split()).strip().casefold()
+
+
+def import_customers_raw_export_xlsx(xlsx_path: str, db_path: Path | str) -> dict[str, Any]:
+    """
+    WS3 Raw Export workbook: column A = Customer, B = Code, N = Parent Company.
+    Resolves parent_number by exact name lookup in column A → code in B (Excel VLOOKUP semantics: first match wins).
+    """
+    warnings: list[str] = []
+    _WARN_CAP = 50
+
+    def _finalize_warnings(ws: list[str]) -> list[str]:
+        if len(ws) <= _WARN_CAP:
+            return ws
+        return ws[:_WARN_CAP] + [f"... and {len(ws) - _WARN_CAP} more warnings"]
+
+    wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+        data_rows: list[tuple[Any, ...]] = [tuple(r) for r in ws.iter_rows(values_only=True)]
+    finally:
+        wb.close()
+
+    if not data_rows:
+        return {"rows_imported": 0, "warnings": []}
+
+    def _cell_str(v: Any) -> str:
+        if v is None:
+            return ""
+        return str(v).strip()
+
+    def _abn_padded(row: tuple[Any, ...]) -> tuple[Any, Any, Any]:
+        need = 14
+        if len(row) < need:
+            row = tuple(list(row) + [None] * (need - len(row)))
+        return row[0], row[1], row[13]
+
+    start = 0
+    hdr_a, hdr_b, _ = _abn_padded(data_rows[0])
+    if _cell_str(hdr_a).casefold() == "customer" and _cell_str(hdr_b).casefold() == "code":
+        start = 1
+
+    name_to_code: dict[str, int] = {}
+    for row in data_rows[start:]:
+        a, b, _n = _abn_padded(row)
+        code = strip_zeros(b)
+        name = _cell_str(a)
+        if code is None or not name:
+            continue
+        k = _raw_export_normalize_lookup_key(name)
+        if not k:
+            continue
+        if k not in name_to_code:
+            name_to_code[k] = code
+        elif name_to_code[k] != code:
+            warnings.append(
+                f"Duplicate customer name in column A (keeping first code {name_to_code[k]}): "
+                f"{name!r} also has code {code}"
+            )
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys = OFF")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM customers")
+
+    count = 0
+    for row in data_rows[start:]:
+        a, b, n_col = _abn_padded(row)
+        code = strip_zeros(b)
+        if code is None:
+            continue
+        cust_name = _cell_str(a)
+        display_name = cust_name or f"Account {code}"
+
+        parent_raw = _cell_str(n_col)
+        if not parent_raw:
+            pnum, pname = None, None
+        else:
+            pk = _raw_export_normalize_lookup_key(parent_raw)
+            pnum = name_to_code.get(pk)
+            if pnum is not None:
+                pname = parent_raw
+            else:
+                warnings.append(
+                    f"Parent Company unknown in column A (no matching name) for customer {code}: {parent_raw!r}"
+                )
+                pname, pnum = parent_raw, None
+
+        cur.execute(
+            """
+            INSERT INTO customers (customer_number, customer_name, parent_number, parent_name)
+            VALUES (?, ?, ?, ?)
+            """,
+            (code, display_name, pnum, pname),
+        )
+        count += 1
+
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.close()
+
+    return {"rows_imported": count, "warnings": _finalize_warnings(warnings)}
+
+
 def import_flat_rate_costs(csv_path: str, db_path: Path | str) -> dict[str, Any]:
     def parse_rate(val: Any) -> float | None:
         try:
@@ -739,6 +857,25 @@ def _parse_effective_date_any(cell: Any) -> str | None:
     return None
 
 
+def parse_priority_mail_filename_effective_date(file_name: str) -> str | None:
+    """Parse M-D-YY or M-D-YYYY from basename (e.g. 'Priority mail zones 4-27-26')."""
+    stem = Path(file_name).stem
+    m = re.search(r"\b(\d{1,2})-(\d{1,2})-(\d{2,4})\b", stem)
+    if not m:
+        return None
+    month, day, y_raw = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    if y_raw < 100:
+        year = 2000 + y_raw if y_raw < 70 else 1900 + y_raw
+    else:
+        year = y_raw
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
 def _cell_money_float(val: Any) -> float | None:
     if val is None:
         return None
@@ -768,30 +905,80 @@ def _normalize_row_cells(row: list[Any]) -> list[str]:
     return [str(c).strip() if c is not None else "" for c in row]
 
 
+def _header_first_nine_cells_are_usps_zones_1_through_9(header: list[str]) -> bool:
+    """True when A1–I1 hold the digits 1–9 in some order (zone labels only)."""
+    if len(header) < 9:
+        return False
+    zones: list[int] = []
+    for i in range(9):
+        zf = _cell_float(header[i])
+        if zf is None:
+            return False
+        zi = int(round(zf))
+        if abs(zf - zi) > 1e-6:
+            return False
+        if not (1 <= zi <= 9):
+            return False
+        zones.append(zi)
+    return sorted(zones) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+
+def _compact_matrix_zone_cols_from_header_row(header: list[str]) -> list[tuple[int, int]] | None:
+    """
+    Map column index -> USPS zone for compact zone matrix xlsx.
+    Layout A: Row 1 col A texts like '(lbs.)', cols B+ are zone labels; data column A is weight lb.
+    Layout B: Row 1 cols A-I are zones 1–9; data column A is weight lb and cols B+ are zone prices aligned
+             so zone for header[col-1] is read from data[col].
+
+    Each tuple is (zone_number, price_column_index).
+    Returns None when the sheet does not match either layout.
+    """
+    if not header:
+        return None
+    if "lb" in header[0].lower():
+        zone_cols: list[tuple[int, int]] = []
+        for idx in range(1, min(len(header), 12)):
+            zf = _cell_float(header[idx])
+            if zf is None:
+                continue
+            zi = int(zf)
+            if 1 <= zi <= 9:
+                zone_cols.append((zi, idx))
+        if len(zone_cols) < 9:
+            return None
+        return zone_cols
+    if not _header_first_nine_cells_are_usps_zones_1_through_9(header):
+        return None
+    out: list[tuple[int, int]] = []
+    for j in range(1, 10):
+        zf = _cell_float(header[j - 1])
+        if zf is None:
+            return None
+        zi = int(round(zf))
+        if not (1 <= zi <= 9):
+            return None
+        out.append((zi, j))
+    return out
+
+
 def _parse_compact_priority_mail_zone_matrix_xlsx(
     raw_rows: list[list[Any]],
     file_name: str,
     *,
-    effective_date: str | None,
+    effective_date: str | None = None,
 ) -> list[dict[str, Any]] | None:
     """
-    Sheet with row 0 like '(lbs.)', 1, 2, ... 9 and data rows: weight, z1..z9 prices.
-    Returns matrix rows only, or None if the layout does not match.
+    Compact zone-price matrix .xlsx: data rows weight (lb) in column A.
+
+    Supported row-0 layouts:
+    - '(lbs.)' or similar in A1 with zone digits 1–9 in adjacent columns (original path).
+    - Zones 1–9 (each once) across A–I; prices for zone header[j−1] are in column j (user template).
     """
     if len(raw_rows) < 2:
         return None
     header = _normalize_row_cells(raw_rows[0])
-    if not header or "lb" not in header[0].lower():
-        return None
-    zone_cols: list[tuple[int, int]] = []
-    for idx in range(1, min(len(header), 12)):
-        zf = _cell_float(header[idx])
-        if zf is None:
-            continue
-        zi = int(zf)
-        if 1 <= zi <= 9:
-            zone_cols.append((zi, idx))
-    if len(zone_cols) < 9:
+    zone_cols = _compact_matrix_zone_cols_from_header_row(header)
+    if zone_cols is None:
         return None
 
     out_rows: list[dict[str, Any]] = []
@@ -957,7 +1144,11 @@ def _parse_priority_mail_retail_rows(
     return out_rows, effective_date
 
 
-def _priority_mail_retail_rows_from_file(source_path: str) -> tuple[list[dict[str, Any]], str | None]:
+def _priority_mail_retail_rows_from_file(
+    source_path: str,
+    *,
+    effective_date: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
     """Load raw grid from CSV or XLSX and parse into priority_mail_retail row dicts."""
     file_name = os.path.basename(source_path)
     suffix = Path(source_path).suffix.lower()
@@ -968,33 +1159,73 @@ def _priority_mail_retail_rows_from_file(source_path: str) -> tuple[list[dict[st
             raw_rows = [list(row) for row in ws.iter_rows(values_only=True)]
         finally:
             wb.close()
-        eff_compact: str | None = date.today().isoformat()
         compact = _parse_compact_priority_mail_zone_matrix_xlsx(
-            raw_rows, file_name, effective_date=eff_compact
+            raw_rows,
+            file_name,
+            effective_date=effective_date,
         )
         if compact is not None:
+            eff_compact = effective_date or parse_priority_mail_filename_effective_date(file_name)
+            if eff_compact is None:
+                raise ValueError(
+                    "Compact Priority zone .xlsx requires an effective_date (System tab upload) "
+                    "or a parseable date in the filename (e.g. zones-4-27-26)."
+                )
+            for r in compact:
+                r["effective_date"] = eff_compact
             return compact, eff_compact
-        out_rows, effective_date = _parse_priority_mail_retail_rows(raw_rows, file_name)
-        return out_rows, effective_date
+        out_rows, eff_parse = _parse_priority_mail_retail_rows(raw_rows, file_name)
+        final_eff = effective_date or eff_parse
+        if effective_date:
+            for r in out_rows:
+                r["effective_date"] = effective_date
+            final_eff = effective_date
+        return out_rows, final_eff
     with open(source_path, encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
         raw_rows = [r for r in reader]
-    return _parse_priority_mail_retail_rows(raw_rows, file_name)
+    out_rows, eff_parse = _parse_priority_mail_retail_rows(raw_rows, file_name)
+    final_eff = effective_date or eff_parse
+    if effective_date:
+        for r in out_rows:
+            r["effective_date"] = effective_date
+        final_eff = effective_date
+    return out_rows, final_eff
 
 
-def import_priority_mail_retail(source_path: str, db_path: Path | str) -> dict[str, Any]:
+def import_priority_mail_retail(
+    source_path: str,
+    db_path: Path | str,
+    *,
+    effective_date: str | None = None,
+) -> dict[str, Any]:
     """
     Import Priority Mail Retail rates (matrix by Zone x Weight(Lbs) + flat-rate items + fees).
-    Accepts `.csv` (USPS export layout) or `.xlsx` (compact zone matrix: row 0 = lbs + zones 1–9).
-    Full-replaces `priority_mail_retail`.
+    Accepts `.csv` (USPS export layout) or `.xlsx` (compact zone matrix: row 0 = lbs + zones 1–9,
+    or zones 1–9 only across columns A–I with weights in column A).
+
+    Rows are tagged with ``effective_date``; re-importing the same date replaces only that revision.
+    When ``effective_date`` is omitted, uses the date parsed from a USPS CSV header and/or filename
+    (compact .xlsx must supply an explicit date or have one in the filename).
     """
     file_name = os.path.basename(source_path)
-    out_rows, effective_date = _priority_mail_retail_rows_from_file(source_path)
+    out_rows, effective_used = _priority_mail_retail_rows_from_file(
+        source_path,
+        effective_date=effective_date,
+    )
+    if effective_used is None:
+        raise ValueError(
+            "Could not determine effective_date for Priority Mail retail import "
+            "(set it on upload or include a dated USPS CSV header)."
+        )
 
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA foreign_keys = ON")
     cur = conn.cursor()
-    cur.execute("DELETE FROM priority_mail_retail")
+    cur.execute(
+        "DELETE FROM priority_mail_retail WHERE effective_date IS ?",
+        (effective_used,),
+    )
     cur.executemany(
         """
         INSERT INTO priority_mail_retail (
@@ -1020,11 +1251,22 @@ def import_priority_mail_retail(source_path: str, db_path: Path | str) -> dict[s
     )
     conn.commit()
     conn.close()
-    return {
+    result: dict[str, Any] = {
         "rows_imported": len(out_rows),
-        "effective_date": effective_date,
+        "effective_date": effective_used,
         "file_name": file_name,
     }
+    suffix = Path(source_path).suffix.lower()
+    if suffix == ".xlsx":
+        n_matrix = sum(1 for r in out_rows if r.get("row_type") == "matrix")
+        # Each intact weight band should produce one cell per USPS zone (9); otherwise the grid is likely misread.
+        if n_matrix % 9 != 0:
+            result["warnings"] = [
+                f"Priority Mail zone matrix imported {n_matrix} cells ({n_matrix} is not divisible by "
+                "9 zones). Rows may not match zones 1–9 across columns. Check row 1 headers and "
+                "that column A is weight (lb)."
+            ]
+    return result
 
 
 def import_ground_advantage_retail(csv_path: str, db_path: Path | str) -> dict[str, Any]:

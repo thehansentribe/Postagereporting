@@ -46,6 +46,48 @@
     </section>
 
     <section class="panel">
+      <h2 class="system-section-title">Priority Mail parcel retail (zones)</h2>
+      <p class="system-hint">
+        Upload the compact USPS-style zone × weight workbook (zones across the top, pounds down the side).
+        Choose the <strong>effective date</strong> for this tariff (inclusive): billing is priced using the latest
+        upload on or before each piece date until you publish a newer one.
+      </p>
+      <div class="system-actions system-inline-fields">
+        <label class="field">
+          <span class="field-label">Effective date</span>
+          <input type="date" id="priorityMailEffectiveDate" />
+        </label>
+        <label class="field">
+          <span class="field-label">Zone matrix (.xlsx)</span>
+          <input type="file" id="priorityMailFile" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+        </label>
+        <button type="button" class="btn btn-primary" id="btnUploadPriorityMail">Upload tariff</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Import customers (Raw Export)</h2>
+      <p class="system-hint">
+        WS3 Raw Export workbook: column A = Customer, B = Code, N = Parent Company. Parent account numbers
+        are resolved by matching Parent Company text to column A (same as a VLOOKUP to Code). Replaces all
+        rows in <code>customers</code>.
+      </p>
+      <div class="system-actions system-inline-fields">
+        <label class="field">
+          <span class="field-label">Raw Export (.xlsx)</span>
+          <input
+            type="file"
+            id="rawExportCustomersFile"
+            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+          />
+        </label>
+        <button type="button" class="btn btn-primary" id="btnImportRawExportCustomers">
+          Import customers (Raw Export)
+        </button>
+      </div>
+    </section>
+
+    <section class="panel">
       <h2 class="system-section-title">WS3 profile → parent account</h2>
       <p class="system-hint">
         Map each NetSort profile to a rollup account (parent company or main account) and set an optional
@@ -53,6 +95,10 @@
         Import WS3 Customer Mail Detail files via <code>input/</code> first; then configure here.
       </p>
       <div class="table-wrap">
+        <p class="system-hint" id="ws3ProfilesLoadWrap">
+          <button type="button" class="btn btn-run" id="btnLoadWs3Profiles">Load WS3 assignments</button>
+          <span id="ws3ProfilesLoadHint"> (large customer lists load on demand.)</span>
+        </p>
         <div class="table-scroll">
           <div id="ws3ProfilesTable"></div>
         </div>
@@ -66,12 +112,19 @@
         Use this table to give the number a name and optionally associate it to a parent account.
       </p>
       <div class="table-wrap">
+        <p class="system-hint" id="unmatchedLoadWrap">
+          <button type="button" class="btn btn-run" id="btnLoadUnmatched">Load unmatched accounts</button>
+          <span id="unmatchedLoadHint"> (avoid scanning huge tables on each visit.)</span>
+        </p>
         <div class="table-scroll">
           <div id="unmatchedAccountsTable"></div>
         </div>
       </div>
     </section>
   </div>
+  <!-- Shared datalists: avoids one giant &lt;select&gt; (options × rows) freezing the tab. -->
+  <datalist id="systemWs3RollupList"></datalist>
+  <datalist id="systemUnmatchedParentList"></datalist>
   <script src="{{ url_for('static', filename='system.js') }}"></script>
 </body>
 </html>

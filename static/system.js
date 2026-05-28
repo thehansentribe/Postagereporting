@@ -90,7 +90,9 @@
   }
 
   function collectRowsFromUi() {
-    const inputs = Array.from(document.querySelectorAll("input.system-money-input"));
+    const tbl = $("flatsRetailTable");
+    const scope = tbl && tbl.querySelectorAll ? tbl : document;
+    const inputs = Array.from(scope.querySelectorAll("input.system-money-input"));
     const out = [];
     for (const el of inputs) {
       const w = parseFloat(el.getAttribute("data-weight") || "");
@@ -170,6 +172,72 @@
     });
   });
 
+  const btnPm = $("btnUploadPriorityMail");
+  if (btnPm) {
+    btnPm.addEventListener("click", async () => {
+      showError("");
+      const effEl = $("priorityMailEffectiveDate");
+      const fileEl = $("priorityMailFile");
+      const eff = effEl && effEl.value ? String(effEl.value).trim() : "";
+      const file = fileEl && fileEl.files && fileEl.files[0] ? fileEl.files[0] : null;
+      if (!eff) {
+        showError("Choose an effective date.");
+        return;
+      }
+      if (!file) {
+        showError("Choose an .xlsx file.");
+        return;
+      }
+      showBanner("Uploading Priority Mail tariff…");
+      const fd = new FormData();
+      fd.append("effective_date", eff);
+      fd.append("file", file, file.name);
+      try {
+        const r = await fetch("/api/import/priority-mail-retail", { method: "POST", body: fd });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "Upload failed");
+        showBanner(
+          `Imported ${j.rows_imported || 0} row(s); effective ${j.effective_date || eff}.`
+        );
+        if (fileEl) fileEl.value = "";
+      } catch (e) {
+        showBanner("");
+        showError(String(e.message || e));
+      }
+    });
+  }
+
+  const btnRawExport = $("btnImportRawExportCustomers");
+  if (btnRawExport) {
+    btnRawExport.addEventListener("click", async () => {
+      showError("");
+      const fileEl = $("rawExportCustomersFile");
+      const file = fileEl && fileEl.files && fileEl.files[0] ? fileEl.files[0] : null;
+      if (!file) {
+        showError("Choose a Raw Export .xlsx file.");
+        return;
+      }
+      showBanner("Importing customers from Raw Export…");
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      try {
+        const r = await fetch("/api/import/customers-raw-export", { method: "POST", body: fd });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "Import failed");
+        let msg = `Imported ${j.rows_imported || 0} customer row(s).`;
+        const w = j.warnings;
+        if (w && w.length) {
+          msg += ` ${w.length} warning(s); see server log or response for details. First: ${w[0]}`;
+        }
+        showBanner(msg);
+        if (fileEl) fileEl.value = "";
+      } catch (e) {
+        showBanner("");
+        showError(String(e.message || e));
+      }
+    });
+  }
+
   load().catch((e) => showError(String(e.message || e)));
 })();
 
@@ -185,35 +253,24 @@
   }
 
   const tbl = $("ws3ProfilesTable");
-  if (!tbl) return;
+  const btnLoadWs3 = $("btnLoadWs3Profiles");
+  const ws3Dl = $("systemWs3RollupList");
+  if (!tbl || !btnLoadWs3) return;
 
   let state = { profiles: [], assignment_accounts: [] };
 
-  function buildAssignmentOptions(selected) {
+  function populateWs3RollupDatalist() {
+    const dl = ws3Dl;
     const accts = state.assignment_accounts || [];
-    const parents = accts.filter((a) => a.kind === "parent");
-    const mains = accts.filter((a) => a.kind === "main");
-    let h = '<option value="">— None —</option>';
-    function opts(rows) {
-      let s = "";
-      for (const p of rows) {
-        const n = p.customer_number;
-        const sel = n === selected ? " selected" : "";
-        s += `<option value="${n}"${sel}>${escapeHtml(p.customer_name || "")} (${n})</option>`;
-      }
-      return s;
+    if (!dl) return;
+    let opts = "";
+    for (const a of accts) {
+      const n = a.customer_number;
+      const nm = (a.customer_name || "").trim() || `Account ${n}`;
+      const kind = a.kind === "parent" ? "Parent" : "Main";
+      opts += `<option value="${escapeHtml(String(n))}">${escapeHtml(nm)} (${n}) · ${kind}</option>`;
     }
-    if (parents.length) {
-      h += '<optgroup label="Parent accounts (have child accounts)">';
-      h += opts(parents);
-      h += "</optgroup>";
-    }
-    if (mains.length) {
-      h += '<optgroup label="Main accounts (no child accounts)">';
-      h += opts(mains);
-      h += "</optgroup>";
-    }
-    return h;
+    dl.innerHTML = opts;
   }
 
   function render() {
@@ -222,20 +279,22 @@
         "<p class='empty-state'>No WS3 profiles yet. Import a WS3_FCFL_CustomerMailDetail file into input/.</p>";
       return;
     }
+    populateWs3RollupDatalist();
     let html =
       "<table class='data-table system-edit-table'><thead><tr><th>Profile</th><th>Rollup account</th><th class='num'>Reject fee</th><th></th></tr></thead><tbody>";
     for (const row of state.profiles) {
       const pid = row.id;
-      const sel = row.parent_customer_number != null ? row.parent_customer_number : "";
+      const sel =
+        row.parent_customer_number != null ? String(row.parent_customer_number).trim() : "";
       const fee =
         row.reject_fee != null && row.reject_fee !== ""
           ? String(row.reject_fee)
           : "";
       html += "<tr>";
       html += `<td>${escapeHtml(row.profile_name || "")}</td>`;
-      html += `<td><select class="ws3-parent-select" data-profile-id="${pid}">${buildAssignmentOptions(
+      html += `<td><input type="text" class="ws3-parent-input input-ws3-rollup" data-profile-id="${pid}" list="systemWs3RollupList" value="${escapeHtml(
         sel
-      )}</select></td>`;
+      )}" autocomplete="off" placeholder="Acct # …" /></td>`;
       html += `<td class="num"><input type="text" class="system-money-input ws3-reject-fee" inputmode="decimal" placeholder="—" data-profile-id="${pid}" value="${escapeHtml(
         fee
       )}" /></td>`;
@@ -248,10 +307,18 @@
     tbl.querySelectorAll("button.ws3-save").forEach((btn) => {
       btn.addEventListener("click", async () => {
         const id = parseInt(btn.getAttribute("data-profile-id"), 10);
-        const sel = tbl.querySelector(`select[data-profile-id="${id}"]`);
+        const inp = tbl.querySelector(`input.ws3-parent-input[data-profile-id="${id}"]`);
         const feeIn = tbl.querySelector(`input.ws3-reject-fee[data-profile-id="${id}"]`);
-        const raw = sel ? sel.value : "";
-        const parent_customer_number = raw === "" ? null : parseInt(raw, 10);
+        const raw = inp ? String(inp.value || "").trim() : "";
+        let parent_customer_number = null;
+        if (raw !== "") {
+          parent_customer_number = parseInt(raw, 10);
+          if (Number.isNaN(parent_customer_number)) {
+            alert("Rollup account must be a numeric customer number (pick from suggestions).");
+            if (inp) inp.focus();
+            return;
+          }
+        }
         let reject_fee = null;
         if (feeIn) {
           const t = String(feeIn.value || "").trim();
@@ -294,8 +361,21 @@
     render();
   }
 
-  loadWs3().catch((e) => {
-    tbl.innerHTML = `<p class="empty-state">${escapeHtml(String(e.message || e))}</p>`;
+  tbl.innerHTML =
+    "<p class='empty-state'>Click “Load WS3 assignments” above. (Assignment lists are large — loaded on demand.)</p>";
+
+  btnLoadWs3.addEventListener("click", async () => {
+    btnLoadWs3.disabled = true;
+    tbl.innerHTML = "<p class='empty-state'>Loading…</p>";
+    try {
+      await loadWs3();
+      const hw = $("ws3ProfilesLoadHint");
+      if (hw) hw.textContent = "";
+    } catch (e) {
+      tbl.innerHTML = `<p class='empty-state'>${escapeHtml(String(e.message || e))}</p>`;
+    } finally {
+      btnLoadWs3.disabled = false;
+    }
   });
 })();
 
@@ -317,35 +397,26 @@
   }
 
   const tbl = $("unmatchedAccountsTable");
-  if (!tbl) return;
+  const btnUn = $("btnLoadUnmatched");
+  const unmatchedDl = $("systemUnmatchedParentList");
+  if (!tbl || !btnUn) return;
 
   let state = { unmatched: [], parent_options: [] };
 
-  function buildParentOptions(selected) {
-    const rows = state.parent_options || [];
-    const parents = rows.filter((r) => r.kind === "parent");
-    const standalone = rows.filter((r) => r.kind === "standalone");
-    let h = '<option value="">— None —</option>';
-    function opts(list) {
-      let s = "";
-      for (const r of list) {
-        const n = r.customer_number;
-        const sel = n === selected ? " selected" : "";
-        s += `<option value="${n}"${sel}>${escapeHtml(r.customer_name || "")} (${n})</option>`;
-      }
-      return s;
+  function populateUnmatchedParentDatalist() {
+    const dl = unmatchedDl;
+    const rows = (state.parent_options || []).filter((r) =>
+      ["parent", "standalone"].includes(r.kind)
+    );
+    if (!dl) return;
+    let opts = '<option value=""></option>';
+    for (const r of rows) {
+      const n = r.customer_number;
+      const nm = (r.customer_name || "").trim() || `Account ${n}`;
+      const tag = r.kind === "parent" ? "Parent" : "Standalone";
+      opts += `<option value="${escapeHtml(String(n))}">${escapeHtml(nm)} (${n}) · ${tag}</option>`;
     }
-    if (parents.length) {
-      h += '<optgroup label="Parent accounts">';
-      h += opts(parents);
-      h += "</optgroup>";
-    }
-    if (standalone.length) {
-      h += '<optgroup label="Standalone accounts">';
-      h += opts(standalone);
-      h += "</optgroup>";
-    }
-    return h;
+    dl.innerHTML = opts;
   }
 
   function render() {
@@ -354,6 +425,8 @@
       tbl.innerHTML = "<p class='empty-state'>No unmatched accounts found.</p>";
       return;
     }
+
+    populateUnmatchedParentDatalist();
 
     let html =
       "<table class='data-table system-edit-table'><thead><tr>" +
@@ -380,9 +453,9 @@
       html += `<td><input type="text" class="unmatched-name" data-account="${escapeHtml(
         String(code)
       )}" placeholder="Enter name…" /></td>`;
-      html += `<td><select class="unmatched-parent" data-account="${escapeHtml(
+      html += `<td><input type="text" class="unmatched-parent-input" data-account="${escapeHtml(
         String(code)
-      )}">${buildParentOptions("")}</select></td>`;
+      )}" list="systemUnmatchedParentList" placeholder="Parent acct #" autocomplete="off" /></td>`;
       html += `<td><button type="button" class="btn btn-primary unmatched-save" data-account="${escapeHtml(
         String(code)
       )}">Save</button></td>`;
@@ -396,10 +469,19 @@
       btn.addEventListener("click", async () => {
         const code = parseInt(btn.getAttribute("data-account") || "", 10);
         const nameEl = tbl.querySelector(`input.unmatched-name[data-account="${code}"]`);
-        const parentEl = tbl.querySelector(`select.unmatched-parent[data-account="${code}"]`);
+        const parentEl = tbl.querySelector(`input.unmatched-parent-input[data-account="${code}"]`);
         const customer_name = String((nameEl && nameEl.value) || "").trim();
-        const rawParent = parentEl ? parentEl.value : "";
-        const parent_number = rawParent === "" ? null : parseInt(rawParent, 10);
+        const rawParent = parentEl ? String(parentEl.value || "").trim() : "";
+        let parent_number = null;
+        if (rawParent !== "") {
+          parent_number = parseInt(rawParent, 10);
+          if (Number.isNaN(parent_number)) {
+            alert("Parent must be a numeric account number (use suggestions).");
+            if (parentEl) parentEl.focus();
+            btn.disabled = false;
+            return;
+          }
+        }
 
         if (!customer_name) {
           alert("Customer name is required.");
@@ -428,7 +510,7 @@
     });
   }
 
-  async function load() {
+  async function loadUnmatched() {
     const r = await fetch("/api/system/unmatched-accounts");
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || "Failed to load unmatched accounts");
@@ -437,8 +519,21 @@
     render();
   }
 
-  load().catch((e) => {
-    tbl.innerHTML = `<p class="empty-state">${escapeHtml(String(e.message || e))}</p>`;
+  tbl.innerHTML =
+    "<p class=\"empty-state\">Click “Load unmatched accounts” above if you need this list. Scanning billing and postage data waits until then.</p>";
+
+  btnUn.addEventListener("click", async () => {
+    btnUn.disabled = true;
+    tbl.innerHTML = "<p class=\"empty-state\">Loading…</p>";
+    try {
+      await loadUnmatched();
+      const hu = $("unmatchedLoadHint");
+      if (hu) hu.textContent = "";
+    } catch (e) {
+      tbl.innerHTML = `<p class="empty-state">${escapeHtml(String(e.message || e))}</p>`;
+    } finally {
+      btnUn.disabled = false;
+    }
   });
 })();
 

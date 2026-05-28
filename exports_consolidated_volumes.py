@@ -96,14 +96,14 @@ def _zone_cell_priority_count(blocks: list[dict[str, Any]], z: int, ri: int) -> 
     return pr, disc, cnt
 
 
-def _parcel_consolidated_headers(remove_customer_numbers: bool) -> list[str]:
+def _parcel_consolidated_headers(hide_customer_numbers: bool) -> list[str]:
     """Column order must match the PARCELS (COUNTS) sheet (retail is last column)."""
     return [
         "Date",
         "Parent Name",
-        *(["Parent Number"] if not remove_customer_numbers else []),
+        *(["Parent Number"] if not hide_customer_numbers else []),
         "Child Name",
-        *(["Child Number"] if not remove_customer_numbers else []),
+        *(["Child Number"] if not hide_customer_numbers else []),
         *[f"{i} lb" for i in range(1, 11)],
         "10+ lb",
         "Total Qty",
@@ -111,14 +111,14 @@ def _parcel_consolidated_headers(remove_customer_numbers: bool) -> list[str]:
     ]
 
 
-def _flats_consolidated_column_plan(remove_customer_numbers: bool) -> tuple[list[str], list[str]]:
+def _flats_consolidated_column_plan(hide_customer_numbers: bool) -> tuple[list[str], list[str]]:
     oz_keys = [f"oz_{i}" for i in range(13)] + ["oz_13", "oz_13plus"]
     headers = [
         "Date",
         "Parent Name",
-        *(["Parent Number"] if not remove_customer_numbers else []),
+        *(["Parent Number"] if not hide_customer_numbers else []),
         "Child Name",
-        *(["Child Number"] if not remove_customer_numbers else []),
+        *(["Child Number"] if not hide_customer_numbers else []),
         "Class",
         *[f"{i} oz" for i in range(13)],
         "13 oz",
@@ -129,15 +129,46 @@ def _flats_consolidated_column_plan(remove_customer_numbers: bool) -> tuple[list
     keys = [
         "date",
         "parent_name",
-        *(["parent_number"] if not remove_customer_numbers else []),
+        *(["parent_number"] if not hide_customer_numbers else []),
         "child_name",
-        *(["child_number"] if not remove_customer_numbers else []),
+        *(["child_number"] if not hide_customer_numbers else []),
         "mail_class",
         *oz_keys,
         "total_qty",
         "retail_cost",
     ]
     return headers, keys
+
+
+def flats_summary_retail_formula(
+    *,
+    flats_sheet_quoted: str,
+    f_headers: list[str],
+    retail_col_letter: str,
+    last_data_row: int,
+) -> str:
+    """
+    Excel formula for Summary **Flats Total retail Postage Cost**: sum the FLATS retail column
+    minus rows whose Class is synthetic presort rejects or allocated rejects (matches
+    ``query_postage`` total_retail_cost semantics).
+    """
+    class_idx = f_headers.index("Class") + 1
+    class_col = get_column_letter(class_idx)
+
+    def _xl_str(s: str) -> str:
+        return '"' + str(s).replace('"', '""') + '"'
+
+    pr = db.WS3_REJECT_MAIL_CLASS
+    ar = db.WS3_REJECT_ALLOCATED_MAIL_CLASS
+    rng_retail = (
+        f"{flats_sheet_quoted}!{retail_col_letter}2:{retail_col_letter}{last_data_row}"
+    )
+    rng_class = f"{flats_sheet_quoted}!{class_col}2:{class_col}{last_data_row}"
+    return (
+        f"=SUM({rng_retail})"
+        f"-SUMIF({rng_class},{_xl_str(pr)},{rng_retail})"
+        f"-SUMIF({rng_class},{_xl_str(ar)},{rng_retail})"
+    )
 
 
 def _write_zone_summary_stacked_sheet(ws: Any, zone_data: dict[str, Any], *, start_row: int = 1) -> int:
@@ -240,7 +271,7 @@ def export_consolidated_volumes_xlsx(
     consolidate: bool,
     remove_zeros: bool,
     hide_costs_summary: bool,
-    remove_customer_numbers: bool,
+    hide_customer_numbers: bool,
     account_scope_label: str,
     parcel_discount: float = 0.25,
 ) -> Path:
@@ -350,8 +381,8 @@ def export_consolidated_volumes_xlsx(
     kv_row(r, "Total flats rejected items", rejected_flats, is_int=True)
     r += 1
 
-    f_headers, _ = _flats_consolidated_column_plan(remove_customer_numbers)
-    p_headers = _parcel_consolidated_headers(remove_customer_numbers)
+    f_headers, _ = _flats_consolidated_column_plan(hide_customer_numbers)
+    p_headers = _parcel_consolidated_headers(hide_customer_numbers)
     flats_retail_col = get_column_letter(len(f_headers))
     parcel_retail_col = get_column_letter(len(p_headers))
     flats_sheet_q = "'FLATS (POSTAGE)'"
@@ -367,7 +398,12 @@ def export_consolidated_volumes_xlsx(
         b1.alignment = Alignment(horizontal="left", vertical="center")
         if flat_rows:
             last_fr = 1 + len(flat_rows)
-            b1.value = f"=SUM({flats_sheet_q}!{flats_retail_col}2:{flats_retail_col}{last_fr})"
+            b1.value = flats_summary_retail_formula(
+                flats_sheet_quoted=flats_sheet_q,
+                f_headers=list(f_headers),
+                retail_col_letter=flats_retail_col,
+                last_data_row=last_fr,
+            )
             b1.number_format = money_fmt
         else:
             flat_num = (
@@ -409,7 +445,7 @@ def export_consolidated_volumes_xlsx(
 
     if flat_rows:
         ws_f = wb.create_sheet("FLATS (POSTAGE)")
-        f_headers, f_keys = _flats_consolidated_column_plan(remove_customer_numbers)
+        f_headers, f_keys = _flats_consolidated_column_plan(hide_customer_numbers)
         for col, h in enumerate(f_headers, start=1):
             c = ws_f.cell(1, col, h)
             c.font = hdr_font
@@ -434,7 +470,7 @@ def export_consolidated_volumes_xlsx(
                 else:
                     cell.value = v
                     cell.alignment = Alignment(horizontal="left", vertical="center")
-        ws_f.freeze_panes = "G2" if not remove_customer_numbers else "E2"
+        ws_f.freeze_panes = "G2" if not hide_customer_numbers else "E2"
         ws_f.row_dimensions[1].height = 26
         for i in range(1, len(f_headers) + 1):
             letter = get_column_letter(i)
@@ -442,9 +478,9 @@ def export_consolidated_volumes_xlsx(
                 base = 14.0
             elif i in (2, 4):
                 base = 22.0
-            elif not remove_customer_numbers and i in (3, 5):
+            elif not hide_customer_numbers and i in (3, 5):
                 base = 14.0
-            elif i <= (6 if not remove_customer_numbers else 4):
+            elif i <= (6 if not hide_customer_numbers else 4):
                 base = 14.0
             else:
                 base = 10.0
@@ -452,7 +488,7 @@ def export_consolidated_volumes_xlsx(
 
     if parcel_agg:
         ws_p = wb.create_sheet("PARCELS (COUNTS)")
-        p_headers = _parcel_consolidated_headers(remove_customer_numbers)
+        p_headers = _parcel_consolidated_headers(hide_customer_numbers)
         for col, h in enumerate(p_headers, start=1):
             c = ws_p.cell(1, col, h)
             c.font = hdr_font
@@ -463,9 +499,9 @@ def export_consolidated_volumes_xlsx(
             vals: list[Any] = [
                 prow.get("date"),
                 prow.get("parent_name"),
-                *([prow.get("parent_number")] if not remove_customer_numbers else []),
+                *([prow.get("parent_number")] if not hide_customer_numbers else []),
                 prow.get("child_name"),
-                *([prow.get("child_number")] if not remove_customer_numbers else []),
+                *([prow.get("child_number")] if not hide_customer_numbers else []),
                 *[int(prow.get(f"lb_{i}") or 0) for i in range(1, 11)],
                 int(prow.get("lb_10plus") or 0),
                 int(prow.get("total_qty") or 0),
@@ -476,21 +512,21 @@ def export_consolidated_volumes_xlsx(
                 cell = ws_p.cell(ri, col, v)
                 cell.font = body_font
                 cell.border = grid
-                if col <= (5 if not remove_customer_numbers else 3):
+                if col <= (5 if not hide_customer_numbers else 3):
                     cell.alignment = Alignment(horizontal="left", vertical="center")
                 else:
                     cell.alignment = Alignment(horizontal="right", vertical="center")
                 if col == ncols:
                     cell.number_format = money_fmt
-                elif col >= (6 if not remove_customer_numbers else 4):
+                elif col >= (6 if not hide_customer_numbers else 4):
                     cell.number_format = int_fmt
-        ws_p.freeze_panes = "F2" if not remove_customer_numbers else "D2"
+        ws_p.freeze_panes = "F2" if not hide_customer_numbers else "D2"
         ws_p.row_dimensions[1].height = 28
         col_widths = [12.0, 24.0]
-        if not remove_customer_numbers:
+        if not hide_customer_numbers:
             col_widths.append(14.0)
         col_widths.append(30.0)
-        if not remove_customer_numbers:
+        if not hide_customer_numbers:
             col_widths.append(14.0)
         col_widths.extend([9.0] * 10 + [9.0, 11.0, 14.0])
         for i, w in enumerate(col_widths, start=1):

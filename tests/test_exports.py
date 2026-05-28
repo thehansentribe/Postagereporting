@@ -12,6 +12,7 @@ import db
 import exports
 import exports_consolidated_volumes
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 
 def _parcel_row(
@@ -71,6 +72,79 @@ def test_parcel_counts_download_name() -> None:
     assert exports.parcel_counts_download_name("2026-01-01", "2026-01-31", 12, None).endswith(
         ".xlsx"
     )
+
+
+def test_export_parcel_counts_report_xlsx_child_number_column(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "parcel_counts.db"
+        monkeypatch.setattr(db, "DB_PATH", p)
+        db.init_db()
+
+        conn = db.get_connection()
+        conn.execute(
+            "INSERT INTO customers (customer_number, customer_name) VALUES (200, 'Acme')"
+        )
+        conn.execute(
+            "INSERT INTO billing_imports (billing_id, file_name, row_count) VALUES ('b1', 'x.csv', 1)"
+        )
+        import_id = conn.execute(
+            "SELECT id FROM billing_imports WHERE billing_id = 'b1'"
+        ).fetchone()["id"]
+        conn.execute(
+            """
+            INSERT INTO billing_records (
+                billing_import_id, custom_account_code, time_stamp, weight_oz,
+                usps_mail_class, billing_amount, fully_paid_postage, zone
+            )
+            VALUES (?, 200, '4/3/2026 10:00', 16.0, 'PRIORITY', 5.0, 6.0, '2')
+            """,
+            (import_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(
+            db,
+            "compute_retail_cost_for_piece",
+            lambda *a, **k: {"retail": 6.0, "zone": 2},
+        )
+
+        out_hidden = exports.export_parcel_counts_report_xlsx(
+            "2026-04-01",
+            "2026-04-30",
+            None,
+            None,
+            show_parents=True,
+            show_main=True,
+            consolidate=False,
+            remove_zeros=False,
+            hide_costs=False,
+            hide_customer_numbers=True,
+        )
+        wb_h = load_workbook(out_hidden)
+        ws_h = wb_h.active
+        assert ws_h.cell(1, 4).value == "1 lb"
+        assert "Child Number" not in [ws_h.cell(1, c).value for c in range(1, 6)]
+        out_hidden.unlink(missing_ok=True)
+
+        out_show = exports.export_parcel_counts_report_xlsx(
+            "2026-04-01",
+            "2026-04-30",
+            None,
+            None,
+            show_parents=True,
+            show_main=True,
+            consolidate=False,
+            remove_zeros=False,
+            hide_costs=False,
+            hide_customer_numbers=False,
+        )
+        wb_s = load_workbook(out_show)
+        ws_s = wb_s.active
+        assert ws_s.cell(1, 4).value == "Child Number"
+        assert ws_s.cell(1, 5).value == "1 lb"
+        assert ws_s.cell(2, 4).value == 200
+        out_show.unlink(missing_ok=True)
 
 
 def test_parcel_invoice_download_name_uses_title_customer_and_end_date() -> None:
@@ -153,6 +227,22 @@ def test_export_flats_data_grid_xlsx_headers_and_piece_count(monkeypatch) -> Non
         assert ws.cell(2, 21).value == 10.0
         out.unlink(missing_ok=True)
 
+        out_show = exports.export_flats_data_grid_xlsx(
+            "2026-03-01",
+            "2026-03-01",
+            hide_costs=False,
+            hide_customer_numbers=False,
+            sort_key="date",
+            sort_dir=1,
+        )
+        wb2 = load_workbook(out_show)
+        ws2 = wb2.active
+        assert ws2.cell(1, 4).value == "Child Number"
+        assert ws2.cell(1, 5).value == "Class"
+        assert ws2.cell(2, 4).value == 200
+        assert ws2.cell(2, 8).value == 5
+        out_show.unlink(missing_ok=True)
+
 
 def test_export_flats_data_grid_csv_headers_and_hide_costs(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
@@ -188,10 +278,34 @@ def test_export_flats_data_grid_csv_headers_and_hide_costs(monkeypatch) -> None:
             header = next(reader)
             row = next(reader)
         assert header[0:4] == ["Date", "Parent Name", "Child Name", "Class"]
+        assert "Child Number" not in header
         assert "Total Qty" in header
         assert header[-1] == "Total Cost"
         assert len(row) == len(header)
         out.unlink(missing_ok=True)
+
+        out_show = exports.export_flats_data_grid_csv(
+            "2026-03-01",
+            "2026-03-01",
+            hide_costs=False,
+            hide_customer_numbers=False,
+            sort_key="date",
+            sort_dir=1,
+        )
+        with open(out_show, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header_show = next(reader)
+            row_show = next(reader)
+        assert header_show[0:5] == [
+            "Date",
+            "Parent Name",
+            "Child Name",
+            "Child Number",
+            "Class",
+        ]
+        assert row_show[3] == "200"
+        assert len(row_show) == len(header_show)
+        out_show.unlink(missing_ok=True)
 
         out2 = exports.export_flats_data_grid_csv(
             "2026-03-01",
@@ -241,6 +355,32 @@ def test_total_presort_reject_pieces_from_postage_rows() -> None:
     ]
     assert exports_consolidated_volumes.total_presort_reject_pieces_from_postage_rows(rows) == 8
     assert exports_consolidated_volumes.total_presort_reject_pieces_from_postage_rows([]) == 0
+
+
+def test_flats_summary_retail_formula_excludes_reject_classes() -> None:
+    """Summary retail uses SUM minus SUMIF for Presort rejects and Rejects; Class column from headers."""
+    sheet = "'FLATS (POSTAGE)'"
+    for remove_nums in (True, False):
+        f_headers, _ = exports_consolidated_volumes._flats_consolidated_column_plan(remove_nums)
+        class_col = f_headers.index("Class") + 1
+
+        assert get_column_letter(class_col) == ("D" if remove_nums else "F")
+
+        retail_col = get_column_letter(len(f_headers))
+        last_row = 5
+        f = exports_consolidated_volumes.flats_summary_retail_formula(
+            flats_sheet_quoted=sheet,
+            f_headers=f_headers,
+            retail_col_letter=retail_col,
+            last_data_row=last_row,
+        )
+        assert f.startswith("=SUM(")
+        assert '"Presort rejects"' in f
+        assert '"Rejects"' in f
+        cc = get_column_letter(class_col)
+        assert f"{sheet}!{cc}2:{cc}{last_row}" in f
+        assert f"{sheet}!{retail_col}2:{retail_col}{last_row}" in f
+        assert f.count("SUMIF(") == 2
 
 
 def test_export_parcel_billing_csv_writes_full_header(monkeypatch) -> None:
@@ -373,13 +513,64 @@ def test_export_efd_parcel_invoice_xlsx_layout_and_formulas(monkeypatch) -> None
         assert ws.cell(9, 26).value == "EFD Revenue"
         assert ws.cell(9, 27).value == "retail_cost"
         assert ws.cell(10, 24).value == 5.22
-        assert ws.cell(10, 25).value == "=X10+0.5"
-        assert ws.cell(10, 26).value == "=AA10-0.25-Y10"
+        assert ws.cell(10, 25).value == "=X10+1.25"
+        assert ws.cell(10, 26).value == "=AA10-Y10"
         assert ws.cell(10, 27).value == 10.2
         b2 = ws.cell(2, 2).value
         assert isinstance(b2, str) and b2.startswith("=SUM(X10:")
         assert ws.cell(6, 2).value == "=COUNTA(A10:A10)"
         assert ws.cell(5, 2).value == "=B4-B3"
+        wb.close()
+        out.unlink(missing_ok=True)
+
+
+def test_export_efd_parcel_invoice_xlsx_custom_efd_fee_formula(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "efd_invoice_custom.db"
+        monkeypatch.setattr(db, "DB_PATH", p)
+        db.init_db()
+
+        conn = db.get_connection()
+        conn.execute(
+            "INSERT INTO customers (customer_number, customer_name) VALUES (200, 'Acme')"
+        )
+        conn.execute(
+            "INSERT INTO billing_imports (billing_id, file_name, row_count) VALUES ('b1', 'x.csv', 1)"
+        )
+        import_id = conn.execute(
+            "SELECT id FROM billing_imports WHERE billing_id = 'b1'"
+        ).fetchone()["id"]
+        conn.execute(
+            """
+            INSERT INTO billing_records (
+                billing_import_id, custom_account_code, time_stamp, weight_oz,
+                billing_amount, zone, imb_tracking_code, impb
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (import_id, 200, "4/1/2026 15:34", 16.0, 5.22, "5", "trk", "impb1"),
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(
+            db,
+            "compute_retail_cost_for_piece",
+            lambda *a, **k: {"retail": 10.2, "zone": 5},
+        )
+
+        out, _title = exports.export_efd_parcel_invoice_xlsx(
+            "2026-04-01",
+            "2026-04-30",
+            200,
+            None,
+            show_parents=True,
+            show_main=True,
+            efd_parcel_fee=0.33,
+        )
+        wb = load_workbook(out, data_only=False)
+        ws = wb.active
+        assert ws.cell(10, 25).value == "=X10+0.33"
         wb.close()
         out.unlink(missing_ok=True)
 
@@ -414,3 +605,140 @@ def test_export_efd_parcel_invoice_xlsx_empty_rows(monkeypatch) -> None:
         assert ws.cell(6, 2).value == 0
         wb.close()
         out.unlink(missing_ok=True)
+
+
+def test_efd_weekly_invoice_download_name() -> None:
+    assert exports.efd_weekly_invoice_download_name(
+        "2026-04-27", "2026-05-01"
+    ) == "EFD 4-27 to 5-1.xlsx"
+    assert exports.efd_weekly_invoice_download_name(
+        "2026-04-01", "2026-04-01"
+    ) == "EFD 4-1-2026.xlsx"
+
+
+def test_export_efd_weekly_invoice_xlsx_workbook_and_summary_formulas(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "efd_weekly.db"
+        monkeypatch.setattr(db, "DB_PATH", p)
+        db.init_db()
+
+        conn = db.get_connection()
+        for pn, name in (
+            (3901, "Blue Cross Blue Shield -EFD Mailing"),
+            (3899, "GEHA -EFD Mailing"),
+            (3900, "Security Benefit/Zinnia -EFD Mailing"),
+        ):
+            conn.execute(
+                "INSERT INTO customers (customer_number, customer_name) VALUES (?, ?)",
+                (pn, name),
+            )
+        conn.commit()
+        conn.close()
+
+        out = exports.export_efd_weekly_invoice_xlsx(
+            "2026-04-27",
+            "2026-05-01",
+            discount=0.1,
+            efd_parcel_fee=1.25,
+        )
+        assert out.is_file()
+        wb = load_workbook(out, data_only=False)
+        assert len(wb.sheetnames) == 7
+        assert wb.sheetnames[0] == "Summary"
+        for pn in (3901, 3899, 3900):
+            assert f"{pn} Postage" in wb.sheetnames
+            assert f"{pn} Parcel" in wb.sheetnames
+
+        ws = wb["Summary"]
+        assert ws["A1"].value == "BCBS"
+        assert ws["B1"].value == "Flats"
+        assert ws["A2"].value == "BCBS"
+        assert ws["B2"].value == "Parcels"
+        assert ws["A3"].value == "BCBS"
+        assert ws["B3"].value == "Total"
+        assert ws["A4"].value == "GEHA"
+        assert ws["B4"].value == "Flats"
+        assert ws["A5"].value == "GEHA"
+        assert ws["B5"].value == "Parcels"
+        assert ws["A6"].value == "GEHA"
+        assert ws["B6"].value == "Total"
+        assert ws["A7"].value == "Zinnia"
+        assert ws["B7"].value == "Flats"
+        assert ws["A8"].value == "Zinnia"
+        assert ws["B8"].value == "Parcels"
+        assert ws["A9"].value == "Zinnia"
+        assert ws["B9"].value == "Total"
+        assert ws["A10"].value == "Grand Total"
+        assert ws["B10"].value == "Grand Total"
+
+        assert ws["C1"].value == "='3901 Postage'!L31"
+        assert ws["D1"].value == "='3901 Postage'!I32"
+        assert ws["C2"].value == "='3901 Parcel'!B3"
+        assert ws["D2"].value == "='3901 Parcel'!B6"
+        assert ws["C3"].value == "=SUM(C1:C2)"
+        assert ws["D3"].value == "=SUM(D1:D2)"
+        assert ws["C4"].value == "='3899 Postage'!L31"
+        assert ws["D6"].value == "=SUM(D4:D5)"
+        assert ws["C10"].value == "=SUM(C3,C6,C9)"
+        assert ws["D10"].value == "=SUM(D3,D6,D9)"
+
+        parcel_ws = wb["3900 Parcel"]
+        assert parcel_ws.cell(3, 2).value == 0
+        assert parcel_ws.cell(6, 2).value == 0
+
+        wb.close()
+        out.unlink(missing_ok=True)
+
+
+def test_efd_weekly_account_download_name() -> None:
+    assert exports.efd_weekly_account_download_name(
+        "BCBS", "2026-04-27", "2026-05-01"
+    ) == "EFD BCBS 4-27 to 5-1.xlsx"
+    assert exports.efd_weekly_account_download_name(
+        "Zinnia", "2026-04-01", "2026-04-01"
+    ) == "EFD Zinnia 4-1-2026.xlsx"
+
+
+def test_export_efd_weekly_invoice_single_account_workbook(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "efd_weekly_single.db"
+        monkeypatch.setattr(db, "DB_PATH", p)
+        db.init_db()
+
+        conn = db.get_connection()
+        conn.execute(
+            "INSERT INTO customers (customer_number, customer_name) VALUES (3901, 'BCBS')"
+        )
+        conn.commit()
+        conn.close()
+
+        out = exports.export_efd_weekly_invoice_xlsx(
+            "2026-04-27",
+            "2026-05-01",
+            discount=0.1,
+            efd_parcel_fee=1.25,
+            parent_number=3901,
+        )
+        assert out.is_file()
+        wb = load_workbook(out, data_only=False)
+        assert wb.sheetnames == ["Summary", "Postage", "Parcel"]
+
+        ws = wb["Summary"]
+        assert ws["A1"].value == "BCBS"
+        assert ws["B1"].value == "Flats"
+        assert ws["B2"].value == "Parcels"
+        assert ws["B3"].value == "Total"
+        assert ws["C1"].value == "='Postage'!L31"
+        assert ws["D2"].value == "='Parcel'!B6"
+        assert ws["C3"].value == "=SUM(C1:C2)"
+        assert ws["D3"].value == "=SUM(D1:D2)"
+        assert ws["A4"].value is None
+        assert ws["A10"].value is None
+
+        wb.close()
+        out.unlink(missing_ok=True)
+
+
+def test_efd_weekly_summary_label_invalid_parent() -> None:
+    with pytest.raises(ValueError, match="3901"):
+        exports.efd_weekly_summary_label(9999)

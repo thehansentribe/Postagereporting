@@ -45,6 +45,86 @@ def _bool_param(name: str, default: bool = False) -> bool:
     return str(v).lower() in ("1", "true", "yes", "on")
 
 
+def _profit_request_extras(conn) -> tuple[list[int] | None, float, str | None]:
+    """
+    Parse optional ``profit_accounts`` CSV and ``parcel_fee`` from the query string.
+
+    Returns ``(profit_account_ids, parcel_fee, error_message)`` where ``error_message`` is set on validation failure.
+    """
+    raw_pa = request.args.get("profit_accounts")
+    profit_ids: list[int] | None = None
+    if raw_pa and str(raw_pa).strip():
+        try:
+            profit_ids = db.parse_profit_accounts_csv(conn, raw_pa)
+        except ValueError as e:
+            return None, 1.25, str(e)
+    pf = request.args.get("parcel_fee", type=float)
+    if pf is None:
+        pf = 1.25
+    if pf < 0:
+        return None, 1.25, "parcel_fee must be non-negative"
+    return profit_ids, float(pf), None
+
+
+def _efd_parcel_fee_pair(
+    efd_explicit: float | None,
+    parcel_fee_fallback: float | None,
+) -> tuple[float, str | None]:
+    """
+    Price-to-EFD adder for invoice column Y and Summary B10 on profit export.
+
+    Prefer ``efd_explicit``; if absent, use ``parcel_fee_fallback`` (legacy query strings);
+    default 1.25.
+    """
+    if efd_explicit is not None:
+        if efd_explicit < 0:
+            return 1.25, "efd_parcel_fee must be non-negative"
+        return float(efd_explicit), None
+    if parcel_fee_fallback is not None:
+        if parcel_fee_fallback < 0:
+            return 1.25, "parcel_fee must be non-negative"
+        return float(parcel_fee_fallback), None
+    return 1.25, None
+
+
+def _efd_parcel_fee_from_post_body(body: dict) -> tuple[float | None, str | None]:
+    """If key ``efd_parcel_fee`` is present, parse non-negative float; else (None, None)."""
+    if "efd_parcel_fee" not in body:
+        return None, None
+    raw = body["efd_parcel_fee"]
+    try:
+        f = float(raw)
+    except (TypeError, ValueError):
+        return None, "efd_parcel_fee must be a number"
+    if f < 0:
+        return None, "efd_parcel_fee must be non-negative"
+    return float(f), None
+
+
+def _profit_request_extras_post(conn, data: dict) -> tuple[list[int] | None, float, str | None]:
+    """Parse ``profit_account_ids`` JSON array and ``parcel_fee`` from a POST JSON body."""
+    profit_ids: list[int] | None = None
+    j = data.get("profit_account_ids")
+    if j is not None:
+        if not isinstance(j, list):
+            return None, 1.25, "profit_account_ids must be an array"
+        try:
+            profit_ids = db.parse_profit_account_ids_from_json_list(conn, j)
+        except ValueError as e:
+            return None, 1.25, str(e)
+    pf = data.get("parcel_fee")
+    if pf is None:
+        pf = 1.25
+    else:
+        try:
+            pf = float(pf)
+        except (TypeError, ValueError):
+            return None, 1.25, "parcel_fee must be a number"
+    if pf < 0:
+        return None, 1.25, "parcel_fee must be non-negative"
+    return profit_ids, float(pf), None
+
+
 @app.before_request
 def _before() -> None:
     _ensure_watcher()
@@ -279,6 +359,7 @@ def api_postage():
         cn = request.args.get("customer_number", type=int)
         kc_presort = _bool_param("kc_presort", False)
         efd = _bool_param("efd", False)
+        allocate_presort_rejects = _bool_param("allocate_presort_rejects", False)
         conn = db.get_connection()
         data = db.query_postage(
             conn,
@@ -290,6 +371,7 @@ def api_postage():
             show_main=_bool_param("show_main", True),
             kc_presort=kc_presort,
             efd=efd,
+            allocate_presort_rejects=allocate_presort_rejects,
             consolidate=_bool_param("consolidate", False),
             remove_zeros=_bool_param("remove_zeros", False),
             hide_costs=_bool_param("hide_costs", False),
@@ -309,7 +391,7 @@ def api_postage_row_details():
         return jsonify({"error": "file_date, account_code, mail_class required"}), 400
     if file_date == "Combined":
         return jsonify({"error": "Cannot edit a consolidated row"}), 400
-    if mail_class == db.WS3_REJECT_MAIL_CLASS:
+    if mail_class in (db.WS3_REJECT_MAIL_CLASS, db.WS3_REJECT_ALLOCATED_MAIL_CLASS):
         return jsonify({"error": "Presort rejects are not editable"}), 400
     try:
         conn = db.get_connection()
@@ -375,6 +457,102 @@ def api_postage_row_apply_update():
             )
         conn.close()
         return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/parcels/row-details")
+def api_parcels_row_details():
+    bill_date = request.args.get("bill_date")
+    account_code = request.args.get("account_code", type=int)
+    mail_class = request.args.get("mail_class")
+    zone = request.args.get("zone")
+    if zone is None:
+        zone = ""
+    if not bill_date or account_code is None or not mail_class:
+        return jsonify({"error": "bill_date, account_code, mail_class required"}), 400
+    if bill_date == "Combined":
+        return jsonify({"error": "Cannot edit a consolidated row"}), 400
+    try:
+        conn = db.get_connection()
+        rows = db.get_billing_row_details(
+            conn, bill_date, account_code, mail_class, zone
+        )
+        conn.close()
+        return jsonify({"rows": rows})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/parcels/row-preview-update", methods=["POST"])
+def api_parcels_row_preview_update():
+    payload = request.get_json(silent=True) or {}
+    bill_date = payload.get("bill_date")
+    from_account = payload.get("from_account_code")
+    to_account = payload.get("to_account_code")
+    mail_class = payload.get("mail_class")
+    zone = payload.get("zone")
+    if zone is None:
+        zone = ""
+    pieces_by_bucket = payload.get("pieces_by_bucket") or {}
+    if not bill_date or bill_date == "Combined":
+        return jsonify({"error": "bill_date required"}), 400
+    if from_account is None or to_account is None or not mail_class:
+        return jsonify({"error": "from_account_code, to_account_code, mail_class required"}), 400
+    try:
+        conn = db.get_connection()
+        out = db.preview_billing_row_update(
+            conn,
+            bill_date=str(bill_date),
+            from_account_code=int(from_account),
+            mail_class=str(mail_class),
+            zone=str(zone),
+            to_account_code=int(to_account),
+            pieces_by_bucket=pieces_by_bucket,
+        )
+        conn.close()
+        return jsonify(out)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/parcels/row-apply-update", methods=["POST"])
+def api_parcels_row_apply_update():
+    payload = request.get_json(silent=True) or {}
+    bill_date = payload.get("bill_date")
+    from_account = payload.get("from_account_code")
+    to_account = payload.get("to_account_code")
+    mail_class = payload.get("mail_class")
+    zone = payload.get("zone")
+    if zone is None:
+        zone = ""
+    pieces_by_bucket = payload.get("pieces_by_bucket") or {}
+    reason = payload.get("reason")
+    if not bill_date or bill_date == "Combined":
+        return jsonify({"error": "bill_date required"}), 400
+    if from_account is None or to_account is None or not mail_class:
+        return jsonify({"error": "from_account_code, to_account_code, mail_class required"}), 400
+    try:
+        conn = db.get_connection()
+        with conn:
+            out = db.apply_billing_row_update(
+                conn,
+                bill_date=str(bill_date),
+                from_account_code=int(from_account),
+                mail_class=str(mail_class),
+                zone=str(zone),
+                to_account_code=int(to_account),
+                pieces_by_bucket=pieces_by_bucket,
+                reason=str(reason) if reason is not None else None,
+            )
+        conn.close()
+        return jsonify(out)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
@@ -481,6 +659,21 @@ def api_summary():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/reports/readiness")
+def api_reports_readiness():
+    start = request.args.get("start_date")
+    end = request.args.get("end_date")
+    if not start or not end:
+        return jsonify({"error": "start_date and end_date required"}), 400
+    try:
+        conn = db.get_connection()
+        data = db.query_report_readiness(conn, start, end)
+        conn.close()
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/watcher/status")
 def api_watcher_status():
     try:
@@ -505,8 +698,10 @@ def api_watcher_status():
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
     try:
-        watcher.scan_once()
-        return jsonify({"ok": True})
+        result = watcher.scan_once()
+        failed = result.get("failed") or []
+        ok = len(failed) == 0
+        return jsonify({"ok": ok, **result})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -530,6 +725,27 @@ def api_import_customers():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/import/customers-raw-export", methods=["POST"])
+def api_import_customers_raw_export():
+    if "file" not in request.files:
+        return jsonify({"error": "file required"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "empty filename"}), 400
+    if not f.filename.lower().endswith(".xlsx"):
+        return jsonify({"error": "Raw Export import requires an .xlsx file"}), 400
+    path = Path(watcher.INCOMING) / secure_filename(f.filename)
+    watcher.ensure_dirs()
+    f.save(path)
+    try:
+        result = importer.import_customers_raw_export_xlsx(str(path), db.DB_PATH)
+        path.unlink(missing_ok=True)
+        return jsonify(result)
+    except Exception as e:
+        path.unlink(missing_ok=True)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/import/flatrates", methods=["POST"])
 def api_import_flatrates():
     if "file" not in request.files:
@@ -542,6 +758,30 @@ def api_import_flatrates():
     f.save(path)
     try:
         result = importer.import_flat_rate_costs(str(path), db.DB_PATH)
+        path.unlink(missing_ok=True)
+        return jsonify(result)
+    except Exception as e:
+        path.unlink(missing_ok=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/import/priority-mail-retail", methods=["POST"])
+def api_import_priority_mail_retail():
+    if "file" not in request.files:
+        return jsonify({"error": "file required"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "empty filename"}), 400
+    eff = (request.form.get("effective_date") or "").strip()
+    if not eff:
+        return jsonify({"error": "effective_date required (YYYY-MM-DD)"}), 400
+    path = Path(watcher.INCOMING) / secure_filename(f.filename)
+    watcher.ensure_dirs()
+    f.save(path)
+    try:
+        result = importer.import_priority_mail_retail(
+            str(path), db.DB_PATH, effective_date=eff
+        )
         path.unlink(missing_ok=True)
         return jsonify(result)
     except Exception as e:
@@ -614,6 +854,8 @@ def api_export_flats_grid_xlsx():
     consolidate = _bool_param("consolidate", False)
     remove_zeros = _bool_param("remove_zeros", False)
     hide_costs = _bool_param("hide_costs", False)
+    hide_customer_numbers = _bool_param("hide_customer_numbers", True)
+    allocate_presort_rejects = _bool_param("allocate_presort_rejects", False)
     sort_key = request.args.get("sort_key") or "date"
     sort_dir = request.args.get("sort_dir", type=int)
     if sort_dir is None:
@@ -631,6 +873,8 @@ def api_export_flats_grid_xlsx():
             consolidate=consolidate,
             remove_zeros=remove_zeros,
             hide_costs=hide_costs,
+            hide_customer_numbers=hide_customer_numbers,
+            allocate_presort_rejects=allocate_presort_rejects,
             sort_key=sort_key,
             sort_dir=sort_dir,
         )
@@ -658,6 +902,8 @@ def api_export_flats_grid_csv():
     consolidate = _bool_param("consolidate", False)
     remove_zeros = _bool_param("remove_zeros", False)
     hide_costs = _bool_param("hide_costs", False)
+    hide_customer_numbers = _bool_param("hide_customer_numbers", True)
+    allocate_presort_rejects = _bool_param("allocate_presort_rejects", False)
     sort_key = request.args.get("sort_key") or "date"
     sort_dir = request.args.get("sort_dir", type=int)
     if sort_dir is None:
@@ -675,6 +921,8 @@ def api_export_flats_grid_csv():
             consolidate=consolidate,
             remove_zeros=remove_zeros,
             hide_costs=hide_costs,
+            hide_customer_numbers=hide_customer_numbers,
+            allocate_presort_rejects=allocate_presort_rejects,
             sort_key=sort_key,
             sort_dir=sort_dir,
         )
@@ -726,22 +974,70 @@ def api_export_ground_advantage_zone_pricing_csv():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/export/profit-report-xlsx")
+@app.route("/api/export/profit-report-xlsx", methods=["GET", "POST"])
 def api_export_profit_report_xlsx():
-    start = request.args.get("start_date")
-    end = request.args.get("end_date")
+    body: dict = {}
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        start = body.get("start_date")
+        end = body.get("end_date")
+        pn = body.get("parent_number")
+        cn = body.get("customer_number")
+        if pn is not None:
+            pn = int(pn)
+        if cn is not None:
+            cn = int(cn)
+        show_parents = bool(body.get("show_parents", True))
+        show_main = bool(body.get("show_main", True))
+        discount = body.get("discount", 0.10)
+        discount_efd = body.get("discount_efd", 0.23)
+        try:
+            discount = float(discount)
+            discount_efd = float(discount_efd)
+        except (TypeError, ValueError):
+            return jsonify({"error": "discount and discount_efd must be numbers"}), 400
+    else:
+        start = request.args.get("start_date")
+        end = request.args.get("end_date")
+        pn = request.args.get("parent_number", type=int)
+        cn = request.args.get("customer_number", type=int)
+        show_parents = _bool_param("show_parents", True)
+        show_main = _bool_param("show_main", True)
+        discount = request.args.get("discount", type=float)
+        if discount is None:
+            discount = 0.10
+        discount_efd = request.args.get("discount_efd", type=float)
+        if discount_efd is None:
+            discount_efd = 0.23
     if not start or not end:
         return jsonify({"error": "start_date and end_date required"}), 400
-    pn = request.args.get("parent_number", type=int)
-    cn = request.args.get("customer_number", type=int)
-    show_parents = _bool_param("show_parents", True)
-    show_main = _bool_param("show_main", True)
-    discount = request.args.get("discount", type=float)
-    if discount is None:
-        discount = 0.10
     if discount < 0:
         return jsonify({"error": "discount must be non-negative"}), 400
+    if discount_efd < 0:
+        return jsonify({"error": "discount_efd must be non-negative"}), 400
     try:
+        conn_pf = db.get_connection()
+        try:
+            if request.method == "POST":
+                profit_ids, parcel_fee, perr = _profit_request_extras_post(conn_pf, body)
+            else:
+                profit_ids, parcel_fee, perr = _profit_request_extras(conn_pf)
+        finally:
+            conn_pf.close()
+        if perr:
+            return jsonify({"error": perr}), 400
+        if request.method == "POST":
+            efd_raw, efd_err = _efd_parcel_fee_from_post_body(body)
+            if efd_err:
+                return jsonify({"error": efd_err}), 400
+            efd_q = efd_raw
+        else:
+            efd_q = request.args.get("efd_parcel_fee", type=float)
+            if efd_q is not None and efd_q < 0:
+                return jsonify({"error": "efd_parcel_fee must be non-negative"}), 400
+        fee_efd, fe_err = _efd_parcel_fee_pair(efd_q, float(parcel_fee))
+        if fe_err:
+            return jsonify({"error": fe_err}), 400
         out = exports.export_profit_report_xlsx(
             start,
             end,
@@ -750,6 +1046,9 @@ def api_export_profit_report_xlsx():
             show_parents=show_parents,
             show_main=show_main,
             flats_discount=float(discount),
+            flats_discount_efd=float(discount_efd),
+            efd_parcel_fee=float(fee_efd),
+            profit_account_ids=profit_ids,
         )
         dt = datetime.strptime(end, "%Y-%m-%d")
         end_label = f"{dt.month}-{dt.day}-{dt.year}"
@@ -776,21 +1075,38 @@ def api_export_profit_report_xlsx():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/profit/flats")
+@app.route("/api/profit/flats", methods=["GET", "POST"])
 def api_profit_flats():
-    start = request.args.get("start_date")
-    end = request.args.get("end_date")
+    body: dict = {}
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        start = body.get("start_date")
+        end = body.get("end_date")
+        pn = body.get("parent_number")
+        cn = body.get("customer_number")
+        if pn is not None:
+            pn = int(pn)
+        if cn is not None:
+            cn = int(cn)
+        show_parents = bool(body.get("show_parents", True))
+        show_main = bool(body.get("show_main", True))
+        discount = body.get("discount", 0.10)
+        try:
+            discount = float(discount)
+        except (TypeError, ValueError):
+            return jsonify({"error": "discount must be a number"}), 400
+    else:
+        start = request.args.get("start_date")
+        end = request.args.get("end_date")
+        pn = request.args.get("parent_number", type=int)
+        cn = request.args.get("customer_number", type=int)
+        show_parents = _bool_param("show_parents", True)
+        show_main = _bool_param("show_main", True)
+        discount = request.args.get("discount", type=float)
+        if discount is None:
+            discount = 0.10
     if not start or not end:
         return jsonify({"error": "start_date and end_date required"}), 400
-
-    pn = request.args.get("parent_number", type=int)
-    cn = request.args.get("customer_number", type=int)
-    show_parents = _bool_param("show_parents", True)
-    show_main = _bool_param("show_main", True)
-
-    discount = request.args.get("discount", type=float)
-    if discount is None:
-        discount = 0.10
     if discount < 0:
         return jsonify({"error": "discount must be non-negative"}), 400
 
@@ -798,6 +1114,13 @@ def api_profit_flats():
     sell_to_rate = round(float(retail_rate) - float(discount), 4)
     try:
         conn = db.get_connection()
+        if request.method == "POST":
+            profit_ids, parcel_fee, perr = _profit_request_extras_post(conn, body)
+        else:
+            profit_ids, parcel_fee, perr = _profit_request_extras(conn)
+        if perr:
+            conn.close()
+            return jsonify({"error": perr}), 400
         totals = db.query_ws3_flats_profit_totals(
             conn,
             start,
@@ -807,6 +1130,7 @@ def api_profit_flats():
             show_parents=show_parents,
             show_main=show_main,
             sell_to_rate=sell_to_rate,
+            profit_account_ids=profit_ids,
         )
         rate_summary = db.query_ws3_flats_profit_rate_type_summary(
             conn,
@@ -817,6 +1141,7 @@ def api_profit_flats():
             show_parents=show_parents,
             show_main=show_main,
             sell_to_rate=sell_to_rate,
+            profit_account_ids=profit_ids,
         )
         detail = db.query_ws3_flats_profit_detail(
             conn,
@@ -827,6 +1152,7 @@ def api_profit_flats():
             show_parents=show_parents,
             show_main=show_main,
             sell_to_rate=sell_to_rate,
+            profit_account_ids=profit_ids,
         )
         conn.close()
 
@@ -842,6 +1168,8 @@ def api_profit_flats():
                             "retail_rate": retail_rate,
                             "discount": float(discount),
                             "sell_to_rate": sell_to_rate,
+                            "profit_accounts": profit_ids,
+                            "parcel_fee": float(parcel_fee),
                         },
                         "totals": totals,
                         "rate_summary": [],
@@ -859,6 +1187,8 @@ def api_profit_flats():
                     "retail_rate": retail_rate,
                     "discount": float(discount),
                     "sell_to_rate": sell_to_rate,
+                    "profit_accounts": profit_ids,
+                    "parcel_fee": float(parcel_fee),
                 },
                 "totals": totals,
                 "rate_summary": rate_summary,
@@ -869,20 +1199,55 @@ def api_profit_flats():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/profit/parcels")
+@app.route("/api/profit/parcels", methods=["GET", "POST"])
 def api_profit_parcels():
-    start = request.args.get("start_date")
-    end = request.args.get("end_date")
+    body: dict = {}
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        start = body.get("start_date")
+        end = body.get("end_date")
+        pn = body.get("parent_number")
+        cn = body.get("customer_number")
+        if pn is not None:
+            pn = int(pn)
+        if cn is not None:
+            cn = int(cn)
+        show_parents = bool(body.get("show_parents", True))
+        show_main = bool(body.get("show_main", True))
+    else:
+        start = request.args.get("start_date")
+        end = request.args.get("end_date")
+        pn = request.args.get("parent_number", type=int)
+        cn = request.args.get("customer_number", type=int)
+        show_parents = _bool_param("show_parents", True)
+        show_main = _bool_param("show_main", True)
     if not start or not end:
         return jsonify({"error": "start_date and end_date required"}), 400
 
-    pn = request.args.get("parent_number", type=int)
-    cn = request.args.get("customer_number", type=int)
-    show_parents = _bool_param("show_parents", True)
-    show_main = _bool_param("show_main", True)
-
     try:
         conn = db.get_connection()
+        if request.method == "POST":
+            profit_ids, parcel_fee, perr = _profit_request_extras_post(conn, body)
+        else:
+            profit_ids, parcel_fee, perr = _profit_request_extras(conn)
+        if perr:
+            conn.close()
+            return jsonify({"error": perr}), 400
+        if request.method == "POST":
+            efd_raw, efd_err = _efd_parcel_fee_from_post_body(body)
+            if efd_err:
+                conn.close()
+                return jsonify({"error": efd_err}), 400
+            efd_q = efd_raw
+        else:
+            efd_q = request.args.get("efd_parcel_fee", type=float)
+            if efd_q is not None and efd_q < 0:
+                conn.close()
+                return jsonify({"error": "efd_parcel_fee must be non-negative"}), 400
+        fee_efd, fe_err = _efd_parcel_fee_pair(efd_q, float(parcel_fee))
+        if fe_err:
+            conn.close()
+            return jsonify({"error": fe_err}), 400
         raw = db.query_parcel_profit_totals(
             conn,
             start,
@@ -891,63 +1256,24 @@ def api_profit_parcels():
             customer_number=cn,
             show_parents=show_parents,
             show_main=show_main,
+            profit_account_ids=profit_ids,
         )
         conn.close()
 
-        parcel_count = int(raw.get("parcel_count") or 0)
-        total_final_postage = float(raw.get("total_final_postage") or 0.0)
-        total_fully_paid_postage = float(raw.get("total_fully_paid_postage") or 0.0)
-        total_billing_amount = float(raw.get("total_billing_amount") or 0.0)
-
-        postage_fee = round(float(parcel_count) * 0.50, 2)
-        lineage_revenue = round(total_billing_amount - total_final_postage + postage_fee, 2)
-        efd_profit = round(total_fully_paid_postage - total_billing_amount - postage_fee, 2)
-
-        lines = [
-            {"line_no": 1, "label": "Parcel count", "kind": "int", "value": parcel_count},
-            {"line_no": 3, "label": "Final Postage total", "kind": "money", "value": round(total_final_postage, 2)},
-            {
-                "line_no": 4,
-                "label": "Fully Paid Postage total",
-                "kind": "money",
-                "value": round(total_fully_paid_postage, 2),
-            },
-            {
-                "line_no": 5,
-                "label": "Billing Amount total",
-                "kind": "money",
-                "value": round(total_billing_amount, 2),
-            },
-            {
-                "line_no": 6,
-                "label": "Postage fee (qty × $0.50)",
-                "kind": "money",
-                "value": postage_fee,
-            },
-            {
-                "line_no": 7,
-                "label": "Lineage Revenue",
-                "kind": "money",
-                "value": lineage_revenue,
-            },
-            {
-                "line_no": 8,
-                "label": "EFD Profit",
-                "kind": "money",
-                "value": efd_profit,
-            },
-        ]
+        pp = db.parcel_profit_from_raw(raw, parcel_fee_per_piece=float(parcel_fee))
 
         return jsonify(
             {
-                "meta": {"start_date": start, "end_date": end},
-                "raw": raw,
-                "computed": {
-                    "postage_fee": postage_fee,
-                    "lineage_revenue": lineage_revenue,
-                    "efd_profit": efd_profit,
+                "meta": {
+                    "start_date": start,
+                    "end_date": end,
+                    "profit_accounts": profit_ids,
+                    "parcel_fee": float(parcel_fee),
+                    "efd_parcel_fee": float(fee_efd),
                 },
-                "lines": lines,
+                "raw": raw,
+                "computed": pp["computed"],
+                "lines": pp["lines"],
             }
         )
     except Exception as e:
@@ -1009,6 +1335,7 @@ def api_export_parcel_counts_xlsx():
     show_main = _bool_param("show_main", True)
     consolidate = _bool_param("consolidate", False)
     remove_zeros = _bool_param("remove_zeros", False)
+    hide_customer_numbers = _bool_param("hide_customer_numbers", True)
     try:
         out = exports.export_parcel_counts_report_xlsx(
             start,
@@ -1020,6 +1347,7 @@ def api_export_parcel_counts_xlsx():
             consolidate=consolidate,
             remove_zeros=remove_zeros,
             hide_costs=False,
+            hide_customer_numbers=hide_customer_numbers,
         )
         name = exports.parcel_counts_download_name(start, end, pn, cn)
         return send_file(
@@ -1073,6 +1401,16 @@ def api_export_efd_parcel_invoice_xlsx():
     cn = request.args.get("customer_number", type=int)
     show_parents = _bool_param("show_parents", True)
     show_main = _bool_param("show_main", True)
+    # Prefer efd_parcel_fee; fall back to parcel_fee for older bookmarked URLs.
+    efd_q = request.args.get("efd_parcel_fee", type=float)
+    if efd_q is not None and efd_q < 0:
+        return jsonify({"error": "efd_parcel_fee must be non-negative"}), 400
+    parcel_fb = request.args.get("parcel_fee", type=float)
+    if parcel_fb is not None and parcel_fb < 0:
+        return jsonify({"error": "parcel_fee must be non-negative"}), 400
+    fee_efd, fe_err = _efd_parcel_fee_pair(efd_q, parcel_fb)
+    if fe_err:
+        return jsonify({"error": fe_err}), 400
     try:
         out, title = exports.export_efd_parcel_invoice_xlsx(
             start,
@@ -1081,6 +1419,7 @@ def api_export_efd_parcel_invoice_xlsx():
             cn,
             show_parents=show_parents,
             show_main=show_main,
+            efd_parcel_fee=float(fee_efd),
         )
         name = exports.efd_parcel_invoice_download_name(
             title, parent_number=pn, customer_number=cn, end_date=end
@@ -1091,6 +1430,63 @@ def api_export_efd_parcel_invoice_xlsx():
             download_name=name,
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/export/efd-weekly-invoice-xlsx")
+def api_export_efd_weekly_invoice_xlsx():
+    start = request.args.get("start_date")
+    end = request.args.get("end_date")
+    if not start or not end:
+        return jsonify({"error": "start_date and end_date required"}), 400
+    discount = request.args.get("discount", type=float)
+    if discount is None:
+        discount = 0.10
+    if discount < 0:
+        return jsonify({"error": "discount must be non-negative"}), 400
+    efd_q = request.args.get("efd_parcel_fee", type=float)
+    if efd_q is not None and efd_q < 0:
+        return jsonify({"error": "efd_parcel_fee must be non-negative"}), 400
+    parcel_fb = request.args.get("parcel_fee", type=float)
+    if parcel_fb is not None and parcel_fb < 0:
+        return jsonify({"error": "parcel_fee must be non-negative"}), 400
+    fee_efd, fe_err = _efd_parcel_fee_pair(efd_q, parcel_fb)
+    if fe_err:
+        return jsonify({"error": fe_err}), 400
+    show_parents = _bool_param("show_parents", True)
+    show_main = _bool_param("show_main", True)
+    remove_zeros = _bool_param("remove_zeros", False)
+    hide_costs = _bool_param("hide_costs", False)
+    hide_savings = _bool_param("hide_savings", False)
+    pn = request.args.get("parent_number", type=int)
+    try:
+        out = exports.export_efd_weekly_invoice_xlsx(
+            start,
+            end,
+            discount=float(discount),
+            efd_parcel_fee=float(fee_efd),
+            show_parents=show_parents,
+            show_main=show_main,
+            remove_zeros=remove_zeros,
+            hide_costs=hide_costs,
+            hide_savings=hide_savings,
+            parent_number=pn,
+        )
+        if pn is not None:
+            name = exports.efd_weekly_account_download_name(
+                exports.efd_weekly_summary_label(int(pn)), start, end
+            )
+        else:
+            name = exports.efd_weekly_invoice_download_name(start, end)
+        return send_file(
+            out,
+            as_attachment=True,
+            download_name=name,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1108,7 +1504,7 @@ def api_export_consolidated_volumes_xlsx():
     consolidate = _bool_param("consolidate", False)
     remove_zeros = _bool_param("remove_zeros", True)
     hide_summary_money = _bool_param("hide_costs", True)
-    remove_customer_numbers = _bool_param("remove_customer_numbers", True)
+    hide_customer_numbers = _bool_param("hide_customer_numbers", True)
     scope = (request.args.get("account_scope") or "All Accounts").strip() or "All Accounts"
     parcel_discount = request.args.get("parcel_discount", type=float)
     if parcel_discount is None:
@@ -1126,7 +1522,57 @@ def api_export_consolidated_volumes_xlsx():
             consolidate=consolidate,
             remove_zeros=remove_zeros,
             hide_costs_summary=hide_summary_money,
-            remove_customer_numbers=remove_customer_numbers,
+            hide_customer_numbers=hide_customer_numbers,
+            account_scope_label=scope,
+            parcel_discount=float(parcel_discount),
+        )
+        name = exports_consolidated_volumes.consolidated_volumes_download_name(scope, end)
+        return send_file(
+            out,
+            as_attachment=True,
+            download_name=name,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/export/efd-daily-volumes-xlsx")
+def api_export_efd_daily_volumes_xlsx():
+    """Consolidated volumes XLS for one EFD parent (3901, 3899, or 3900)."""
+    start = request.args.get("start_date")
+    end = request.args.get("end_date")
+    if not start or not end:
+        return jsonify({"error": "start_date and end_date required"}), 400
+    pn = request.args.get("parent_number", type=int)
+    if pn is None:
+        return jsonify({"error": "parent_number required"}), 400
+    show_parents = _bool_param("show_parents", True)
+    show_main = _bool_param("show_main", True)
+    consolidate = _bool_param("consolidate", False)
+    remove_zeros = _bool_param("remove_zeros", True)
+    hide_summary_money = _bool_param("hide_costs", True)
+    hide_customer_numbers = _bool_param("hide_customer_numbers", True)
+    parcel_discount = request.args.get("parcel_discount", type=float)
+    if parcel_discount is None:
+        parcel_discount = 0.25
+    if parcel_discount < 0:
+        return jsonify({"error": "parcel_discount must be non-negative"}), 400
+    try:
+        scope = exports.efd_report_scope_label(int(pn))
+        out = exports_consolidated_volumes.export_consolidated_volumes_xlsx(
+            start,
+            end,
+            int(pn),
+            None,
+            show_parents=show_parents,
+            show_main=show_main,
+            consolidate=consolidate,
+            remove_zeros=remove_zeros,
+            hide_costs_summary=hide_summary_money,
+            hide_customer_numbers=hide_customer_numbers,
             account_scope_label=scope,
             parcel_discount=float(parcel_discount),
         )

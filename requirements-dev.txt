@@ -1,0 +1,5 @@
+# Development and test dependencies only. Do not install on production servers.
+# Includes runtime deps via -r requirements.txt (same as: pip install -r requirements.txt -r requirements-dev.txt).
+-r requirements.txt
+pytest>=8.0.0
+pygments>=2.15.0

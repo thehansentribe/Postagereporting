@@ -1,6 +1,8 @@
 """Tests for importer helpers."""
 
+import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 from openpyxl import Workbook
@@ -27,6 +29,102 @@ def test_strip_zeros(raw, expected):
 def test_strip_zeros_invalid():
     assert importer.strip_zeros("abc") is None
     assert importer.strip_zeros(None) is None
+
+
+def _raw_export_row_14(customer: str, code: Any, parent_company: Any = None) -> list[Any]:
+    r: list[Any] = [None] * 14
+    r[0], r[1], r[13] = customer, code, parent_company
+    return r
+
+
+def test_import_customers_raw_export_resolves_parent_by_name(monkeypatch, tmp_path):
+    import db as dbmod
+
+    db_path = tmp_path / "c.db"
+    monkeypatch.setattr(dbmod, "DB_PATH", db_path)
+    dbmod.init_db()
+    p = tmp_path / "raw.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(_raw_export_row_14("Customer", "Code", "Parent Company"))
+    ws.append(_raw_export_row_14("ParentCo", "100", None))
+    ws.append(_raw_export_row_14("Child One", "200", "ParentCo"))
+    wb.save(p)
+    wb.close()
+
+    out = importer.import_customers_raw_export_xlsx(str(p), db_path)
+    assert out["rows_imported"] == 2
+    assert not out["warnings"]
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT customer_name, parent_number, parent_name FROM customers WHERE customer_number = 200"
+        ).fetchone()
+        assert row[0] == "Child One"
+        assert row[1] == 100
+        assert row[2] == "ParentCo"
+    finally:
+        conn.close()
+
+
+def test_import_customers_raw_export_unresolved_parent_warning(monkeypatch, tmp_path):
+    import db as dbmod
+
+    db_path = tmp_path / "c.db"
+    monkeypatch.setattr(dbmod, "DB_PATH", db_path)
+    dbmod.init_db()
+    p = tmp_path / "raw.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(_raw_export_row_14("Customer", "Code", "Parent Company"))
+    ws.append(_raw_export_row_14("Kid", "300", "NoSuchParent"))
+    wb.save(p)
+    wb.close()
+
+    out = importer.import_customers_raw_export_xlsx(str(p), db_path)
+    assert out["rows_imported"] == 1
+    assert any("unknown in column A" in w for w in out["warnings"])
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT parent_number, parent_name FROM customers WHERE customer_number = 300"
+        ).fetchone()
+        assert row[0] is None
+        assert row[1] == "NoSuchParent"
+    finally:
+        conn.close()
+
+
+def test_import_customers_raw_export_duplicate_name_first_code_wins(monkeypatch, tmp_path):
+    import db as dbmod
+
+    db_path = tmp_path / "c.db"
+    monkeypatch.setattr(dbmod, "DB_PATH", db_path)
+    dbmod.init_db()
+    p = tmp_path / "raw.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(_raw_export_row_14("Customer", "Code", "Parent Company"))
+    ws.append(_raw_export_row_14("DupName", "10", None))
+    ws.append(_raw_export_row_14("DupName", "20", None))
+    ws.append(_raw_export_row_14("Kid", "30", "DupName"))
+    wb.save(p)
+    wb.close()
+
+    out = importer.import_customers_raw_export_xlsx(str(p), db_path)
+    assert out["rows_imported"] == 3
+    assert any("Duplicate customer name" in w for w in out["warnings"])
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT parent_number FROM customers WHERE customer_number = 30"
+        ).fetchone()
+        assert row[0] == 10
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize(
@@ -178,6 +276,79 @@ def test_import_bm_csv_diverts_othercls_1120_to_presort_rejects(monkeypatch, tmp
         conn.close()
 
 
+def test_import_bm_csv_rejects_different_file_same_report_date(monkeypatch, tmp_path):
+    """A second BM file for the same report date must not double-count."""
+    import db as dbmod
+
+    db_path = tmp_path / "imp.db"
+    monkeypatch.setattr(dbmod, "DB_PATH", db_path)
+    dbmod.init_db()
+
+    conn = dbmod.get_connection()
+    try:
+        conn.execute("INSERT INTO customers (customer_number, customer_name) VALUES (88, 'Co')")
+        conn.execute(
+            "INSERT INTO postage_imports (file_name, file_date, row_count) VALUES ('other_report.csv', '2026-05-01', 1)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    p = tmp_path / "BM_5_1_26_report.csv"
+    p.write_text(
+        "Account Code,Class,Weight  (oz.),Pieces,Total Cost\n88,1CA5DFlt,2.0,1,1.5\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="already imported"):
+        importer.import_bm_csv(str(p), db_path, file_date_override="2026-05-01")
+
+    conn = dbmod.get_connection()
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM postage_imports WHERE file_name = ?", (p.name,)
+        ).fetchone()[0]
+        assert int(n) == 0
+    finally:
+        conn.close()
+
+
+def test_import_bm_csv_replace_same_filename_allowed(monkeypatch, tmp_path):
+    """Re-importing the same BM report file replaces the prior import for that filename."""
+    import db as dbmod
+
+    db_path = tmp_path / "imp.db"
+    monkeypatch.setattr(dbmod, "DB_PATH", db_path)
+    dbmod.init_db()
+
+    conn = dbmod.get_connection()
+    try:
+        conn.execute("INSERT INTO customers (customer_number, customer_name) VALUES (88, 'Co')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    p = tmp_path / "BM_5_1_26_report.csv"
+    body = "Account Code,Class,Weight  (oz.),Pieces,Total Cost\n88,1CA5DFlt,2.0,1,1.5\n"
+    p.write_text(body, encoding="utf-8")
+    out1 = importer.import_bm_csv(str(p), db_path, file_date_override="2026-05-01")
+    assert out1["rows_imported"] == 1
+    out2 = importer.import_bm_csv(str(p), db_path, file_date_override="2026-05-01")
+    assert out2["rows_imported"] == 1
+
+    conn = dbmod.get_connection()
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM postage_imports WHERE file_name = ?", (p.name,)
+        ).fetchone()[0]
+        assert int(n) == 1
+        n_data = conn.execute(
+            "SELECT COUNT(*) FROM postage_data WHERE file_date = '2026-05-01'"
+        ).fetchone()[0]
+        assert int(n_data) == 1
+    finally:
+        conn.close()
+
+
 def test_parse_bm_raw_csv_commas_in_numbers(tmp_path):
     """Thousands separators in weight and pieces must parse."""
     p = tmp_path / "BM_1_2_26.csv"
@@ -245,3 +416,110 @@ def test_read_bm_report_date_from_xlsx_mismatch_raises(tmp_path):
 
     with pytest.raises(ValueError, match=r"BM report date mismatch"):
         importer.read_bm_report_date_from_xlsx(str(p))
+
+
+@pytest.mark.parametrize(
+    "filename,expected",
+    [
+        ("Priority mail zones 4-27-26.xlsx", "2026-04-27"),
+        ("zones 12-1-25.xlsx", "2025-12-01"),
+    ],
+)
+def test_parse_priority_mail_filename_effective_date(filename, expected):
+    assert importer.parse_priority_mail_filename_effective_date(filename) == expected
+
+
+def test_parse_priority_mail_filename_effective_date_missing():
+    assert importer.parse_priority_mail_filename_effective_date("zones.xlsx") is None
+
+
+def test_parse_compact_priority_mail_zone_matrix_alt_zones_only_header_row():
+    """Layout matching 'Priority mail zones 4-27-26.xlsx': zones 1–9 in row 1 A–I, lb in column A."""
+    raw = [
+        [1, 2, 3, 4, 5, 6, 7, 8, 9],
+        [
+            1,
+            11,
+            11.5,
+            11.65,
+            11.9,
+            13.05,
+            14.5,
+            15.6,
+            16.95,
+            34.25,
+        ],
+        [2, 11.95, 12.65, 13.45, 14.35, 16.85, 18.15, 19.45, 21.55, 42.4],
+        [3, 12.45, 13.3, 14, 15.15, 18.05, 20.95, 23.85, 27.1, 53.45],
+    ]
+    rows = importer._parse_compact_priority_mail_zone_matrix_xlsx(
+        raw, "zones.xlsx", effective_date="2026-04-27"
+    )
+    assert rows is not None and len(rows) == 27
+    w1_z1 = next(
+        r
+        for r in rows
+        if r["weight_max"] == 1.0 and r["zone"] == 1 and r["effective_date"] == "2026-04-27"
+    )
+    assert w1_z1["price"] == 11
+    assert w1_z1["row_type"] == "matrix"
+
+
+def test_parse_compact_priority_mail_zone_matrix_alt_header_zones_permutes_columns():
+    """Headers may list zones out of USPS order as long as 1–9 appear once."""
+    raw = [[9, 8, 7, 6, 5, 4, 3, 2, 1], [1.0] + list(range(10, 19))]
+    rows = importer._parse_compact_priority_mail_zone_matrix_xlsx(raw, "p.xlsx", effective_date=None)
+    assert rows is not None and len(rows) == 9
+    by_zone = {r["zone"]: r["price"] for r in rows}
+    assert by_zone == {z: float(19 - z) for z in range(1, 10)}
+
+
+def test_import_priority_mail_retail_replaces_same_effective_slice_only(monkeypatch, tmp_path):
+    import sqlite3
+
+    import db as db_actual
+
+    db_path = tmp_path / "prio.db"
+    monkeypatch.setattr(db_actual, "DB_PATH", db_path)
+    db_actual.init_db()
+    conn = db_actual.get_connection()
+    conn.executemany(
+        """
+        INSERT INTO priority_mail_retail (
+            effective_date, row_type, zone, weight_unit, weight_max, price, sort_group, sort_order
+        ) VALUES (?, 'matrix', ?, 'lb', ?, ?, 1, ?)
+        """,
+        [
+            ("2020-01-01", 3, 1.0, 1.0, 0),
+            ("2026-06-01", 4, 1.0, 2.0, 0),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    xlsx = tmp_path / "mat.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["(lbs.)", 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    ws.append([1, 11, 11, 11, 11, 11, 11, 11, 11, 11])
+    wb.save(xlsx)
+
+    out = importer.import_priority_mail_retail(str(xlsx), db_path, effective_date="2026-06-01")
+    assert out["effective_date"] == "2026-06-01"
+    assert out["rows_imported"] == 9
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT zone, price, effective_date FROM priority_mail_retail ORDER BY effective_date, zone"
+        ).fetchall()
+        by_eff: dict[str, list[tuple]] = {}
+        for z, price, eff in rows:
+            by_eff.setdefault(eff, []).append((z, price))
+        assert "2020-01-01" in by_eff
+        assert any(z == 3 and price == 1.0 for z, price in by_eff["2020-01-01"])
+        june = by_eff.get("2026-06-01", [])
+        assert len(june) == 9
+        assert all(z in range(1, 10) and price == 11.0 for z, price in june)
+    finally:
+        conn.close()
