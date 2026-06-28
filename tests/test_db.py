@@ -454,9 +454,14 @@ def test_export_parcel_report_workbook(monkeypatch):
     )
 
 
-def test_export_parcel_zone_summary_includes_af_hm_sections(monkeypatch):
+def test_export_parcel_zone_summary_includes_af_hm_sections(monkeypatch, tmp_path):
     """Parcel Invoice workbook: over-10lb block, then per-customer invoice table below the zone grid."""
     from openpyxl import load_workbook
+
+    # Isolate from the ambient postage.db: the export queries billing_records via
+    # db.get_connection(), so the schema must exist (it is empty here).
+    monkeypatch.setattr(dbmod, "DB_PATH", tmp_path / "afhm.db")
+    dbmod.init_db()
 
     def fake_af_hm(*_a, **_k):
         return {
