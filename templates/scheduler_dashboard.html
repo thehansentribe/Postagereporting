@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Scheduled Reports</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="header header-with-nav">
+      <a class="btn btn-nav" href="{{ url_for('index') }}">&#8592; Dashboard</a>
+      <a class="btn btn-nav" href="{{ url_for('scheduler.report_settings_page') }}">Report Settings</a>
+      <h1>Scheduled Reports</h1>
+    </header>
+
+    {% set active = 'dashboard' %}{% include '_scheduler_nav.html' %}
+
+    <div id="dashError" class="error-banner hidden" role="alert"></div>
+
+    <section class="panel scheduler-cards" id="summaryCards"></section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Today&apos;s timeline</h2>
+      <div class="table-scroll" id="timelineTable"></div>
+    </section>
+  </div>
+  <script src="{{ url_for('static', filename='scheduler_dashboard.js') }}"></script>
+</body>
+</html>

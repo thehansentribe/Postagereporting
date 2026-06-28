@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Recipient Groups</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="header header-with-nav">
+      <a class="btn btn-nav" href="{{ url_for('index') }}">&#8592; Dashboard</a>
+      <a class="btn btn-nav" href="{{ url_for('scheduler.report_settings_page') }}">Report Settings</a>
+      <h1>Recipient Groups</h1>
+    </header>
+
+    {% set active = 'groups' %}{% include '_scheduler_nav.html' %}
+
+    <div id="groupsError" class="error-banner hidden" role="alert"></div>
+
+    <section class="panel">
+      <h2 class="system-section-title">Groups</h2>
+      <div class="table-scroll" id="groupsTable"></div>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title" id="groupFormTitle">New group</h2>
+      <label class="field grow"><span class="field-label">Group name</span><input type="text" id="groupName" /></label>
+      <label class="field grow"><span class="field-label">Members (one email per line)</span><textarea id="groupMembers" rows="6"></textarea></label>
+      <div class="system-actions">
+        <button type="button" class="btn btn-primary" id="btnSaveGroup">Save group</button>
+        <button type="button" class="btn" id="btnNewGroup">Clear</button>
+      </div>
+    </section>
+  </div>
+  <script src="{{ url_for('static', filename='scheduler_groups.js') }}"></script>
+</body>
+</html>

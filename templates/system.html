@@ -10,6 +10,8 @@
   <div class="page">
     <header class="header header-with-nav">
       <a class="btn btn-nav" href="{{ url_for('index') }}">&#8592; Dashboard</a>
+      <a class="btn btn-nav" href="{{ url_for('scheduler.scheduler_dashboard_page') }}">Scheduled Reports</a>
+      <a class="btn btn-nav" href="{{ url_for('scheduler.report_settings_page') }}">Report Settings</a>
       <h1>System</h1>
     </header>
 
@@ -120,6 +122,30 @@
           <div id="unmatchedAccountsTable"></div>
         </div>
       </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Backup &amp; Restore</h2>
+      <p class="system-hint">
+        <strong>Download backup</strong> saves a <code>.zip</code> of the database and report data.
+        <strong>Restore</strong> loads such a zip back in — useful for moving to another computer or recovering data.
+        Restoring stages the data and takes effect after the app (or Windows service) is restarted; the current
+        database is snapshotted to <code>postage.db.bak-restore-*</code> first, so a restore can be undone.
+      </p>
+      <p class="system-inline-field">
+        <label for="backupIncludeArchives">
+          <input type="checkbox" id="backupIncludeArchives" />
+          Include full audit archives (large — adds processed/ and watch/ history)
+        </label>
+      </p>
+      <div class="system-actions">
+        <button type="button" class="btn btn-primary" id="btnDownloadBackup">Download backup</button>
+      </div>
+      <p class="system-inline-field">
+        <label for="restoreFile">Restore file</label>
+        <input type="file" id="restoreFile" accept=".zip,application/zip" />
+        <button type="button" class="btn btn-run" id="btnRestoreBackup">Restore from backup</button>
+      </p>
     </section>
   </div>
   <!-- Shared datalists: avoids one giant &lt;select&gt; (options × rows) freezing the tab. -->

@@ -55,6 +55,74 @@ def test_parse_ws3_xlsx_minimal(tmp_path):
     assert rows[0]["pcs_rejected"] == 0
 
 
+def test_parse_ws3_xlsx_rate_on_profile_row_is_captured(tmp_path):
+    """This NetSort layout puts the first rate type on the profile-name row."""
+    wb = Workbook()
+    ws = wb.active
+    ws.cell(row=1, column=2, value="Acme Corp")
+    ws.cell(row=1, column=15, value="$ 0.970")
+    ws.cell(row=1, column=17, value="Metered")
+    # Profile name (col H = 8) AND first rate type (col T = 20) on the SAME row.
+    ws.cell(row=2, column=8, value="301079 Acme Profile .970")
+    ws.cell(row=2, column=20, value="ThreeDigitAuto")
+    ws.cell(row=2, column=54, value="9.70")
+    ws.cell(row=2, column=67, value="5")
+    ws.cell(row=2, column=71, value="5")
+    # Second rate type on its own row.
+    ws.cell(row=3, column=20, value="ADC Auto")
+    ws.cell(row=3, column=54, value="4.85")
+    ws.cell(row=3, column=67, value="5")
+    ws.cell(row=3, column=71, value="5")
+    p = tmp_path / "t.xlsx"
+    wb.save(p)
+    wb.close()
+
+    _, _, customers, rows = ws3.parse_ws3_xlsx(str(p))
+    assert customers.get("301079") == "Acme Corp"
+    assert len(rows) == 2
+    assert {r["rate_type"] for r in rows} == {"ThreeDigitAuto", "ADC Auto"}
+    assert all(r["customer_code"] == "301079" for r in rows)
+
+
+def test_process_ws3_mislabeled_xls_imports_rows(monkeypatch, tmp_path):
+    """An OOXML workbook saved with a .xls name must import without LibreOffice."""
+    import db as dbmod
+    import importer
+
+    wb = Workbook()
+    ws = wb.active
+    ws["BI8"] = "040626_F"
+    ws.cell(row=1, column=2, value="Acme Corp")
+    ws.cell(row=1, column=15, value="$ 0.970")
+    ws.cell(row=1, column=17, value="Metered")
+    ws.cell(row=2, column=8, value="301079 Acme Profile .970")
+    ws.cell(row=2, column=20, value="ADC Auto")
+    ws.cell(row=2, column=54, value="9.70")
+    ws.cell(row=2, column=67, value="10")
+    ws.cell(row=2, column=71, value="10")
+    src_xlsx = tmp_path / "src.xlsx"
+    wb.save(src_xlsx)
+    wb.close()
+
+    db_path = tmp_path / "t.db"
+    monkeypatch.setattr(dbmod, "DB_PATH", db_path)
+    dbmod.init_db()
+
+    # Fail loudly if conversion is attempted: a real OOXML file must not be converted.
+    def _no_convert(*_a, **_k):
+        raise AssertionError("convert_xls_to_xlsx should not be called for OOXML content")
+
+    monkeypatch.setattr(importer, "convert_xls_to_xlsx", _no_convert)
+
+    dest = tmp_path / "WS3_FCFL_CustomerMailDetail(9).xls"
+    dest.write_bytes(src_xlsx.read_bytes())
+
+    out = ws3.process_ws3_mail_detail_file(str(dest), db_path)
+    assert out.get("skipped") is False
+    assert out.get("mail_date") == "2026-04-06"
+    assert out.get("rows_imported", 0) >= 1
+
+
 def test_parse_ws3_xlsx_negative_rejected_clamped_to_zero(tmp_path):
     wb = Workbook()
     ws = wb.active

@@ -427,6 +427,118 @@ CREATE INDEX IF NOT EXISTS idx_ground_advantage_retail_effective_date
     ON ground_advantage_retail(effective_date);
 """
 
+SCHEDULER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                        TEXT    NOT NULL,
+    description                 TEXT,
+    enabled                     INTEGER NOT NULL DEFAULT 1,
+    schedule_type               TEXT    NOT NULL,
+    scheduled_time              TEXT,
+    days_of_week_csv            TEXT,
+    day_of_month                INTEGER,
+    one_time_at                 TEXT,
+    effective_start_date        TEXT,
+    effective_end_date          TEXT,
+    subject_template            TEXT    NOT NULL,
+    body_template               TEXT    NOT NULL,
+    data_readiness_mode         TEXT    NOT NULL DEFAULT 'all_required',
+    stale_file_threshold_minutes INTEGER,
+    expiration_hours            INTEGER,
+    send_failure_notification   INTEGER NOT NULL DEFAULT 0,
+    retry_count                 INTEGER NOT NULL DEFAULT 0,
+    retry_delay_seconds         INTEGER NOT NULL DEFAULT 60,
+    created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_enabled ON scheduled_jobs(enabled);
+
+CREATE TABLE IF NOT EXISTS job_required_files (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id           INTEGER NOT NULL,
+    file_path_pattern TEXT   NOT NULL,
+    sort_order       INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (job_id) REFERENCES scheduled_jobs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_job_required_files_job ON job_required_files(job_id);
+
+CREATE TABLE IF NOT EXISTS job_attachments (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id           INTEGER NOT NULL,
+    file_path_pattern TEXT   NOT NULL,
+    sort_order       INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (job_id) REFERENCES scheduled_jobs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_job_attachments_job ON job_attachments(job_id);
+
+CREATE TABLE IF NOT EXISTS job_recipients (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id        INTEGER NOT NULL,
+    email_address TEXT    NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES scheduled_jobs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_job_recipients_job ON job_recipients(job_id);
+
+CREATE TABLE IF NOT EXISTS recipient_groups (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_name TEXT    NOT NULL UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS recipient_group_members (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id      INTEGER NOT NULL,
+    email_address TEXT    NOT NULL,
+    FOREIGN KEY (group_id) REFERENCES recipient_groups(id) ON DELETE CASCADE,
+    UNIQUE (group_id, email_address)
+);
+CREATE INDEX IF NOT EXISTS idx_recipient_group_members_group ON recipient_group_members(group_id);
+
+CREATE TABLE IF NOT EXISTS job_recipient_groups (
+    job_id   INTEGER NOT NULL,
+    group_id INTEGER NOT NULL,
+    PRIMARY KEY (job_id, group_id),
+    FOREIGN KEY (job_id) REFERENCES scheduled_jobs(id) ON DELETE CASCADE,
+    FOREIGN KEY (group_id) REFERENCES recipient_groups(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS execution_log (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    logged_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    job_id             INTEGER,
+    job_name           TEXT,
+    status             TEXT    NOT NULL,
+    base_name          TEXT,
+    recipient_count    INTEGER,
+    resolved_recipients TEXT,
+    resolved_files     TEXT,
+    error_message      TEXT,
+    details_json       TEXT,
+    FOREIGN KEY (job_id) REFERENCES scheduled_jobs(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_execution_log_logged_at ON execution_log(logged_at);
+CREATE INDEX IF NOT EXISTS idx_execution_log_job ON execution_log(job_id);
+CREATE INDEX IF NOT EXISTS idx_execution_log_status ON execution_log(status);
+
+CREATE TABLE IF NOT EXISTS job_fire_history (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id     INTEGER NOT NULL,
+    fire_date  TEXT    NOT NULL,
+    base_name  TEXT,
+    status     TEXT    NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (job_id) REFERENCES scheduled_jobs(id) ON DELETE CASCADE,
+    UNIQUE (job_id, fire_date)
+);
+CREATE INDEX IF NOT EXISTS idx_job_fire_history_job ON job_fire_history(job_id);
+
+CREATE TABLE IF NOT EXISTS scheduler_lock (
+    lock_name  TEXT PRIMARY KEY NOT NULL,
+    locked_at  TIMESTAMP,
+    locked_by  TEXT
+);
+"""
+
 
 # Sentinel mail_class for WS3 presort reject totals on the postage dashboard.
 WS3_REJECT_MAIL_CLASS = "Presort rejects"
@@ -436,11 +548,39 @@ WS3_REJECT_ALLOCATED_MAIL_CLASS = "Rejects"
 PRESORT_REJECT_UNIT_COST_KEY = "presort_reject_unit_cost"
 DEFAULT_PRESORT_REJECT_UNIT_COST = 0.66
 
+# Scheduled report email system settings (Report Settings page).
+SETTING_EMAIL_ROOT_PATH = "emailRootPath"
+SETTING_REPORT_SOURCE_PATH = "reportSourcePath"
+SETTING_POLLING_INTERVAL_SECONDS = "pollingIntervalSeconds"
+SETTING_LOG_RETENTION_DAYS = "logRetentionDays"
+SETTING_DEFAULT_EXPIRATION_HOURS = "defaultExpirationHours"
+SETTING_ADMIN_NOTIFICATION_EMAIL = "adminNotificationEmail"
+SETTING_TIMEZONE = "timezone"
+
+DEFAULT_EMAIL_ROOT_PATH = "\\\\DPM2\\Email\\"
+DEFAULT_REPORT_SOURCE_PATH = ""
+DEFAULT_POLLING_INTERVAL_SECONDS = 60
+DEFAULT_LOG_RETENTION_DAYS = 90
+DEFAULT_DEFAULT_EXPIRATION_HOURS = 4
+DEFAULT_ADMIN_NOTIFICATION_EMAIL = ""
+DEFAULT_TIMEZONE = "America/Chicago"
+
+SCHEDULER_SETTING_DEFAULTS: dict[str, tuple[str, Any]] = {
+    SETTING_EMAIL_ROOT_PATH: ("text", DEFAULT_EMAIL_ROOT_PATH),
+    SETTING_REPORT_SOURCE_PATH: ("text", DEFAULT_REPORT_SOURCE_PATH),
+    SETTING_POLLING_INTERVAL_SECONDS: ("int", DEFAULT_POLLING_INTERVAL_SECONDS),
+    SETTING_LOG_RETENTION_DAYS: ("int", DEFAULT_LOG_RETENTION_DAYS),
+    SETTING_DEFAULT_EXPIRATION_HOURS: ("int", DEFAULT_DEFAULT_EXPIRATION_HOURS),
+    SETTING_ADMIN_NOTIFICATION_EMAIL: ("text", DEFAULT_ADMIN_NOTIFICATION_EMAIL),
+    SETTING_TIMEZONE: ("text", DEFAULT_TIMEZONE),
+}
+
 
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
     _ensure_app_settings(conn)
     return conn
 
@@ -477,6 +617,17 @@ def _migrate_ws3_mail_detail_usps_cost_per_piece(conn: sqlite3.Connection) -> No
     )
 
 
+def _migrate_app_settings_columns(conn: sqlite3.Connection) -> None:
+    for col, typedef in (
+        ("value_text", "TEXT"),
+        ("value_int", "INTEGER"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE app_settings ADD COLUMN {col} {typedef}")
+        except sqlite3.OperationalError:
+            pass
+
+
 def _ensure_app_settings(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -486,6 +637,7 @@ def _ensure_app_settings(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _migrate_app_settings_columns(conn)
     conn.execute(
         """
         INSERT OR IGNORE INTO app_settings (key, value_real)
@@ -493,6 +645,103 @@ def _ensure_app_settings(conn: sqlite3.Connection) -> None:
         """,
         (PRESORT_REJECT_UNIT_COST_KEY, DEFAULT_PRESORT_REJECT_UNIT_COST),
     )
+    _seed_scheduler_settings(conn)
+
+
+def _seed_scheduler_settings(conn: sqlite3.Connection) -> None:
+    for key, (kind, default) in SCHEDULER_SETTING_DEFAULTS.items():
+        row = conn.execute(
+            "SELECT key FROM app_settings WHERE key = ?", (key,)
+        ).fetchone()
+        if row is not None:
+            continue
+        if kind == "text":
+            conn.execute(
+                "INSERT INTO app_settings (key, value_text) VALUES (?, ?)",
+                (key, str(default)),
+            )
+        elif kind == "int":
+            conn.execute(
+                "INSERT INTO app_settings (key, value_int) VALUES (?, ?)",
+                (key, int(default)),
+            )
+
+
+def get_setting(conn: sqlite3.Connection, key: str) -> Any:
+    """Return setting value (text, int, or real) or None if missing."""
+    row = conn.execute(
+        "SELECT value_text, value_int, value_real FROM app_settings WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["value_text"] is not None:
+        return row["value_text"]
+    if row["value_int"] is not None:
+        return int(row["value_int"])
+    if row["value_real"] is not None:
+        return float(row["value_real"])
+    return None
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: Any) -> None:
+    """Upsert a setting; clears unused value columns for the stored type."""
+    if isinstance(value, bool):
+        value = int(value)
+    if isinstance(value, int) and key != PRESORT_REJECT_UNIT_COST_KEY:
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value_int, value_text, value_real)
+            VALUES (?, ?, NULL, NULL)
+            ON CONFLICT(key) DO UPDATE SET
+                value_int = excluded.value_int,
+                value_text = NULL,
+                value_real = NULL
+            """,
+            (key, value),
+        )
+    elif isinstance(value, float):
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value_real, value_text, value_int)
+            VALUES (?, ?, NULL, NULL)
+            ON CONFLICT(key) DO UPDATE SET
+                value_real = excluded.value_real,
+                value_text = NULL,
+                value_int = NULL
+            """,
+            (key, float(value)),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value_text, value_int, value_real)
+            VALUES (?, ?, NULL, NULL)
+            ON CONFLICT(key) DO UPDATE SET
+                value_text = excluded.value_text,
+                value_int = NULL,
+                value_real = NULL
+            """,
+            (key, str(value) if value is not None else ""),
+        )
+
+
+def get_scheduler_settings(conn: sqlite3.Connection) -> dict[str, Any]:
+    """All scheduler/report/email global settings for the Report Settings UI."""
+    out: dict[str, Any] = {}
+    for key in SCHEDULER_SETTING_DEFAULTS:
+        val = get_setting(conn, key)
+        if val is None:
+            _, default = SCHEDULER_SETTING_DEFAULTS[key]
+            val = default
+        out[key] = val
+    return out
+
+
+def set_scheduler_settings(conn: sqlite3.Connection, settings: dict[str, Any]) -> None:
+    for key in SCHEDULER_SETTING_DEFAULTS:
+        if key in settings:
+            set_setting(conn, key, settings[key])
 
 
 def clamp_negative_ws3_reject_counts(conn: sqlite3.Connection) -> dict[str, int]:
@@ -516,6 +765,7 @@ def init_db() -> None:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    conn.executescript(SCHEDULER_SCHEMA)
     _migrate_ws3_profiles_reject_fee(conn)
     _migrate_ws3_mail_detail_usps_cost_per_piece(conn)
     _ensure_app_settings(conn)
@@ -4759,6 +5009,59 @@ def query_report_readiness(
             "ws3_presort": missing_ws3,
         },
     }
+
+
+def query_noclass_records(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    parent_number: int | None = None,
+    customer_number: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Postage rows in [start_date, end_date] whose mail_class is a "non-class" presort
+    code (NOCLASS / OTHERCLS), scoped to the selected account.
+
+    Scope follows the dashboard account filter: a specific child uses its own account,
+    a parent includes all of its children (plus the parent's own account). Returns an
+    empty list when neither parent_number nor customer_number is provided.
+    """
+    if customer_number is not None:
+        account_filter = "c.customer_number = ?"
+        account_params: list[Any] = [int(customer_number)]
+    elif parent_number is not None:
+        account_filter = "(c.parent_number = ? OR c.customer_number = ?)"
+        account_params = [int(parent_number), int(parent_number)]
+    else:
+        return []
+
+    sql = f"""
+        SELECT p.file_date,
+               p.account_code,
+               c.customer_name,
+               UPPER(p.mail_class) AS mail_class,
+               SUM(p.pieces) AS pieces
+        FROM postage_data p
+        JOIN customers c ON p.account_code = c.customer_number
+        WHERE p.file_date BETWEEN ? AND ?
+          AND UPPER(p.mail_class) IN ('NOCLASS', 'OTHERCLS')
+          AND {account_filter}
+        GROUP BY p.file_date, p.account_code, UPPER(p.mail_class)
+        ORDER BY p.file_date, c.customer_name, mail_class
+    """
+    cur = conn.execute(sql, [start_date, end_date, *account_params])
+    out: list[dict[str, Any]] = []
+    for r in cur.fetchall():
+        out.append(
+            {
+                "file_date": str(r["file_date"]),
+                "account_code": int(r["account_code"]),
+                "customer_name": r["customer_name"],
+                "mail_class": str(r["mail_class"]),
+                "pieces": int(r["pieces"] or 0),
+            }
+        )
+    return out
 
 
 def query_summary(

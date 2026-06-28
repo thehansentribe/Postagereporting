@@ -127,6 +127,66 @@ def test_import_customers_raw_export_duplicate_name_first_code_wins(monkeypatch,
         conn.close()
 
 
+def test_resolve_xlsx_path_ooxml_named_xls_copied_to_xlsx(tmp_path):
+    """A real OOXML workbook saved with a .xls name must resolve to a readable .xlsx."""
+    src_xlsx = tmp_path / "real.xlsx"
+    wb = Workbook()
+    wb.active["A1"] = "hello"
+    wb.save(src_xlsx)
+    wb.close()
+
+    mislabeled = tmp_path / "WS3_FCFL_CustomerMailDetail(5).xls"
+    mislabeled.write_bytes(src_xlsx.read_bytes())
+
+    resolved = importer.resolve_xlsx_path(str(mislabeled), out_dir=str(tmp_path))
+    assert resolved.lower().endswith(".xlsx")
+    assert Path(resolved).is_file()
+    # openpyxl rejects .xls extensions, so a readable result proves the copy happened.
+    from openpyxl import load_workbook
+
+    wb2 = load_workbook(resolved, read_only=True, data_only=True)
+    try:
+        assert wb2.active["A1"].value == "hello"
+    finally:
+        wb2.close()
+
+
+def test_resolve_xlsx_path_native_xlsx_returned_unchanged(tmp_path):
+    src_xlsx = tmp_path / "real.xlsx"
+    wb = Workbook()
+    wb.save(src_xlsx)
+    wb.close()
+    assert importer.resolve_xlsx_path(str(src_xlsx)) == str(src_xlsx)
+
+
+def test_resolve_xlsx_path_ole2_routes_to_conversion(tmp_path, monkeypatch):
+    """Genuine legacy BIFF (OLE2 magic) must be sent through LibreOffice conversion."""
+    legacy = tmp_path / "old.xls"
+    legacy.write_bytes(importer._OLE2_MAGIC + b"\x00" * 16)
+
+    calls: list[str] = []
+
+    def fake_convert(path, out_dir=None):
+        calls.append(path)
+        return str(tmp_path / "converted.xlsx")
+
+    monkeypatch.setattr(importer, "convert_xls_to_xlsx", fake_convert)
+    out = importer.resolve_xlsx_path(str(legacy))
+    assert out == str(tmp_path / "converted.xlsx")
+    assert calls == [str(legacy)]
+
+
+def test_resolve_xlsx_path_unknown_xls_falls_back_to_conversion(tmp_path, monkeypatch):
+    """Unknown content with a .xls name preserves prior behavior (convert)."""
+    weird = tmp_path / "mystery.xls"
+    weird.write_bytes(b"not a known magic")
+
+    monkeypatch.setattr(
+        importer, "convert_xls_to_xlsx", lambda path, out_dir=None: "sentinel.xlsx"
+    )
+    assert importer.resolve_xlsx_path(str(weird)) == "sentinel.xlsx"
+
+
 @pytest.mark.parametrize(
     "filename,expected",
     [

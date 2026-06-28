@@ -7,6 +7,7 @@ import csv
 from functools import cmp_to_key
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 from copy import copy
@@ -1701,6 +1702,62 @@ def _short_mdy(date_str: str) -> str:
         return str(date_str)
 
 
+def efd_report_date_range_label(start_date: str, end_date: str) -> str:
+    """Date range suffix for EFD bundle downloads (e.g. 6-8 to 6-12 or 6-8-2026)."""
+    try:
+        s = datetime.strptime(start_date, "%Y-%m-%d")
+        e = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        return f"{_short_mdy(start_date)} to {_short_mdy(end_date)}"
+    if start_date == end_date:
+        return f"{s.month}-{s.day}-{s.year}"
+    if s.year == e.year:
+        return f"{s.month}-{s.day} to {e.month}-{e.day}"
+    return f"{_short_mdy(start_date)} to {_short_mdy(end_date)}"
+
+
+def efd_account_report_download_name(
+    *,
+    title_name: str | None,
+    parent_number: int,
+    report_label: str,
+    start_date: str,
+    end_date: str,
+    ext: str,
+) -> str:
+    """
+    EFD weekly bundle per-account download name.
+
+    Example: "KC Presort LLC -EFD (3906) Parcel invoice 6-8 to 6-12.xlsx"
+    """
+    raw_title = (title_name or report_label).strip()
+    display_title = raw_title if "-EFD" in raw_title else f"{raw_title} -EFD"
+    base = _safe_filename_piece(display_title)
+    date_range = _safe_filename_piece(efd_report_date_range_label(start_date, end_date))
+    ext_clean = str(ext).lstrip(".")
+    return f"{base} ({int(parent_number)}) {report_label} {date_range}.{ext_clean}"
+
+
+def postage_invoice_download_name(
+    *,
+    title_name: str | None,
+    parent_number: int,
+    end_date: str,
+) -> str:
+    """
+    Friendly Postage Invoice download name (standalone Export Postage Invoice).
+
+    Example: "Blue Cross Blue Shield (3901) Postage invoice 6-12-2026.xlsx"
+    """
+    cust_name = _safe_filename_piece((title_name or f"Account {parent_number}").strip())
+    try:
+        dt = datetime.strptime(end_date, "%Y-%m-%d")
+        end_label = _safe_filename_piece(f"{dt.month}-{dt.day}-{dt.year}")
+    except ValueError:
+        end_label = _safe_filename_piece(_short_mdy(end_date))
+    return f"{cust_name} ({int(parent_number)}) Postage invoice {end_label}.xlsx"
+
+
 def parcel_invoice_download_name(*, title_name: str | None, parent_number: int | None, end_date: str) -> str:
     """
     Friendly Parcel Invoice download name.
@@ -2880,6 +2937,182 @@ def export_efd_weekly_invoice_xlsx(
         return out
     finally:
         conn.close()
+
+
+POSTAGE_REPORTS_DIR = db.ROOT / "PostageReports"
+_EFD_WEEKLY_BUNDLE_ACCOUNT_PARENTS: tuple[int, ...] = (3901, 3899, 3900)
+
+
+def efd_weekly_bundle_folder_name(end_date: str) -> str:
+    """Folder name from end date, e.g. ``Weekly EFD 6-12-26``."""
+    try:
+        d = datetime.strptime(end_date, "%Y-%m-%d")
+        yy = d.year % 100
+        return f"Weekly EFD {d.month}-{d.day}-{yy}"
+    except ValueError:
+        return f"Weekly EFD {_short_mdy(end_date)}"
+
+
+def efd_weekly_bundle_output_dir(end_date: str) -> Path:
+    """``PostageReports/Weekly EFD M-D-YY/`` under project root."""
+    out_dir = POSTAGE_REPORTS_DIR / efd_weekly_bundle_folder_name(end_date)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def _efd_weekly_customer_name(parent_number: int) -> str:
+    conn = db.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT customer_name FROM customers WHERE customer_number = ?",
+            (int(parent_number),),
+        ).fetchone()
+        return (row["customer_name"] if row else f"Account {parent_number}").strip()
+    finally:
+        conn.close()
+
+
+def _save_temp_export(temp: Path, out_dir: Path, filename: str) -> None:
+    dest = out_dir / filename
+    shutil.copy2(temp, dest)
+    temp.unlink(missing_ok=True)
+
+
+def save_efd_weekly_bundle(
+    start_date: str,
+    end_date: str,
+    *,
+    discount: float = 0.10,
+    postage_discount: float = 0.10,
+    efd_parcel_fee: float = 1.25,
+    parcel_discount: float = 0.25,
+    show_parents: bool = True,
+    show_main: bool = True,
+    remove_zeros: bool = False,
+    hide_costs: bool = False,
+    hide_savings: bool = False,
+) -> dict[str, Any]:
+    """
+    Generate all 10 EFD weekly bundle reports and save under
+    ``PostageReports/Weekly EFD {end-date}/``.
+    """
+    out_dir = efd_weekly_bundle_output_dir(end_date)
+    folder_relative = f"PostageReports/{efd_weekly_bundle_folder_name(end_date)}"
+    saved: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    try:
+        temp = export_efd_weekly_invoice_xlsx(
+            start_date,
+            end_date,
+            discount=float(discount),
+            efd_parcel_fee=float(efd_parcel_fee),
+            show_parents=show_parents,
+            show_main=show_main,
+            remove_zeros=remove_zeros,
+            hide_costs=hide_costs,
+            hide_savings=hide_savings,
+            parent_number=None,
+        )
+        name = efd_weekly_invoice_download_name(start_date, end_date)
+        _save_temp_export(temp, out_dir, name)
+        saved.append(name)
+    except Exception as e:
+        failed.append({"label": "Weekly invoice (combined)", "error": str(e)})
+
+    for pn in _EFD_WEEKLY_BUNDLE_ACCOUNT_PARENTS:
+        summary_label = efd_weekly_summary_label(pn)
+        try:
+            temp = export_efd_weekly_invoice_xlsx(
+                start_date,
+                end_date,
+                discount=float(discount),
+                efd_parcel_fee=float(efd_parcel_fee),
+                show_parents=show_parents,
+                show_main=show_main,
+                remove_zeros=remove_zeros,
+                hide_costs=hide_costs,
+                hide_savings=hide_savings,
+                parent_number=pn,
+            )
+            name = efd_weekly_account_download_name(summary_label, start_date, end_date)
+            _save_temp_export(temp, out_dir, name)
+            saved.append(name)
+        except Exception as e:
+            failed.append({"label": f"Weekly invoice ({pn})", "error": str(e)})
+
+    for pn in _EFD_WEEKLY_BUNDLE_ACCOUNT_PARENTS:
+        summary_label = efd_weekly_summary_label(pn)
+        try:
+            temp = export_postage_invoice(
+                pn,
+                start_date,
+                end_date,
+                discount=float(postage_discount),
+                show_parents=show_parents,
+                show_main=show_main,
+                remove_zeros=remove_zeros,
+                hide_costs=hide_costs,
+                hide_savings=hide_savings,
+            )
+            cust_name = _efd_weekly_customer_name(pn)
+            name = postage_invoice_download_name(
+                title_name=cust_name,
+                parent_number=pn,
+                end_date=end_date,
+            )
+            _save_temp_export(temp, out_dir, name)
+            saved.append(name)
+        except Exception as e:
+            failed.append({"label": f"Postage invoice ({summary_label})", "error": str(e)})
+
+    for pn in _EFD_WEEKLY_BUNDLE_ACCOUNT_PARENTS:
+        summary_label = efd_weekly_summary_label(pn)
+        try:
+            conn = db.get_connection()
+            try:
+                summary = db.query_parcel_zone_summary(
+                    conn,
+                    start_date,
+                    end_date,
+                    parent_number=pn,
+                    customer_number=None,
+                    show_parents=show_parents,
+                    show_main=show_main,
+                    hide_costs=False,
+                    parcel_discount=float(parcel_discount),
+                )
+            finally:
+                conn.close()
+            temp = export_parcel_zone_summary_xlsx(
+                summary,
+                start_date=start_date,
+                end_date=end_date,
+                parent_number=pn,
+                customer_number=None,
+                show_parents=show_parents,
+                show_main=show_main,
+                parcel_discount=float(parcel_discount),
+            )
+            name = efd_account_report_download_name(
+                title_name=summary.get("title_name"),
+                parent_number=pn,
+                report_label="Parcel invoice",
+                start_date=start_date,
+                end_date=end_date,
+                ext="xlsx",
+            )
+            _save_temp_export(temp, out_dir, name)
+            saved.append(name)
+        except Exception as e:
+            failed.append({"label": f"Parcel invoice ({summary_label})", "error": str(e)})
+
+    return {
+        "folder": str(out_dir.resolve()),
+        "folder_relative": folder_relative,
+        "saved": saved,
+        "failed": failed,
+    }
 
 
 # Stacked zone block uses columns A–I (Parcel Summary Final example.xlsx).

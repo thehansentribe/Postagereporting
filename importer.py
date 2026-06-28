@@ -161,6 +161,56 @@ def convert_xls_to_xlsx(xls_path: str, out_dir: str | None = None) -> str:
     return xlsx_path
 
 
+# Magic bytes: OOXML (.xlsx) files are ZIP archives; legacy BIFF (.xls) are OLE2.
+_OOXML_MAGIC = b"PK\x03\x04"
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _sniff_spreadsheet_magic(path: str) -> str | None:
+    """Return 'ooxml', 'ole2', or None based on the file's leading bytes."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return None
+    if head.startswith(_OOXML_MAGIC):
+        return "ooxml"
+    if head.startswith(_OLE2_MAGIC):
+        return "ole2"
+    return None
+
+
+def resolve_xlsx_path(path: str, out_dir: str | None = None) -> str:
+    """
+    Return a path that openpyxl can open, deciding by file content not extension.
+
+    - OOXML (ZIP) content: already an .xlsx workbook. If the on-disk name does not
+      end in .xlsx, copy it to a temp .xlsx (openpyxl rejects any path ending in
+      .xls even when the bytes are valid OOXML), otherwise return it unchanged.
+    - Legacy BIFF (OLE2) content: convert via LibreOffice.
+    - Unknown content: fall back to extension (.xls -> convert, else as-is).
+    """
+    kind = _sniff_spreadsheet_magic(path)
+    low = path.lower()
+
+    if kind == "ooxml":
+        if low.endswith(".xlsx"):
+            return path
+        out_dir = out_dir or tempfile.gettempdir()
+        os.makedirs(out_dir, exist_ok=True)
+        stem = re.sub(r"\.(xls|xlsx)$", "", os.path.basename(path), flags=re.IGNORECASE)
+        dest = os.path.join(out_dir, f"{stem}.xlsx")
+        shutil.copyfile(path, dest)
+        return dest
+
+    if kind == "ole2":
+        return convert_xls_to_xlsx(path, out_dir)
+
+    if low.endswith(".xls") and not low.endswith(".xlsx"):
+        return convert_xls_to_xlsx(path, out_dir)
+    return path
+
+
 def parse_bm_xlsx(xlsx_path: str) -> list[dict[str, Any]]:
     wb = load_workbook(xlsx_path, read_only=True, data_only=True)
     ws = wb.active
@@ -421,13 +471,10 @@ def process_bm_file(
     file_date_override: str | None = None
     if low.endswith(".csv"):
         rows = parse_bm_raw_csv(xls_path)
-    elif low.endswith(".xls") and not low.endswith(".xlsx"):
-        xlsx_path = convert_xls_to_xlsx(xls_path)
+    else:
+        xlsx_path = resolve_xlsx_path(xls_path)
         file_date_override = read_bm_report_date_from_xlsx(xlsx_path)
         rows = parse_bm_xlsx(xlsx_path)
-    else:
-        file_date_override = read_bm_report_date_from_xlsx(xls_path)
-        rows = parse_bm_xlsx(xls_path)
     csv_path = write_report_csv(rows, xls_path, csv_out_dir)
     return import_bm_csv(csv_path, db_path, file_date_override=file_date_override)
 

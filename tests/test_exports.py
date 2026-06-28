@@ -699,6 +699,56 @@ def test_efd_weekly_account_download_name() -> None:
     ) == "EFD Zinnia 4-1-2026.xlsx"
 
 
+def test_efd_report_date_range_label() -> None:
+    assert exports.efd_report_date_range_label("2026-06-08", "2026-06-12") == "6-8 to 6-12"
+    assert exports.efd_report_date_range_label("2026-06-08", "2026-06-08") == "6-8-2026"
+    assert exports.efd_report_date_range_label("2025-12-31", "2026-01-02") == "12-31-2025 to 1-2-2026"
+
+
+def test_efd_account_report_download_name() -> None:
+    n = exports.efd_account_report_download_name(
+        title_name="KC Presort LLC",
+        parent_number=3906,
+        report_label="Parcel invoice",
+        start_date="2026-06-08",
+        end_date="2026-06-12",
+        ext="xlsx",
+    )
+    assert n == "KC Presort LLC -EFD (3906) Parcel invoice 6-8 to 6-12.xlsx"
+
+    n2 = exports.efd_account_report_download_name(
+        title_name="Blue Cross Blue Shield -EFD Mailing",
+        parent_number=3901,
+        report_label="Flats Report",
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        ext="csv",
+    )
+    assert n2 == "Blue Cross Blue Shield -EFD Mailing (3901) Flats Report 4-1-2026.csv"
+
+
+def test_postage_invoice_download_name() -> None:
+    n = exports.postage_invoice_download_name(
+        title_name="Blue Cross Blue Shield",
+        parent_number=3901,
+        end_date="2026-06-12",
+    )
+    assert n == "Blue Cross Blue Shield (3901) Postage invoice 6-12-2026.xlsx"
+
+
+def test_efd_weekly_bundle_folder_name() -> None:
+    assert exports.efd_weekly_bundle_folder_name("2026-06-12") == "Weekly EFD 6-12-26"
+    assert exports.efd_weekly_bundle_folder_name("2026-01-05") == "Weekly EFD 1-5-26"
+
+
+def test_efd_weekly_bundle_output_dir(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(exports, "POSTAGE_REPORTS_DIR", tmp_path / "PostageReports")
+    out_dir = exports.efd_weekly_bundle_output_dir("2026-06-12")
+    assert out_dir.is_dir()
+    assert out_dir.name == "Weekly EFD 6-12-26"
+    assert out_dir.parent == tmp_path / "PostageReports"
+
+
 def test_export_efd_weekly_invoice_single_account_workbook(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "efd_weekly_single.db"

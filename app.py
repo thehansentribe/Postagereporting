@@ -4,22 +4,28 @@ from __future__ import annotations
 
 from datetime import datetime
 import os
+import tempfile
 import threading
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, after_this_request, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
+import backup_restore
 import db
 import exports
 import exports_consolidated_volumes
 import importer
 import watcher
+from scheduler_api import register_scheduler
+import scheduler as report_scheduler
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
+register_scheduler(app)
 
 _watcher_started = False
 _watcher_lock = threading.Lock()
+_scheduler_started = False
 
 
 # Keep this string identical to the XLSX export's no-data guidance (exports.py).
@@ -30,12 +36,15 @@ _WS3_FLATS_PROFIT_NO_DATA_MSG = (
 
 
 def _ensure_watcher() -> None:
-    global _watcher_started
+    global _watcher_started, _scheduler_started
     with _watcher_lock:
         if not _watcher_started:
             t = threading.Thread(target=watcher.watch_loop, kwargs={"interval_sec": 60}, daemon=True)
             t.start()
             _watcher_started = True
+        if not _scheduler_started:
+            report_scheduler.ensure_scheduler()
+            _scheduler_started = True
 
 
 def _bool_param(name: str, default: bool = False) -> bool:
@@ -143,6 +152,55 @@ def customers_hierarchy() -> str:
 @app.route("/system")
 def system_page() -> str:
     return render_template("system.html")
+
+
+@app.route("/api/system/backup")
+def api_system_backup():
+    include_archives = _bool_param("include_archives", False)
+    try:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        tmp = Path(tempfile.gettempdir()) / f"postage-backup-{stamp}.zip"
+        backup_restore.create_backup(tmp, include_archives=include_archives)
+
+        @after_this_request
+        def _cleanup(resp):
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return resp
+
+        return send_file(
+            tmp,
+            as_attachment=True,
+            download_name=tmp.name,
+            mimetype="application/zip",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/system/restore", methods=["POST"])
+def api_system_restore():
+    if "file" not in request.files:
+        return jsonify({"error": "file required"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "empty filename"}), 400
+    if not f.filename.lower().endswith(".zip"):
+        return jsonify({"error": "Restore requires a .zip backup file"}), 400
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tmp = Path(tempfile.gettempdir()) / f"postage-restore-{stamp}-{secure_filename(f.filename)}"
+    try:
+        f.save(tmp)
+        result = backup_restore.stage_restore(tmp)
+        tmp.unlink(missing_ok=True)
+        if not result.get("ok"):
+            return jsonify({"error": result.get("error") or "Invalid backup"}), 400
+        return jsonify(result)
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/system/flats-retail")
@@ -674,6 +732,29 @@ def api_reports_readiness():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/postage/noclass")
+def api_postage_noclass():
+    start = request.args.get("start_date")
+    end = request.args.get("end_date")
+    if not start or not end:
+        return jsonify({"error": "start_date and end_date required"}), 400
+    try:
+        pn = request.args.get("parent_number", type=int)
+        cn = request.args.get("customer_number", type=int)
+        conn = db.get_connection()
+        records = db.query_noclass_records(
+            conn,
+            start,
+            end,
+            parent_number=pn,
+            customer_number=cn,
+        )
+        conn.close()
+        return jsonify({"records": records})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/watcher/status")
 def api_watcher_status():
     try:
@@ -820,7 +901,6 @@ def api_export_postage_invoice():
             hide_costs=hide_costs,
             hide_savings=hide_savings,
         )
-        # Friendly download name: "Customer (1234) Postage invoice M-D-YYYY.xlsx"
         conn = db.get_connection()
         row = conn.execute(
             "SELECT customer_name FROM customers WHERE customer_number = ?",
@@ -828,9 +908,11 @@ def api_export_postage_invoice():
         ).fetchone()
         conn.close()
         cust_name = (row["customer_name"] if row else f"Account {pn}").strip()
-        dt = datetime.strptime(end, "%Y-%m-%d")
-        end_label = f"{dt.month}-{dt.day}-{dt.year}"
-        name = f"{cust_name} ({pn}) Postage invoice {end_label}.xlsx"
+        name = exports.postage_invoice_download_name(
+            title_name=cust_name,
+            parent_number=int(pn),
+            end_date=end,
+        )
         return send_file(
             out,
             as_attachment=True,
@@ -926,9 +1008,11 @@ def api_export_flats_grid_csv():
             sort_key=sort_key,
             sort_dir=sort_dir,
         )
+        efd_weekly_bundle = _bool_param("efd_weekly_bundle", False)
         dt = datetime.strptime(end, "%Y-%m-%d")
         end_label = f"{dt.month}-{dt.day}-{dt.year}"
         scope = "All Accounts"
+        cust_name = None
         if pn is not None:
             conn = db.get_connection()
             row = conn.execute(
@@ -947,7 +1031,17 @@ def api_export_flats_grid_csv():
             conn.close()
             cust_name = (row["customer_name"] if row else f"Account {cn}").strip()
             scope = f"{cust_name} ({cn})"
-        name = f"{scope} Flats Report {end_label}.csv"
+        if efd_weekly_bundle and pn is not None:
+            name = exports.efd_account_report_download_name(
+                title_name=cust_name,
+                parent_number=int(pn),
+                report_label="Flats Report",
+                start_date=start,
+                end_date=end,
+                ext="csv",
+            )
+        else:
+            name = f"{scope} Flats Report {end_label}.csv"
         return send_file(
             out,
             as_attachment=True,
@@ -1491,6 +1585,80 @@ def api_export_efd_weekly_invoice_xlsx():
         return jsonify({"error": str(e)}), 500
 
 
+def _bool_from_payload(payload: dict, name: str, default: bool = False) -> bool:
+    if name not in payload:
+        return default
+    v = payload[name]
+    return str(v).lower() in ("1", "true", "yes", "on")
+
+
+@app.route("/api/export/efd-weekly-bundle", methods=["POST"])
+def api_export_efd_weekly_bundle():
+    body = request.get_json(silent=True) or {}
+    start = body.get("start_date") or request.args.get("start_date")
+    end = body.get("end_date") or request.args.get("end_date")
+    if not start or not end:
+        return jsonify({"error": "start_date and end_date required"}), 400
+    discount = body.get("discount", request.args.get("discount", type=float))
+    if discount is None:
+        discount = 0.10
+    else:
+        discount = float(discount)
+    if discount < 0:
+        return jsonify({"error": "discount must be non-negative"}), 400
+    efd_q = body.get("efd_parcel_fee", request.args.get("efd_parcel_fee"))
+    parcel_fb = body.get("parcel_fee", request.args.get("parcel_fee"))
+    efd_q_f = float(efd_q) if efd_q is not None else None
+    parcel_fb_f = float(parcel_fb) if parcel_fb is not None else None
+    if efd_q_f is not None and efd_q_f < 0:
+        return jsonify({"error": "efd_parcel_fee must be non-negative"}), 400
+    if parcel_fb_f is not None and parcel_fb_f < 0:
+        return jsonify({"error": "parcel_fee must be non-negative"}), 400
+    fee_efd, fe_err = _efd_parcel_fee_pair(efd_q_f, parcel_fb_f)
+    if fe_err:
+        return jsonify({"error": fe_err}), 400
+    parcel_discount = body.get("parcel_discount", request.args.get("parcel_discount"))
+    if parcel_discount is None:
+        parcel_discount = 0.25
+    else:
+        parcel_discount = float(parcel_discount)
+    if parcel_discount < 0:
+        return jsonify({"error": "parcel_discount must be non-negative"}), 400
+    postage_discount = body.get("postage_discount", request.args.get("postage_discount"))
+    if postage_discount is None:
+        postage_discount = 0.10
+    else:
+        postage_discount = float(postage_discount)
+    if postage_discount < 0:
+        return jsonify({"error": "postage_discount must be non-negative"}), 400
+    try:
+        result = exports.save_efd_weekly_bundle(
+            start,
+            end,
+            discount=discount,
+            postage_discount=postage_discount,
+            efd_parcel_fee=float(fee_efd),
+            parcel_discount=parcel_discount,
+            show_parents=_bool_from_payload(body, "show_parents", True),
+            show_main=_bool_from_payload(body, "show_main", True),
+            remove_zeros=_bool_from_payload(body, "remove_zeros", False),
+            hide_costs=_bool_from_payload(body, "hide_costs", False),
+            hide_savings=_bool_from_payload(body, "hide_savings", False),
+        )
+        if not result.get("saved"):
+            err = (
+                result["failed"][0]["error"]
+                if result.get("failed")
+                else "No reports were generated"
+            )
+            return jsonify({"error": err, **result}), 400
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/export/consolidated-volumes-xlsx")
 def api_export_consolidated_volumes_xlsx():
     start = request.args.get("start_date")
@@ -1628,11 +1796,22 @@ def api_export_parcel_zone_summary():
             show_main=show_main,
             parcel_discount=float(parcel_discount),
         )
-        name = exports.parcel_invoice_download_name(
-            title_name=summary.get("title_name"),
-            parent_number=pn,
-            end_date=end,
-        )
+        efd_weekly_bundle = _bool_param("efd_weekly_bundle", False)
+        if efd_weekly_bundle and pn is not None:
+            name = exports.efd_account_report_download_name(
+                title_name=summary.get("title_name"),
+                parent_number=int(pn),
+                report_label="Parcel invoice",
+                start_date=start,
+                end_date=end,
+                ext="xlsx",
+            )
+        else:
+            name = exports.parcel_invoice_download_name(
+                title_name=summary.get("title_name"),
+                parent_number=pn,
+                end_date=end,
+            )
         return send_file(
             out,
             as_attachment=True,
@@ -1648,6 +1827,9 @@ def main() -> None:
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 
+# Apply a staged restore (if any) before opening the DB, so postage.db is never
+# replaced while a connection holds it open (required on Windows).
+backup_restore.apply_pending_restore()
 db.init_db()
 watcher.ensure_dirs()
 

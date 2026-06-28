@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Execution Log</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="header header-with-nav">
+      <a class="btn btn-nav" href="{{ url_for('index') }}">&#8592; Dashboard</a>
+      <a class="btn btn-nav" href="{{ url_for('scheduler.report_settings_page') }}">Report Settings</a>
+      <h1>Execution Log</h1>
+    </header>
+
+    {% set active = 'log' %}{% include '_scheduler_nav.html' %}
+
+    <section class="panel">
+      <div class="system-inline-fields">
+        <label class="field"><span class="field-label">Start</span><input type="date" id="logStart" /></label>
+        <label class="field"><span class="field-label">End</span><input type="date" id="logEnd" /></label>
+        <label class="field"><span class="field-label">Status</span>
+          <select id="logStatus">
+            <option value="">All</option>
+            <option value="success">Success</option>
+            <option value="failed">Failed</option>
+            <option value="waiting">Waiting</option>
+            <option value="expired">Expired</option>
+          </select>
+        </label>
+        <label class="field grow"><span class="field-label">Job name</span><input type="search" id="logSearch" /></label>
+        <button type="button" class="btn btn-primary" id="btnLoadLog">Load</button>
+        <a class="btn" id="btnExportCsv" href="#">Export CSV</a>
+      </div>
+      <div class="table-scroll" id="logTable"></div>
+      <pre id="logDetail" class="scheduler-preview hidden"></pre>
+    </section>
+  </div>
+  <script src="{{ url_for('static', filename='scheduler_log.js') }}"></script>
+</body>
+</html>

@@ -535,5 +535,52 @@
       btnUn.disabled = false;
     }
   });
+
+  // --- Backup & Restore ------------------------------------------------------
+  const btnDownloadBackup = $("btnDownloadBackup");
+  if (btnDownloadBackup) {
+    btnDownloadBackup.addEventListener("click", () => {
+      showError("");
+      const includeArchives = $("backupIncludeArchives");
+      const flag = includeArchives && includeArchives.checked ? "1" : "0";
+      showBanner("Preparing backup… the download will start shortly.");
+      // Let the browser handle the download (backups can be large).
+      window.location.href = `/api/system/backup?include_archives=${flag}`;
+    });
+  }
+
+  const btnRestoreBackup = $("btnRestoreBackup");
+  if (btnRestoreBackup) {
+    btnRestoreBackup.addEventListener("click", async () => {
+      showError("");
+      const fileEl = $("restoreFile");
+      const file = fileEl && fileEl.files && fileEl.files[0] ? fileEl.files[0] : null;
+      if (!file) {
+        showError("Choose a backup .zip file to restore.");
+        return;
+      }
+      const ok = window.confirm(
+        "Restore from this backup? It will replace the current database and report " +
+          "data when the app restarts. The current database is saved as a " +
+          "postage.db.bak-restore-* file first."
+      );
+      if (!ok) return;
+      showBanner("Uploading and validating backup…");
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      try {
+        const r = await fetch("/api/system/restore", { method: "POST", body: fd });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "Restore failed");
+        showBanner(
+          "Backup staged successfully. Restart the app (or the Windows service) to apply the restored data."
+        );
+        if (fileEl) fileEl.value = "";
+      } catch (e) {
+        showBanner("");
+        showError(String(e.message || e));
+      }
+    });
+  }
 })();
 

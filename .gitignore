@@ -18,6 +18,7 @@ htmlcov/
 # Generated/import artifacts (keep repo lightweight)
 processed/
 reports/
+PostageReports/
 
 # Local editor / scratch / samples (do not commit)
 .cursor/
@@ -27,3 +28,9 @@ Postage Price/
 # DB backups / local dumps
 postage.db.bak-*
 *.bak
+
+# Backup/restore working files
+.restore_staging/
+.restore_pending
+*.pre-restore
+postage-backup-*.zip

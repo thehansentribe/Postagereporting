@@ -14,7 +14,7 @@ from typing import Any
 from openpyxl import load_workbook
 
 import db
-from importer import convert_xls_to_xlsx
+from importer import resolve_xlsx_path
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +177,8 @@ def parse_ws3_xlsx(xlsx_path: str) -> tuple[str | None, str | None, dict[str, st
             current_customer_code = m.group(1) if m else None
             if current_customer_code and current_customer_name:
                 customers.setdefault(current_customer_code, current_customer_name)
-            continue
+            # No `continue`: this NetSort layout puts the first rate type on the
+            # same row as the profile name, so fall through to the rate block.
 
         if col19 in RATE_TYPES and current_customer_code:
             is_single = col19 == "Single Piece"
@@ -294,11 +295,7 @@ def process_ws3_mail_detail_file(
             "file_name": file_name,
         }
 
-    low = xls_path.lower()
-    if low.endswith(".xlsx") and not low.endswith(".xls"):
-        xlsx_path = xls_path
-    else:
-        xlsx_path = convert_xls_to_xlsx(xls_path)
+    xlsx_path = resolve_xlsx_path(xls_path)
 
     bi_mail_id = read_bi8_mail_id(xlsx_path)
     mail_date = parse_mail_id_date(bi_mail_id)

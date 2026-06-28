@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Report Settings</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="header header-with-nav">
+      <a class="btn btn-nav" href="{{ url_for('index') }}">&#8592; Dashboard</a>
+      <a class="btn btn-nav" href="{{ url_for('scheduler.scheduler_dashboard_page') }}">Scheduled Reports</a>
+      <h1>Report Settings</h1>
+    </header>
+
+    <div id="settingsBanner" class="system-banner hidden" role="status"></div>
+    <div id="settingsError" class="error-banner hidden" role="alert"></div>
+
+    <section class="panel">
+      <h2 class="system-section-title">Report</h2>
+      <p class="system-hint">Paths and scheduler behavior for scheduled report jobs.</p>
+      <div class="system-inline-fields">
+        <label class="field grow">
+          <span class="field-label">Report source path</span>
+          <input type="text" id="reportSourcePath" placeholder="\\FileServer\Reports\" />
+        </label>
+        <label class="field">
+          <span class="field-label">Poll interval (seconds)</span>
+          <input type="number" id="pollingIntervalSeconds" min="5" step="1" />
+        </label>
+        <label class="field">
+          <span class="field-label">Log retention (days)</span>
+          <input type="number" id="logRetentionDays" min="1" step="1" />
+        </label>
+        <label class="field">
+          <span class="field-label">Default expiration (hours)</span>
+          <input type="number" id="defaultExpirationHours" min="0" step="1" />
+        </label>
+        <label class="field grow">
+          <span class="field-label">Timezone</span>
+          <input type="text" id="timezone" placeholder="America/Chicago" />
+        </label>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Email</h2>
+      <p class="system-hint">VB6 watcher folder — emails send when the <code>.dat</code> file is created.</p>
+      <div class="system-inline-fields">
+        <label class="field grow">
+          <span class="field-label">Email root path</span>
+          <input type="text" id="emailRootPath" placeholder="\\DPM2\Email\" />
+        </label>
+        <label class="field grow">
+          <span class="field-label">Admin notification email</span>
+          <input type="email" id="adminNotificationEmail" placeholder="alerts@example.com" />
+        </label>
+      </div>
+      <div class="system-actions">
+        <button type="button" class="btn btn-run" id="btnTestEmailRoot">Test connection</button>
+        <button type="button" class="btn btn-primary" id="btnSaveSettings">Save</button>
+      </div>
+    </section>
+  </div>
+  <script src="{{ url_for('static', filename='report_settings.js') }}"></script>
+</body>
+</html>

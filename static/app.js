@@ -1210,6 +1210,56 @@
       $("spinParcels").classList.add("hidden");
       if ($("btnExportFlatsSavings")) $("btnExportFlatsSavings").hidden = $("hideCosts").checked;
       refreshReportReadiness();
+      refreshNoclassNotice();
+    }
+  }
+
+  async function refreshNoclassNotice() {
+    const notice = $("noclassNotice");
+    if (!notice) return;
+
+    const sel = $("selectAccount");
+    const opt = sel && sel.selectedOptions && sel.selectedOptions[0];
+    // Only flag for a specific selected account, not "All Accounts".
+    if (!opt || !opt.value) {
+      notice.classList.add("hidden");
+      notice.textContent = "";
+      return;
+    }
+
+    try {
+      const r = await fetch("/api/postage/noclass?" + queryParams().toString());
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "NOCLASS check failed");
+
+      const records = j.records || [];
+      if (!records.length) {
+        notice.classList.add("hidden");
+        notice.textContent = "";
+        return;
+      }
+
+      const lines = records.map(
+        (rec) =>
+          `${rec.customer_name || rec.account_code} \u2014 ${rec.mail_class}: ${fmtDisplayDate(
+            rec.file_date
+          )} (${fmtInt(rec.pieces)} pcs)`
+      );
+      notice.innerHTML = "";
+      const heading = document.createElement("strong");
+      heading.textContent = `Non-class postage found (${records.length}):`;
+      notice.appendChild(heading);
+      const ul = document.createElement("ul");
+      lines.forEach((line) => {
+        const li = document.createElement("li");
+        li.textContent = line;
+        ul.appendChild(li);
+      });
+      notice.appendChild(ul);
+      notice.classList.remove("hidden");
+    } catch {
+      notice.classList.add("hidden");
+      notice.textContent = "";
     }
   }
 
@@ -2348,49 +2398,48 @@
     }
   });
 
-  const EFD_WEEKLY_EXPORT_PARENTS = [null, 3901, 3899, 3900];
-
   function efdWeeklyExportBaseQuery() {
     const q = queryParams();
     q.delete("parent_number");
     q.delete("customer_number");
-    q.set("discount", String(parseFlatsDiscount()));
+    q.set("discount", String(parseResellerDiscount()));
     q.set("efd_parcel_fee", String(parseEfdParcelFee()));
     return q;
   }
 
-  async function downloadEfdWeeklyInvoiceExport(queryString, defaultName) {
-    const r = await fetch("/api/export/efd-weekly-invoice-xlsx?" + queryString);
-    if (!r.ok) {
-      const j = await r.json().catch(() => ({}));
-      throw new Error(j.error || "Export failed");
-    }
-    const blob = await r.blob();
-    const name =
-      filenameFromContentDisposition(r.headers.get("Content-Disposition") || "") ||
-      defaultName;
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = name;
-    a.click();
-    URL.revokeObjectURL(a.href);
+  function efdWeeklyBundleRequestBody() {
+    const q = efdWeeklyExportBaseQuery();
+    q.set("postage_discount", String(parseFlatsDiscount()));
+    q.set("parcel_discount", String(parseParcelDiscount()));
+    const body = {};
+    for (const [k, v] of q.entries()) body[k] = v;
+    return body;
   }
 
   $("btnExportEfdWeeklyInvoice").addEventListener("click", async () => {
     const btn = $("btnExportEfdWeeklyInvoice");
     setExportLoading(btn, true);
+    const totalExpected = 10;
     try {
-      const baseQ = efdWeeklyExportBaseQuery();
-      for (let i = 0; i < EFD_WEEKLY_EXPORT_PARENTS.length; i++) {
-        const pn = EFD_WEEKLY_EXPORT_PARENTS[i];
-        const q = new URLSearchParams(baseQ.toString());
-        if (pn != null) q.set("parent_number", String(pn));
-        const defaultName =
-          pn == null ? "efd_weekly_invoice.xlsx" : `efd_weekly_${pn}.xlsx`;
-        await downloadEfdWeeklyInvoiceExport(q.toString(), defaultName);
-        if (i < EFD_WEEKLY_EXPORT_PARENTS.length - 1) {
-          await new Promise((resolve) => setTimeout(resolve, 400));
-        }
+      const r = await fetch("/api/export/efd-weekly-bundle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(efdWeeklyBundleRequestBody()),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        throw new Error(j.error || "Export failed");
+      }
+      const savedCount = (j.saved || []).length;
+      const folder = j.folder_relative || j.folder || "PostageReports";
+      const failed = j.failed || [];
+      if (failed.length > 0) {
+        const missing = failed.map((f) => f.label).join(", ");
+        alert(
+          `Saved ${savedCount} of ${totalExpected} reports to ${folder}. Failed: ${missing}.`
+        );
+      } else {
+        alert(`Saved ${savedCount} reports to ${folder}`);
       }
     } catch (e) {
       alert(String(e.message || e));

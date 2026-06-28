@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Scheduled Jobs</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="header header-with-nav">
+      <a class="btn btn-nav" href="{{ url_for('index') }}">&#8592; Dashboard</a>
+      <a class="btn btn-nav" href="{{ url_for('scheduler.report_settings_page') }}">Report Settings</a>
+      <h1>Scheduled Jobs</h1>
+    </header>
+
+    {% set active = 'jobs' %}{% include '_scheduler_nav.html' %}
+
+    <div id="jobsError" class="error-banner hidden" role="alert"></div>
+
+    <section class="panel">
+      <div class="system-actions">
+        <a class="btn btn-primary" href="{{ url_for('scheduler.scheduler_job_new_page') }}">New job</a>
+        <input type="search" id="jobSearch" placeholder="Search jobs…" class="scheduler-search" />
+        <button type="button" class="btn" id="btnBulkEnable">Enable selected</button>
+        <button type="button" class="btn" id="btnBulkDisable">Disable selected</button>
+      </div>
+      <div class="table-scroll" id="jobsTable"></div>
+    </section>
+  </div>
+  <script>
+    window.SCHEDULER_ACTIVE = "jobs";
+  </script>
+  <script src="{{ url_for('static', filename='scheduler_jobs.js') }}"></script>
+</body>
+</html>

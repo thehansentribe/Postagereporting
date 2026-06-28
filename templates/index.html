@@ -10,6 +10,8 @@
   <div class="page">
     <header class="header header-with-nav">
       <a class="btn btn-nav" href="{{ url_for('customers_hierarchy') }}">Parent / child accounts</a>
+      <a class="btn btn-nav" href="{{ url_for('scheduler.scheduler_dashboard_page') }}">Scheduled Reports</a>
+      <a class="btn btn-nav" href="{{ url_for('scheduler.report_settings_page') }}">Report Settings</a>
       <a class="btn btn-nav" href="{{ url_for('system_page') }}">System</a>
       <h1><span class="header-icon" aria-hidden="true">&#128202;</span> Postage Dashboard</h1>
     </header>
@@ -57,6 +59,7 @@
         <span class="readiness-dot" id="reportReadinessDot" aria-hidden="true"></span>
         <span class="readiness-label" id="reportReadinessLabel">Checking reports…</span>
       </div>
+      <div class="noclass-notice hidden" id="noclassNotice" role="status" aria-live="polite"></div>
       <div class="controls-row controls-options">
         <label class="check"><input type="checkbox" id="showParents" checked /> Show Parent Accounts</label>
         <label class="check"><input type="checkbox" id="showMain" checked /> Show standalone accounts</label>

@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Job Editor</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="header header-with-nav">
+      <a class="btn btn-nav" href="{{ url_for('scheduler.scheduler_jobs_page') }}">&#8592; Jobs</a>
+      <a class="btn btn-nav" href="{{ url_for('scheduler.report_settings_page') }}">Report Settings</a>
+      <h1 id="editorTitle">Job</h1>
+    </header>
+
+    <div id="editorError" class="error-banner hidden" role="alert"></div>
+    <div id="editorBanner" class="system-banner hidden" role="status"></div>
+
+    <section class="panel">
+      <h2 class="system-section-title">General</h2>
+      <label class="field grow"><span class="field-label">Name</span><input type="text" id="jobName" /></label>
+      <label class="field grow"><span class="field-label">Description</span><textarea id="jobDescription" rows="2"></textarea></label>
+      <label class="check"><input type="checkbox" id="jobEnabled" checked /> Enabled</label>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Schedule</h2>
+
+      <label class="check schedule-one-time-toggle">
+        <input type="checkbox" id="oneTimeReport" /> One-time report
+      </label>
+
+      <div id="oneTimeFields" class="schedule-block hidden">
+        <label class="field">
+          <span class="field-label">Run on</span>
+          <input type="datetime-local" id="oneTimeAt" />
+        </label>
+      </div>
+
+      <div id="repeatScheduleFields" class="schedule-block">
+        <label class="field">
+          <span class="field-label">Repeat</span>
+          <select id="scheduleType">
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+            <option value="monthly">Monthly</option>
+            <option value="data-only">Data only</option>
+          </select>
+        </label>
+        <label class="field" id="timeFieldWrap">
+          <span class="field-label">Time</span>
+          <input type="time" id="scheduledTime" />
+        </label>
+      </div>
+
+      <div id="weeklyFields" class="schedule-block hidden">
+        <span class="field-label">Days of week</span>
+        <div id="daysOfWeekGroup" class="schedule-dow-row" role="group" aria-label="Days of week">
+          <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Mon" /> Mon</label>
+          <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Tue" /> Tue</label>
+          <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Wed" /> Wed</label>
+          <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Thu" /> Thu</label>
+          <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Fri" /> Fri</label>
+          <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Sat" /> Sat</label>
+          <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Sun" /> Sun</label>
+        </div>
+      </div>
+
+      <div id="monthlyFields" class="schedule-block hidden">
+        <label class="field">
+          <span class="field-label">Day of month</span>
+          <input type="number" id="dayOfMonth" min="1" max="31" value="1" />
+        </label>
+      </div>
+
+      <div class="schedule-block schedule-effective-block">
+        <span class="field-label">Effective period</span>
+        <p class="system-hint">Leave start empty for no start limit. Use &ldquo;Until canceled&rdquo; for no end date.</p>
+        <div class="schedule-effective-row">
+          <label class="field">
+            <span class="field-label">Start date</span>
+            <input type="date" id="effectiveStart" />
+          </label>
+          <label class="field" id="effectiveEndWrap">
+            <span class="field-label">End date</span>
+            <input type="date" id="effectiveEnd" />
+          </label>
+        </div>
+        <label class="check">
+          <input type="checkbox" id="effectiveUntilCanceled" checked /> Until canceled
+        </label>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Data files</h2>
+      <div class="token-buttons">
+        <button type="button" class="btn btn-run token-btn" data-token="{YYYY}">{YYYY}</button>
+        <button type="button" class="btn btn-run token-btn" data-token="{YY}">{YY}</button>
+        <button type="button" class="btn btn-run token-btn" data-token="{MM}">{MM}</button>
+        <button type="button" class="btn btn-run token-btn" data-token="{DD}">{DD}</button>
+        <button type="button" class="btn btn-run token-btn" data-token="{DOW}">{DOW}</button>
+      </div>
+      <div id="requiredFilesList"></div>
+      <button type="button" class="btn" id="btnAddRequiredFile">Add required file</button>
+      <label class="field"><span class="field-label">Readiness</span>
+        <select id="dataReadinessMode">
+          <option value="all_required">All required</option>
+          <option value="any_required">Any required</option>
+        </select>
+      </label>
+      <label class="field"><span class="field-label">Stale threshold (minutes)</span><input type="number" id="staleThreshold" min="0" /></label>
+      <div id="filePreview" class="scheduler-preview"></div>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Email</h2>
+      <label class="field grow"><span class="field-label">Subject</span><input type="text" id="subjectTemplate" data-token-target="1" /></label>
+      <label class="field grow"><span class="field-label">Body</span><textarea id="bodyTemplate" rows="8" data-token-target="1"></textarea></label>
+      <div id="recipientsList"></div>
+      <button type="button" class="btn" id="btnAddRecipient">Add recipient</button>
+      <label class="field"><span class="field-label">Recipient group</span><select id="recipientGroupPick"></select></label>
+      <button type="button" class="btn" id="btnAddGroup">Attach group</button>
+      <div id="attachedGroups"></div>
+      <div id="attachmentsList"></div>
+      <button type="button" class="btn" id="btnAddAttachment">Add attachment path</button>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Advanced</h2>
+      <label class="field"><span class="field-label">Expiration (hours)</span><input type="number" id="expirationHours" min="0" /></label>
+      <label class="check"><input type="checkbox" id="sendFailureNotification" /> Send failure notification</label>
+      <label class="field"><span class="field-label">Retry count</span><input type="number" id="retryCount" min="0" value="0" /></label>
+      <label class="field"><span class="field-label">Retry delay (sec)</span><input type="number" id="retryDelay" min="0" value="60" /></label>
+    </section>
+
+    <section class="panel">
+      <div class="system-actions">
+        <button type="button" class="btn btn-primary" id="btnSaveJob">Save</button>
+        <button type="button" class="btn" id="btnPreviewJob">Test / Preview</button>
+        <button type="button" class="btn btn-run" id="btnSendNow">Send Now</button>
+      </div>
+      <pre id="previewPane" class="scheduler-preview hidden"></pre>
+    </section>
+  </div>
+  <script>
+    window.SCHEDULER_JOB_ID = {{ job_id|tojson }};
+  </script>
+  <script src="{{ url_for('static', filename='scheduler_job_editor.js') }}"></script>
+</body>
+</html>
