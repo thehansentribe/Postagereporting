@@ -154,8 +154,11 @@ def convert_xls_to_xlsx(xls_path: str, out_dir: str | None = None) -> str:
     )
     if result.returncode != 0:
         raise RuntimeError(f"LibreOffice conversion failed: {result.stderr or result.stdout}")
-    base = os.path.basename(xls_path).replace(".xls", ".xlsx").replace(".XLS", ".xlsx")
-    xlsx_path = os.path.join(out_dir, base)
+    # LibreOffice names its output after the input stem with a .xlsx extension. Strip only
+    # the trailing extension; a naive ".xls"->".xlsx" replace turns a misnamed ".xlsx" input
+    # (OLE2/BIFF bytes with an .xlsx name) into a bogus ".xlsxx" lookup that never exists.
+    stem = re.sub(r"\.(xls|xlsx)$", "", os.path.basename(xls_path), flags=re.IGNORECASE)
+    xlsx_path = os.path.join(out_dir, f"{stem}.xlsx")
     if not os.path.exists(xlsx_path):
         raise FileNotFoundError(f"Expected output not found: {xlsx_path}")
     return xlsx_path
