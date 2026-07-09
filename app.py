@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 import os
+import shutil
 import tempfile
 import threading
 from pathlib import Path
@@ -268,6 +269,43 @@ def api_system_flats_retail_update():
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/system/rates/flats")
+def api_system_rates_flats():
+    try:
+        conn = db.get_connection()
+        view = db.get_flat_rate_costs(conn)
+        conn.close()
+        return jsonify(
+            {
+                "queried_at": datetime.now().isoformat(timespec="seconds"),
+                "as_of_date": view["as_of_date"],
+                "tariff_effective_date": view["tariff_effective_date"],
+                "rows": view["rows"],
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/system/rates/parcels")
+def api_system_rates_parcels():
+    try:
+        conn = db.get_connection()
+        view = db.get_priority_mail_retail_tariff_view(conn)
+        conn.close()
+        return jsonify(
+            {
+                "queried_at": datetime.now().isoformat(timespec="seconds"),
+                "as_of_date": view["as_of_date"],
+                "tariff_effective_date": view["tariff_effective_date"],
+                "matrix": view["matrix"],
+                "flat_rate_items": view["flat_rate_items"],
+            }
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -846,28 +884,35 @@ def api_import_flatrates():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/import/priority-mail-retail", methods=["POST"])
-def api_import_priority_mail_retail():
+@app.route("/api/import/notice123-rate-case", methods=["POST"])
+def api_import_notice123_rate_case():
     if "file" not in request.files:
         return jsonify({"error": "file required"}), 400
     f = request.files["file"]
     if not f.filename:
         return jsonify({"error": "empty filename"}), 400
+    if not f.filename.lower().endswith(".zip"):
+        return jsonify({"error": "file must be a .zip archive"}), 400
     eff = (request.form.get("effective_date") or "").strip()
     if not eff:
         return jsonify({"error": "effective_date required (YYYY-MM-DD)"}), 400
-    path = Path(watcher.INCOMING) / secure_filename(f.filename)
-    watcher.ensure_dirs()
-    f.save(path)
     try:
-        result = importer.import_priority_mail_retail(
-            str(path), db.DB_PATH, effective_date=eff
+        date.fromisoformat(eff)
+    except ValueError:
+        return jsonify({"error": "effective_date must be YYYY-MM-DD"}), 400
+
+    tmp = Path(tempfile.mkdtemp(prefix="notice123-"))
+    zip_path = tmp / secure_filename(f.filename)
+    try:
+        f.save(zip_path)
+        result = importer.import_notice123_rate_case(
+            zip_path, db.DB_PATH, effective_date=eff
         )
-        path.unlink(missing_ok=True)
         return jsonify(result)
     except Exception as e:
-        path.unlink(missing_ok=True)
         return jsonify({"error": str(e)}), 500
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @app.route("/api/export/postage-invoice")

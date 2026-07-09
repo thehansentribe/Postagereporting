@@ -48,22 +48,57 @@
     </section>
 
     <section class="panel">
-      <h2 class="system-section-title">Priority Mail parcel retail (zones)</h2>
+      <h2 class="system-section-title">Notice 123 rate case</h2>
       <p class="system-hint">
-        Upload the compact USPS-style zone × weight workbook (zones across the top, pounds down the side).
-        Choose the <strong>effective date</strong> for this tariff (inclusive): billing is priced using the latest
-        upload on or before each piece date until you publish a newer one.
+        Upload a USPS Notice 123 price-change <code>.zip</code>. Files are extracted to
+        <code>Notice123/</code> and the system imports Priority Mail retail, First-Class flats retail,
+        and commercial presort rates. Choose the <strong>effective date</strong> for this tariff
+        (may be in the future): billing uses the latest upload on or before each piece date.
       </p>
       <div class="system-actions system-inline-fields">
         <label class="field">
           <span class="field-label">Effective date</span>
-          <input type="date" id="priorityMailEffectiveDate" />
+          <input type="date" id="notice123EffectiveDate" />
         </label>
         <label class="field">
-          <span class="field-label">Zone matrix (.xlsx)</span>
-          <input type="file" id="priorityMailFile" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+          <span class="field-label">Notice 123 zip</span>
+          <input type="file" id="notice123ZipFile" accept=".zip,application/zip" />
         </label>
-        <button type="button" class="btn btn-primary" id="btnUploadPriorityMail">Upload tariff</button>
+        <button type="button" class="btn btn-primary" id="btnUploadNotice123">Import rate case</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Current flats retail &amp; presort rates</h2>
+      <p class="system-hint">
+        Read-only view of flat mail rates active as of today. Click to load the latest tariff on or
+        before the current date.
+      </p>
+      <div class="system-actions">
+        <button type="button" class="btn btn-run" id="btnLoadFlatsRatesView">Show current flats rates</button>
+      </div>
+      <p class="system-hint hidden" id="flatsRatesMeta" role="status"></p>
+      <div class="table-wrap">
+        <div class="table-scroll">
+          <div id="flatsRatesViewTable"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Current parcel (Priority Mail) zone rates</h2>
+      <p class="system-hint">
+        Read-only view of Priority Mail retail zone × weight rates active as of today, plus flat-rate
+        envelopes and boxes.
+      </p>
+      <div class="system-actions">
+        <button type="button" class="btn btn-run" id="btnLoadParcelRatesView">Show current parcel rates</button>
+      </div>
+      <p class="system-hint hidden" id="parcelRatesMeta" role="status"></p>
+      <div class="table-wrap">
+        <div class="table-scroll">
+          <div id="parcelRatesViewTable"></div>
+        </div>
       </div>
     </section>
 

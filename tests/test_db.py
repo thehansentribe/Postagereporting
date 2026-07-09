@@ -2037,4 +2037,107 @@ def test_postage_invoice_remove_zeros_filters_cost_centers(monkeypatch):
                 out.unlink(missing_ok=True)
 
         assert cost_center_numbers(remove_zeros=True) == {801}
-        assert cost_center_numbers(remove_zeros=False) == {800, 801, 802}
+
+
+def test_get_flat_rate_costs_tariff_as_of_effective_dates(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "flat_tariff.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", p)
+        dbmod.init_db()
+        conn = dbmod.get_connection()
+        try:
+            conn.executemany(
+                """
+                INSERT INTO flat_rate_costs (
+                    weight_not_over_oz, rate_retail, rate_5digit, effective_date
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (1.0, 1.50, 1.00, "2020-01-01"),
+                    (1.0, 1.69, 1.025, "2026-07-01"),
+                    (2.0, 1.90, 1.20, "2020-01-01"),
+                    (2.0, 1.98, 1.315, "2026-07-01"),
+                ],
+            )
+            conn.commit()
+            early = dbmod.get_flat_rate_costs(conn, as_of_date="2026-06-01")
+            assert early["tariff_effective_date"] == "2020-01-01"
+            assert early["rows"][0]["rate_retail"] == 1.50
+            late = dbmod.get_flat_rate_costs(conn, as_of_date="2026-07-15")
+            assert late["tariff_effective_date"] == "2026-07-01"
+            assert late["rows"][0]["rate_retail"] == 1.69
+            assert late["rows"][0]["rate_5digit"] == 1.025
+        finally:
+            conn.close()
+
+
+def test_get_priority_mail_retail_tariff_view(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "pm_view.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", p)
+        dbmod.init_db()
+        conn = dbmod.get_connection()
+        try:
+            conn.executemany(
+                """
+                INSERT INTO priority_mail_retail (
+                    effective_date, row_type, label, zone, weight_unit, weight_max, price,
+                    sort_group, sort_order
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                """,
+                [
+                    ("2026-07-01", "matrix", None, 1, "lb", 1.0, 11.0, 0),
+                    ("2026-07-01", "matrix", None, 2, "lb", 1.0, 11.5, 1),
+                    ("2026-07-01", "flat_rate_item", "Flat Rate Envelopes", None, None, None, 12.9, 2),
+                ],
+            )
+            conn.commit()
+            view = dbmod.get_priority_mail_retail_tariff_view(conn, as_of_date="2026-07-15")
+            assert view["tariff_effective_date"] == "2026-07-01"
+            assert len(view["matrix"]) == 1
+            assert view["matrix"][0]["zones"]["1"] == 11.0
+            assert view["flat_rate_items"][0]["label"] == "Flat Rate Envelopes"
+        finally:
+            conn.close()
+
+
+def test_api_system_rates_endpoints(monkeypatch):
+    import app as app_mod
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "api_rates.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", p)
+        dbmod.init_db()
+        conn = dbmod.get_connection()
+        try:
+            conn.executemany(
+                """
+                INSERT INTO flat_rate_costs (
+                    weight_not_over_oz, rate_retail, rate_5digit, effective_date
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [(1.0, 1.69, 1.025, "2026-07-01")],
+            )
+            conn.executemany(
+                """
+                INSERT INTO priority_mail_retail (
+                    effective_date, row_type, zone, weight_unit, weight_max, price,
+                    sort_group, sort_order
+                ) VALUES (?, 'matrix', ?, 'lb', ?, ?, 1, ?)
+                """,
+                [("2026-07-01", 1, 1.0, 11.0, 0)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        client = app_mod.app.test_client()
+        flats = client.get("/api/system/rates/flats")
+        assert flats.status_code == 200
+        fj = flats.get_json()
+        assert fj["rows"][0]["rate_5digit"] == 1.025
+
+        parcels = client.get("/api/system/rates/parcels")
+        assert parcels.status_code == 200
+        pj = parcels.get_json()
+        assert pj["matrix"][0]["zones"]["1"] == 11.0

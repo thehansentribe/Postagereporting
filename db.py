@@ -186,7 +186,7 @@ CREATE INDEX IF NOT EXISTS idx_billing_edit_lines_edit ON billing_edit_lines(edi
 
 CREATE TABLE IF NOT EXISTS flat_rate_costs (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-    weight_not_over_oz   REAL    NOT NULL UNIQUE,
+    weight_not_over_oz   REAL    NOT NULL,
     rate_5digit          REAL,
     rate_3digit          REAL,
     rate_aadc            REAL,
@@ -194,7 +194,8 @@ CREATE TABLE IF NOT EXISTS flat_rate_costs (
     rate_machinable_pres REAL,
     rate_retail          REAL,
     effective_date       TEXT,
-    notes                TEXT
+    notes                TEXT,
+    UNIQUE (weight_not_over_oz, effective_date)
 );
 
 CREATE TABLE IF NOT EXISTS parcel_costs (
@@ -547,6 +548,7 @@ WS3_REJECT_ALLOCATED_MAIL_CLASS = "Rejects"
 # Invoice / billing: per-piece charge for WS3 presort rejects (editable on System page).
 PRESORT_REJECT_UNIT_COST_KEY = "presort_reject_unit_cost"
 DEFAULT_PRESORT_REJECT_UNIT_COST = 0.66
+FLAT_RATE_BASELINE_DATE = "1900-01-01"
 
 # Scheduled report email system settings (Report Settings page).
 SETTING_EMAIL_ROOT_PATH = "emailRootPath"
@@ -581,8 +583,64 @@ def get_connection() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
+    _migrate_flat_rate_costs_effective_date(conn)
     _ensure_app_settings(conn)
     return conn
+
+
+def _flat_rate_costs_has_dated_unique(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='flat_rate_costs'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return False
+    ddl = str(row[0])
+    return "UNIQUE (weight_not_over_oz, effective_date)" in ddl
+
+
+def _migrate_flat_rate_costs_effective_date(conn: sqlite3.Connection) -> None:
+    """Allow multiple dated flat-rate revisions (Notice 123 rate cases)."""
+    if _flat_rate_costs_has_dated_unique(conn):
+        return
+    conn.execute(
+        """
+        CREATE TABLE flat_rate_costs_new (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            weight_not_over_oz   REAL    NOT NULL,
+            rate_5digit          REAL,
+            rate_3digit          REAL,
+            rate_aadc            REAL,
+            rate_mixed_adc       REAL,
+            rate_machinable_pres REAL,
+            rate_retail          REAL,
+            effective_date       TEXT,
+            notes                TEXT,
+            UNIQUE (weight_not_over_oz, effective_date)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO flat_rate_costs_new (
+            id, weight_not_over_oz, rate_5digit, rate_3digit, rate_aadc,
+            rate_mixed_adc, rate_machinable_pres, rate_retail, effective_date, notes
+        )
+        SELECT
+            id, weight_not_over_oz, rate_5digit, rate_3digit, rate_aadc,
+            rate_mixed_adc, rate_machinable_pres, rate_retail, effective_date, notes
+        FROM flat_rate_costs
+        """
+    )
+    conn.execute("DROP TABLE flat_rate_costs")
+    conn.execute("ALTER TABLE flat_rate_costs_new RENAME TO flat_rate_costs")
+    conn.execute(
+        """
+        UPDATE flat_rate_costs
+        SET effective_date = ?
+        WHERE effective_date IS NULL
+        """,
+        (FLAT_RATE_BASELINE_DATE,),
+    )
 
 
 def _migrate_ws3_profiles_reject_fee(conn: sqlite3.Connection) -> None:
@@ -768,26 +826,138 @@ def init_db() -> None:
     conn.executescript(SCHEDULER_SCHEMA)
     _migrate_ws3_profiles_reject_fee(conn)
     _migrate_ws3_mail_detail_usps_cost_per_piece(conn)
+    _migrate_flat_rate_costs_effective_date(conn)
     _ensure_app_settings(conn)
     clamp_negative_ws3_reject_counts(conn)
     conn.commit()
     conn.close()
 
 
-def list_flat_retail_rates(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    cur = conn.execute(
-        """
-        SELECT weight_not_over_oz, rate_retail
-        FROM flat_rate_costs
+def _flat_rate_as_of_date_sql() -> str:
+    """Calendar date expression for flat-rate tariff lookup (piece file_date)."""
+    return "COALESCE(p.file_date, ?)"
+
+
+def _flat_rate_tier_match_sql(alias: str, *, weight_sql: str, as_of_sql: str) -> str:
+    return f"""
+      {alias}.id = (
+        SELECT f2.id FROM flat_rate_costs f2
+        WHERE CAST(f2.weight_not_over_oz AS INTEGER) = {weight_sql}
+          AND (f2.effective_date IS NULL OR f2.effective_date <= {as_of_sql})
+        ORDER BY
+          CASE WHEN f2.effective_date IS NULL THEN 1 ELSE 0 END,
+          f2.effective_date DESC
+        LIMIT 1
+      )
+    """
+
+
+def _flat_rate_rows_as_of_sql() -> str:
+    return """
+        WITH ranked AS (
+          SELECT
+            weight_not_over_oz,
+            rate_5digit,
+            rate_3digit,
+            rate_aadc,
+            rate_mixed_adc,
+            rate_machinable_pres,
+            rate_retail,
+            effective_date,
+            ROW_NUMBER() OVER (
+              PARTITION BY weight_not_over_oz
+              ORDER BY
+                CASE WHEN effective_date IS NULL THEN 1 ELSE 0 END,
+                effective_date DESC
+            ) AS rn
+          FROM flat_rate_costs
+          WHERE effective_date IS NULL OR effective_date <= ?
+        )
+        SELECT
+          weight_not_over_oz,
+          rate_5digit,
+          rate_3digit,
+          rate_aadc,
+          rate_mixed_adc,
+          rate_machinable_pres,
+          rate_retail,
+          effective_date
+        FROM ranked
+        WHERE rn = 1
         ORDER BY weight_not_over_oz ASC
+    """
+
+
+def get_flat_rate_costs(
+    conn: sqlite3.Connection,
+    *,
+    as_of_date: str | None = None,
+) -> dict[str, Any]:
+    """Latest flat-rate tiers (retail + presort) on or before as_of_date."""
+    od = str(as_of_date) if as_of_date is not None else date.today().isoformat()
+    cur = conn.execute(_flat_rate_rows_as_of_sql(), (od,))
+    rows: list[dict[str, Any]] = []
+    tariff_dates: list[str] = []
+    for r in cur.fetchall():
+        eff = r["effective_date"]
+        if eff:
+            tariff_dates.append(str(eff))
+        rows.append(
+            {
+                "weight_not_over_oz": float(r["weight_not_over_oz"]),
+                "rate_5digit": float(r["rate_5digit"]) if r["rate_5digit"] is not None else None,
+                "rate_3digit": float(r["rate_3digit"]) if r["rate_3digit"] is not None else None,
+                "rate_aadc": float(r["rate_aadc"]) if r["rate_aadc"] is not None else None,
+                "rate_mixed_adc": float(r["rate_mixed_adc"]) if r["rate_mixed_adc"] is not None else None,
+                "rate_machinable_pres": (
+                    float(r["rate_machinable_pres"]) if r["rate_machinable_pres"] is not None else None
+                ),
+                "rate_retail": float(r["rate_retail"]) if r["rate_retail"] is not None else None,
+                "effective_date": str(eff) if eff else None,
+            }
+        )
+    tariff_effective_date: str | None = None
+    if tariff_dates:
+        tariff_effective_date = max(tariff_dates)
+    return {
+        "as_of_date": od,
+        "tariff_effective_date": tariff_effective_date,
+        "rows": rows,
+    }
+
+
+def _resolve_flat_rate_edit_effective_date(
+    conn: sqlite3.Connection,
+    *,
+    as_of_date: str | None = None,
+) -> str | None:
+    """Effective-date slice used for manual retail edits (today's active tariff)."""
+    od = str(as_of_date) if as_of_date is not None else date.today().isoformat()
+    row = conn.execute(
         """
-    )
+        SELECT effective_date
+        FROM flat_rate_costs
+        WHERE effective_date IS NULL OR effective_date <= ?
+        ORDER BY
+          CASE WHEN effective_date IS NULL THEN 1 ELSE 0 END,
+          effective_date DESC
+        LIMIT 1
+        """,
+        (od,),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row["effective_date"]) if row["effective_date"] is not None else None
+
+
+def list_flat_retail_rates(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    view = get_flat_rate_costs(conn)
     return [
         {
             "weight_not_over_oz": float(r["weight_not_over_oz"]),
-            "rate_retail": float(r["rate_retail"]) if r["rate_retail"] is not None else None,
+            "rate_retail": r["rate_retail"],
         }
-        for r in cur.fetchall()
+        for r in view["rows"]
     ]
 
 
@@ -1074,10 +1244,17 @@ def seed_flat_retail_rates_if_empty(
     cur = conn.cursor()
     cur.executemany(
         """
-        INSERT INTO flat_rate_costs (weight_not_over_oz, rate_retail)
-        VALUES (:weight_not_over_oz, :rate_retail)
+        INSERT INTO flat_rate_costs (weight_not_over_oz, rate_retail, effective_date)
+        VALUES (:weight_not_over_oz, :rate_retail, :effective_date)
         """,
-        rows,
+        [
+            {
+                "weight_not_over_oz": r["weight_not_over_oz"],
+                "rate_retail": r["rate_retail"],
+                "effective_date": FLAT_RATE_BASELINE_DATE,
+            }
+            for r in rows
+        ],
     )
     return {"seeded": True, "rows_inserted": cur.rowcount}
 
@@ -1110,17 +1287,23 @@ def upsert_flat_retail_rates(
     if not cleaned:
         return {"rows_upserted": 0}
 
+    eff = _resolve_flat_rate_edit_effective_date(conn)
+    if eff is None:
+        eff = FLAT_RATE_BASELINE_DATE
+    for row in cleaned:
+        row["effective_date"] = eff
+
     cur = conn.cursor()
     cur.executemany(
         """
-        INSERT INTO flat_rate_costs (weight_not_over_oz, rate_retail)
-        VALUES (:weight_not_over_oz, :rate_retail)
-        ON CONFLICT(weight_not_over_oz) DO UPDATE SET
+        INSERT INTO flat_rate_costs (weight_not_over_oz, rate_retail, effective_date)
+        VALUES (:weight_not_over_oz, :rate_retail, :effective_date)
+        ON CONFLICT(weight_not_over_oz, effective_date) DO UPDATE SET
             rate_retail = excluded.rate_retail
         """,
         cleaned,
     )
-    return {"rows_upserted": len(cleaned)}
+    return {"rows_upserted": len(cleaned), "effective_date": eff}
 
 def _billing_ts_date_sql(expr: str) -> str:
     """SQLite expression: M/D/YYYY HH:MM -> YYYY-MM-DD for range compare."""
@@ -2616,6 +2799,15 @@ def query_postage(
     else:
         oz_13plus_sel = "0 AS oz_13plus"
 
+    flat_weight_sql = "CAST(ROUND(p.weight_oz) AS INTEGER)"
+    flat_as_of_sql = "p.file_date"
+    frc_match = _flat_rate_tier_match_sql(
+        "frc", weight_sql=flat_weight_sql, as_of_sql=flat_as_of_sql
+    )
+    fret_match = _flat_rate_tier_match_sql(
+        "fret", weight_sql=flat_weight_sql, as_of_sql=flat_as_of_sql
+    )
+
     sql = f"""
     SELECT
         {date_sel} AS file_date,
@@ -2661,12 +2853,12 @@ def query_postage(
     LEFT JOIN flat_rate_costs frc
       ON p.mail_class IN {POSTAGE_INVOICE_FLAT_MAIL_SQL_IN}
      AND p.mail_class <> '{INVOICE_EFD_FLAT_MAIL_CLASS}'
-     AND CAST(ROUND(p.weight_oz) AS INTEGER) BETWEEN 1 AND 13
-     AND CAST(ROUND(p.weight_oz) AS INTEGER) = CAST(frc.weight_not_over_oz AS INTEGER)
+     AND {flat_weight_sql} BETWEEN 1 AND 13
+     AND {frc_match}
     LEFT JOIN flat_rate_costs fret
       ON p.mail_class IN {POSTAGE_INVOICE_FLAT_MAIL_SQL_IN}
-     AND CAST(ROUND(p.weight_oz) AS INTEGER) BETWEEN 1 AND 13
-     AND CAST(ROUND(p.weight_oz) AS INTEGER) = CAST(fret.weight_not_over_oz AS INTEGER)
+     AND {flat_weight_sql} BETWEEN 1 AND 13
+     AND {fret_match}
     WHERE {where_sql}
     GROUP BY {date_group}c.customer_number, p.mail_class
     ORDER BY {order_date}parent_name, c.customer_name, p.mail_class
@@ -3949,6 +4141,82 @@ def get_priority_mail_retail_rates(
     otherwise uses today's calendar date."""
     od = str(as_of_date) if as_of_date is not None else date.today().isoformat()
     return _load_priority_mail_rates_as_of(conn, as_of_date=od)
+
+
+def get_priority_mail_retail_tariff_view(
+    conn: sqlite3.Connection,
+    *,
+    as_of_date: str | None = None,
+) -> dict[str, Any]:
+    """Priority Mail retail matrix + flat-rate items for System page display."""
+    od = str(as_of_date) if as_of_date is not None else date.today().isoformat()
+    rate_by_zone_lb, weights_by_zone = _load_priority_mail_rates_as_of(conn, as_of_date=od)
+
+    eff_row = conn.execute(
+        """
+        SELECT MAX(effective_date) AS eff
+        FROM priority_mail_retail
+        WHERE row_type = 'matrix'
+          AND (effective_date IS NULL OR effective_date <= ?)
+        """,
+        (od,),
+    ).fetchone()
+    tariff_effective_date = (
+        str(eff_row["eff"]) if eff_row and eff_row["eff"] is not None else None
+    )
+
+    all_lbs: set[int] = set()
+    for wlist in weights_by_zone.values():
+        all_lbs.update(wlist)
+    matrix: list[dict[str, Any]] = []
+    for lb in sorted(all_lbs):
+        zones: dict[str, float] = {}
+        for z in range(1, 10):
+            price = rate_by_zone_lb.get((z, lb))
+            if price is not None:
+                zones[str(z)] = float(price)
+        if zones:
+            matrix.append({"lb": lb, "zones": zones})
+
+    item_rows = conn.execute(
+        """
+        WITH ranked AS (
+          SELECT label, price, effective_date,
+            ROW_NUMBER() OVER (
+              PARTITION BY label
+              ORDER BY
+                CASE WHEN effective_date IS NULL THEN 1 ELSE 0 END,
+                effective_date DESC
+            ) AS rn
+          FROM priority_mail_retail
+          WHERE row_type = 'flat_rate_item'
+            AND label IS NOT NULL AND price IS NOT NULL
+            AND (effective_date IS NULL OR effective_date <= ?)
+        )
+        SELECT label, price, effective_date FROM ranked WHERE rn = 1
+        ORDER BY label COLLATE NOCASE
+        """,
+        (od,),
+    ).fetchall()
+    flat_rate_items = [
+        {
+            "label": str(r["label"]),
+            "price": float(r["price"]),
+            "effective_date": str(r["effective_date"]) if r["effective_date"] else None,
+        }
+        for r in item_rows
+    ]
+    if flat_rate_items:
+        item_dates = [x["effective_date"] for x in flat_rate_items if x["effective_date"]]
+        if item_dates and (tariff_effective_date is None or max(item_dates) > tariff_effective_date):
+            tariff_effective_date = max(item_dates)
+
+    return {
+        "as_of_date": od,
+        "tariff_effective_date": tariff_effective_date,
+        "matrix": matrix,
+        "flat_rate_items": flat_rate_items,
+    }
 
 
 def _retail_price_for_zone_lb(

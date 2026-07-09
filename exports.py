@@ -675,10 +675,10 @@ def fill_postage_invoice_worksheet(
     cur = conn.cursor()
 
     rates: dict[int, float] = {}
-    for row in cur.execute(
-        "SELECT weight_not_over_oz, rate_retail FROM flat_rate_costs ORDER BY weight_not_over_oz"
-    ):
-        rates[int(row["weight_not_over_oz"])] = float(row["rate_retail"] or 0)
+    flat_view = db.get_flat_rate_costs(conn, as_of_date=end_date)
+    for row in flat_view["rows"]:
+        w = int(row["weight_not_over_oz"])
+        rates[w] = float(row["rate_retail"] or 0)
 
     scope_range_sql, scope_range_params = db.postage_scope_where_clause(
         start_date,

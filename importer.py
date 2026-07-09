@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
 import tempfile
+import zipfile
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
+
+import db
 
 # Column A: skip title / header rows (case-insensitive prefix).
 SKIP_A_PREFIXES = (
@@ -870,14 +874,16 @@ def import_flat_rate_costs(csv_path: str, db_path: Path | str) -> dict[str, Any]
     conn.execute("PRAGMA foreign_keys = ON")
     cur = conn.cursor()
     cur.execute("DELETE FROM flat_rate_costs")
+    for row in rows:
+        row["effective_date"] = db.FLAT_RATE_BASELINE_DATE
     cur.executemany(
         """
         INSERT INTO flat_rate_costs
             (weight_not_over_oz, rate_5digit, rate_3digit, rate_aadc,
-             rate_mixed_adc, rate_machinable_pres, rate_retail)
+             rate_mixed_adc, rate_machinable_pres, rate_retail, effective_date)
         VALUES
             (:weight_not_over_oz, :rate_5digit, :rate_3digit, :rate_aadc,
-             :rate_mixed_adc, :rate_machinable_pres, :rate_retail)
+             :rate_mixed_adc, :rate_machinable_pres, :rate_retail, :effective_date)
         """,
         rows,
     )
@@ -1472,3 +1478,261 @@ def import_ground_advantage_retail(csv_path: str, db_path: Path | str) -> dict[s
         "effective_date": effective_date,
         "file_name": file_name,
     }
+
+
+NOTICE123_DIR = db.ROOT / "Notice123"
+
+NOTICE123_PM_RETAIL_CSV = "PM Retail.csv"
+NOTICE123_FCM_RETAIL_CSV = "FCM & EDDM - Retail.csv"
+NOTICE123_FCM_COMM_FLATS_CSV = "FCM - Comm Flats.csv"
+
+
+def _parse_notice123_money(val: Any) -> float | None:
+    try:
+        return float(str(val).replace("$", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_notice123_weight_oz(val: Any) -> float | None:
+    try:
+        w = float(str(val).strip())
+    except (ValueError, TypeError):
+        return None
+    if w <= 0 or w > 13:
+        return None
+    return w
+
+
+def parse_notice123_fcm_retail_flats(csv_path: str) -> dict[float, float]:
+    """Parse flats retail tiers from FCM & EDDM - Retail.csv (cols C/D)."""
+    retail_by_weight: dict[float, float] = {}
+    with open(csv_path, encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) < 4:
+                continue
+            w = _parse_notice123_weight_oz(row[2])
+            if w is None:
+                continue
+            price = _parse_notice123_money(row[3])
+            if price is None:
+                continue
+            retail_by_weight[w] = price
+    return retail_by_weight
+
+
+def parse_notice123_fcm_comm_flats_presort(csv_path: str) -> list[dict[str, Any]]:
+    """Parse commercial presort tiers from FCM - Comm Flats.csv."""
+    rows: list[dict[str, Any]] = []
+    with open(csv_path, encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) < 5:
+                continue
+            w = _parse_notice123_weight_oz(row[0])
+            if w is None:
+                continue
+            rows.append(
+                {
+                    "weight_not_over_oz": w,
+                    "rate_5digit": _parse_notice123_money(row[1]),
+                    "rate_3digit": _parse_notice123_money(row[2]),
+                    "rate_mixed_adc": _parse_notice123_money(row[3]),
+                    "rate_machinable_pres": _parse_notice123_money(row[4]),
+                }
+            )
+    return rows
+
+
+def _notice123_csv_rank(path: Path, root: Path) -> tuple[int, int, int, str]:
+    """Sort key for duplicate CSV resolution (lower = preferred)."""
+    rel = path.relative_to(root)
+    depth = len(rel.parts) - 1
+    parent_parts = rel.parts[:-1]
+    in_notice_folder = any("notice 123" in part.lower() for part in parent_parts)
+    return (
+        0 if depth > 0 else 1,
+        0 if in_notice_folder else 1,
+        -len(rel.parts),
+        str(rel).lower(),
+    )
+
+
+def _find_notice123_csv(root: Path, basename: str) -> tuple[Path, int]:
+    """
+    Locate a required Notice 123 CSV under ``root``.
+
+    Returns ``(path, candidate_count)``. When multiple paths match, picks the best
+    nested path (prefer folders named like Notice 123). Raises if top candidates
+    differ in file content.
+    """
+    matches = [p for p in root.rglob("*.csv") if p.name.lower() == basename.lower()]
+    if not matches:
+        raise ValueError(f"Required Notice 123 file not found: {basename}")
+    if len(matches) == 1:
+        return matches[0], 1
+
+    ranked = sorted(matches, key=lambda p: _notice123_csv_rank(p, root))
+    best_rank = _notice123_csv_rank(ranked[0], root)
+    candidates = [p for p in ranked if _notice123_csv_rank(p, root) == best_rank]
+    hashes = {hashlib.sha256(p.read_bytes()).hexdigest() for p in candidates}
+    if len(hashes) > 1:
+        paths = ", ".join(str(p.relative_to(root)) for p in candidates[:5])
+        raise ValueError(
+            f"Multiple distinct {basename} files found (content differs): {paths}"
+        )
+    return candidates[0], len(matches)
+
+
+def extract_notice123_zip(zip_path: str | Path, dest_dir: Path | None = None) -> Path:
+    """Extract a Notice 123 zip into a fresh staging directory (not Notice123/)."""
+    _ = dest_dir  # staging only; dest_dir is applied when replacing Notice123/
+    staging = Path(tempfile.mkdtemp(prefix="notice123-stage-"))
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(staging)
+    return staging
+
+
+def _replace_notice123_dir(staged_root: Path, dest_dir: Path | None = None) -> Path:
+    """Replace Notice123/ (or ``dest_dir``) with the staged extract tree."""
+    target = dest_dir or NOTICE123_DIR
+    parent = target.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.move(str(staged_root), str(target))
+    return target
+
+
+def import_notice123_flat_rates(
+    retail_csv: str,
+    presort_csv: str,
+    db_path: Path | str,
+    *,
+    effective_date: str,
+) -> dict[str, Any]:
+    """Import merged flats retail + presort for one effective-date revision."""
+    retail_by_weight = parse_notice123_fcm_retail_flats(retail_csv)
+    presort_rows = parse_notice123_fcm_comm_flats_presort(presort_csv)
+    if not retail_by_weight and not presort_rows:
+        raise ValueError("No flats rate tiers found in Notice 123 CSV files")
+
+    merged: dict[float, dict[str, Any]] = {}
+    for w, retail in retail_by_weight.items():
+        merged[w] = {
+            "weight_not_over_oz": w,
+            "rate_retail": retail,
+            "rate_5digit": None,
+            "rate_3digit": None,
+            "rate_aadc": None,
+            "rate_mixed_adc": None,
+            "rate_machinable_pres": None,
+            "effective_date": effective_date,
+        }
+    for row in presort_rows:
+        w = float(row["weight_not_over_oz"])
+        if w not in merged:
+            merged[w] = {
+                "weight_not_over_oz": w,
+                "rate_retail": None,
+                "rate_5digit": None,
+                "rate_3digit": None,
+                "rate_aadc": None,
+                "rate_mixed_adc": None,
+                "rate_machinable_pres": None,
+                "effective_date": effective_date,
+            }
+        for col in (
+            "rate_5digit",
+            "rate_3digit",
+            "rate_mixed_adc",
+            "rate_machinable_pres",
+        ):
+            if row.get(col) is not None:
+                merged[w][col] = row[col]
+
+    out_rows = [merged[k] for k in sorted(merged.keys())]
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys = ON")
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM flat_rate_costs WHERE effective_date IS ?",
+        (effective_date,),
+    )
+    cur.executemany(
+        """
+        INSERT INTO flat_rate_costs (
+            weight_not_over_oz, rate_5digit, rate_3digit, rate_aadc,
+            rate_mixed_adc, rate_machinable_pres, rate_retail, effective_date
+        ) VALUES (
+            :weight_not_over_oz, :rate_5digit, :rate_3digit, :rate_aadc,
+            :rate_mixed_adc, :rate_machinable_pres, :rate_retail, :effective_date
+        )
+        """,
+        out_rows,
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "rows_imported": len(out_rows),
+        "effective_date": effective_date,
+        "retail_tiers": len(retail_by_weight),
+        "presort_tiers": len(presort_rows),
+    }
+
+
+def import_notice123_rate_case(
+    zip_path: str | Path,
+    db_path: Path | str,
+    *,
+    effective_date: str,
+    dest_dir: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Extract a Notice 123 zip and import PM retail + flats retail/presort rates.
+    """
+    eff = str(effective_date).strip()
+    if not eff:
+        raise ValueError("effective_date required (YYYY-MM-DD)")
+
+    staged_root: Path | None = None
+    try:
+        staged_root = extract_notice123_zip(zip_path)
+        pm_csv, pm_candidates = _find_notice123_csv(staged_root, NOTICE123_PM_RETAIL_CSV)
+        retail_csv, retail_candidates = _find_notice123_csv(
+            staged_root, NOTICE123_FCM_RETAIL_CSV
+        )
+        presort_csv, presort_candidates = _find_notice123_csv(
+            staged_root, NOTICE123_FCM_COMM_FLATS_CSV
+        )
+
+        pm_result = import_priority_mail_retail(
+            str(pm_csv), db_path, effective_date=eff
+        )
+        flats_result = import_notice123_flat_rates(
+            str(retail_csv),
+            str(presort_csv),
+            db_path,
+            effective_date=eff,
+        )
+        files_rel = {
+            "pm_retail": str(pm_csv.relative_to(staged_root)),
+            "fcm_retail": str(retail_csv.relative_to(staged_root)),
+            "fcm_comm_flats": str(presort_csv.relative_to(staged_root)),
+            "pm_retail_candidates": pm_candidates,
+            "fcm_retail_candidates": retail_candidates,
+            "fcm_comm_flats_candidates": presort_candidates,
+        }
+        extract_path = _replace_notice123_dir(staged_root, dest_dir=dest_dir)
+        staged_root = None
+        return {
+            "effective_date": eff,
+            "extract_path": str(extract_path),
+            "priority_mail": pm_result,
+            "flats": flats_result,
+            "files": files_rel,
+        }
+    finally:
+        if staged_root is not None and staged_root.exists():
+            shutil.rmtree(staged_root, ignore_errors=True)

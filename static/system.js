@@ -158,6 +158,100 @@
     showBanner(`Saved ${j.rows_upserted || 0} flat rate row(s) and postage options.`);
   }
 
+  function fmtRateDisplay(v) {
+    if (v == null || v === "") return "—";
+    const n = Number(v);
+    if (Number.isNaN(n)) return "—";
+    return n.toFixed(3).replace(/\.?0+$/, (m) => (m === "." ? "" : m));
+  }
+
+  function fmtRateDisplayMoney(v) {
+    if (v == null || v === "") return "—";
+    const n = Number(v);
+    if (Number.isNaN(n)) return "—";
+    return n.toFixed(2);
+  }
+
+  function formatQueriedMeta(j) {
+    const parts = [];
+    if (j.queried_at) {
+      const d = new Date(j.queried_at);
+      parts.push(`Queried at ${Number.isNaN(d.getTime()) ? j.queried_at : d.toLocaleString()}`);
+    }
+    if (j.as_of_date) parts.push(`as-of ${j.as_of_date}`);
+    if (j.tariff_effective_date) parts.push(`tariff effective ${j.tariff_effective_date}`);
+    else if (j.tariff_effective_date === null) parts.push("no tariff on file");
+    return parts.join(" · ");
+  }
+
+  function buildFlatsRatesViewTable(rows) {
+    const container = $("flatsRatesViewTable");
+    if (!container) return;
+    if (!rows || !rows.length) {
+      container.innerHTML =
+        "<p class='empty-state'>No flats rates found for today. Import a Notice 123 rate case first.</p>";
+      return;
+    }
+    let html =
+      "<table class='data-table'><thead><tr>" +
+      "<th>Weight (oz)</th><th class='num'>Retail</th><th class='num'>5-Digit</th>" +
+      "<th class='num'>3-Digit</th><th class='num'>AADC</th><th class='num'>Mixed ADC</th>" +
+      "<th class='num'>Machinable Presort</th></tr></thead><tbody>";
+    for (const r of rows) {
+      html += "<tr>";
+      html += `<td>${escapeHtml(fmtWeight(r.weight_not_over_oz))}</td>`;
+      html += `<td class="num">${escapeHtml(fmtRateDisplayMoney(r.rate_retail))}</td>`;
+      html += `<td class="num">${escapeHtml(fmtRateDisplay(r.rate_5digit))}</td>`;
+      html += `<td class="num">${escapeHtml(fmtRateDisplay(r.rate_3digit))}</td>`;
+      html += `<td class="num">${escapeHtml(fmtRateDisplay(r.rate_aadc))}</td>`;
+      html += `<td class="num">${escapeHtml(fmtRateDisplay(r.rate_mixed_adc))}</td>`;
+      html += `<td class="num">${escapeHtml(fmtRateDisplay(r.rate_machinable_pres))}</td>`;
+      html += "</tr>";
+    }
+    html += "</tbody></table>";
+    container.innerHTML = html;
+  }
+
+  function buildParcelRatesViewTable(matrix, flatRateItems) {
+    const container = $("parcelRatesViewTable");
+    if (!container) return;
+    if ((!matrix || !matrix.length) && (!flatRateItems || !flatRateItems.length)) {
+      container.innerHTML =
+        "<p class='empty-state'>No Priority Mail rates found for today. Import a Notice 123 rate case first.</p>";
+      return;
+    }
+    let html = "";
+    if (matrix && matrix.length) {
+      html +=
+        "<table class='data-table'><thead><tr><th>Lb</th>" +
+        [1, 2, 3, 4, 5, 6, 7, 8, 9].map((z) => `<th class='num'>Zone ${z}</th>`).join("") +
+        "</tr></thead><tbody>";
+      for (const row of matrix) {
+        html += `<tr><td>${escapeHtml(String(row.lb))}</td>`;
+        const zones = row.zones || {};
+        for (let z = 1; z <= 9; z += 1) {
+          const p = zones[String(z)];
+          html += `<td class="num">${escapeHtml(p != null ? fmtRateDisplayMoney(p) : "—")}</td>`;
+        }
+        html += "</tr>";
+      }
+      html += "</tbody></table>";
+    }
+    if (flatRateItems && flatRateItems.length) {
+      html +=
+        "<h3 class='system-section-title' style='margin-top:1rem'>Flat-rate envelopes &amp; boxes</h3>" +
+        "<table class='data-table'><thead><tr><th>Item</th><th class='num'>Price</th></tr></thead><tbody>";
+      for (const item of flatRateItems) {
+        html += "<tr>";
+        html += `<td>${escapeHtml(item.label || "")}</td>`;
+        html += `<td class="num">${escapeHtml(fmtRateDisplayMoney(item.price))}</td>`;
+        html += "</tr>";
+      }
+      html += "</tbody></table>";
+    }
+    container.innerHTML = html;
+  }
+
   $("btnSeedFlatsRetail").addEventListener("click", () => {
     seedDefaults().catch((e) => {
       showBanner("");
@@ -172,12 +266,12 @@
     });
   });
 
-  const btnPm = $("btnUploadPriorityMail");
-  if (btnPm) {
-    btnPm.addEventListener("click", async () => {
+  const btnNotice123 = $("btnUploadNotice123");
+  if (btnNotice123) {
+    btnNotice123.addEventListener("click", async () => {
       showError("");
-      const effEl = $("priorityMailEffectiveDate");
-      const fileEl = $("priorityMailFile");
+      const effEl = $("notice123EffectiveDate");
+      const fileEl = $("notice123ZipFile");
       const eff = effEl && effEl.value ? String(effEl.value).trim() : "";
       const file = fileEl && fileEl.files && fileEl.files[0] ? fileEl.files[0] : null;
       if (!eff) {
@@ -185,24 +279,76 @@
         return;
       }
       if (!file) {
-        showError("Choose an .xlsx file.");
+        showError("Choose a Notice 123 .zip file.");
         return;
       }
-      showBanner("Uploading Priority Mail tariff…");
+      showBanner("Importing Notice 123 rate case…");
       const fd = new FormData();
       fd.append("effective_date", eff);
       fd.append("file", file, file.name);
       try {
-        const r = await fetch("/api/import/priority-mail-retail", { method: "POST", body: fd });
+        const r = await fetch("/api/import/notice123-rate-case", { method: "POST", body: fd });
         const j = await r.json();
-        if (!r.ok) throw new Error(j.error || "Upload failed");
+        if (!r.ok) throw new Error(j.error || "Import failed");
+        const pmRows = (j.priority_mail && j.priority_mail.rows_imported) || 0;
+        const flatRows = (j.flats && j.flats.rows_imported) || 0;
         showBanner(
-          `Imported ${j.rows_imported || 0} row(s); effective ${j.effective_date || eff}.`
+          `Imported PM ${pmRows} row(s), flats ${flatRows} tier(s); effective ${j.effective_date || eff}.`
         );
         if (fileEl) fileEl.value = "";
       } catch (e) {
         showBanner("");
         showError(String(e.message || e));
+      }
+    });
+  }
+
+  const btnFlatsView = $("btnLoadFlatsRatesView");
+  if (btnFlatsView) {
+    btnFlatsView.addEventListener("click", async () => {
+      showError("");
+      const meta = $("flatsRatesMeta");
+      const table = $("flatsRatesViewTable");
+      if (table) table.innerHTML = "<p class='empty-state'>Loading…</p>";
+      btnFlatsView.disabled = true;
+      try {
+        const r = await fetch("/api/system/rates/flats");
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "Failed to load flats rates");
+        if (meta) {
+          meta.textContent = formatQueriedMeta(j);
+          meta.classList.remove("hidden");
+        }
+        buildFlatsRatesViewTable(j.rows || []);
+      } catch (e) {
+        if (table) table.innerHTML = `<p class='empty-state'>${escapeHtml(String(e.message || e))}</p>`;
+      } finally {
+        btnFlatsView.disabled = false;
+      }
+    });
+  }
+
+  const btnParcelView = $("btnLoadParcelRatesView");
+  if (btnParcelView) {
+    btnParcelView.addEventListener("click", async () => {
+      showError("");
+      const meta = $("parcelRatesMeta");
+      const table = $("parcelRatesViewTable");
+      if (table) table.innerHTML = "<p class='empty-state'>Loading…</p>";
+      btnParcelView.disabled = true;
+      try {
+        const r = await fetch("/api/system/rates/parcels");
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "Failed to load parcel rates");
+        if (meta) {
+          meta.textContent = formatQueriedMeta(j);
+          meta.classList.remove("hidden");
+        }
+        buildParcelRatesViewTable(j.matrix || [], j.flat_rate_items || []);
+      } catch (e) {
+        if (table) table.innerHTML = `<p class='empty-state'>${escapeHtml(String(e.message || e))}</p>`;
+      } finally {
+        btnParcelView.disabled = false;
       }
     });
   }

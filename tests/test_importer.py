@@ -583,3 +583,183 @@ def test_import_priority_mail_retail_replaces_same_effective_slice_only(monkeypa
         assert all(z in range(1, 10) and price == 11.0 for z, price in june)
     finally:
         conn.close()
+
+
+FCM_RETAIL_SAMPLE = """First-Class Mail and EDDM - Retail,,,,Final,,6/15/2026,,
+,,,,,,
+First-Class Mail,,,,,,
+LETTERS,,FLATS,,,,
+Weight Not Over (ounces),,Weight Not Over (ounces),,,,
+1,0.82,1,1.69,,,
+2,1.11,2,1.98,,,
+"""
+
+FCM_COMM_FLATS_SAMPLE = """First-Class Mail - Commercial - Flats,,,,,Final,,6/15/2026,,
+Weight Not Over (ounces),5-Digit,3-Digit,Mixed,Presorted,
+1,1.025,1.264,1.585,1.590,
+2,1.315,1.554,1.875,1.880,
+"""
+
+PM_RETAIL_SAMPLE = """Priority Mail - Retail,,Final,,6/15/2026
+Flat Rate Envelopes,12.90
+Weight Not Over (Lbs),Zones
+,Zone 1,Zone 2
+1,11.00,11.50
+2,11.95,12.65
+"""
+
+
+def test_parse_notice123_fcm_retail_flats(tmp_path):
+    p = tmp_path / "FCM & EDDM - Retail.csv"
+    p.write_text(FCM_RETAIL_SAMPLE, encoding="utf-8")
+    out = importer.parse_notice123_fcm_retail_flats(str(p))
+    assert out[1.0] == 1.69
+    assert out[2.0] == 1.98
+
+
+def test_parse_notice123_fcm_comm_flats_presort(tmp_path):
+    p = tmp_path / "FCM - Comm Flats.csv"
+    p.write_text(FCM_COMM_FLATS_SAMPLE, encoding="utf-8")
+    rows = importer.parse_notice123_fcm_comm_flats_presort(str(p))
+    assert len(rows) == 2
+    assert rows[0]["rate_5digit"] == 1.025
+    assert rows[0]["rate_machinable_pres"] == 1.59
+
+
+def test_import_notice123_flat_rates_and_future_effective_date(monkeypatch, tmp_path):
+    import sqlite3
+
+    import db as db_actual
+
+    db_path = tmp_path / "flats.db"
+    monkeypatch.setattr(db_actual, "DB_PATH", db_path)
+    db_actual.init_db()
+
+    retail = tmp_path / "retail.csv"
+    presort = tmp_path / "presort.csv"
+    retail.write_text(FCM_RETAIL_SAMPLE, encoding="utf-8")
+    presort.write_text(FCM_COMM_FLATS_SAMPLE, encoding="utf-8")
+
+    importer.import_notice123_flat_rates(
+        str(retail), str(presort), db_path, effective_date="2026-07-01"
+    )
+
+    conn = db_actual.get_connection()
+    try:
+        before = db_actual.get_flat_rate_costs(conn, as_of_date="2026-06-15")
+        assert before["rows"] == []
+        active = db_actual.get_flat_rate_costs(conn, as_of_date="2026-07-15")
+        assert len(active["rows"]) == 2
+        assert active["tariff_effective_date"] == "2026-07-01"
+        assert active["rows"][0]["rate_retail"] == 1.69
+        assert active["rows"][0]["rate_5digit"] == 1.025
+    finally:
+        conn.close()
+
+
+def test_import_notice123_rate_case_zip(monkeypatch, tmp_path):
+    import sqlite3
+    import zipfile
+
+    import db as db_actual
+
+    db_path = tmp_path / "notice.db"
+    extract_dir = tmp_path / "Notice123"
+    monkeypatch.setattr(db_actual, "DB_PATH", db_path)
+    monkeypatch.setattr(importer, "NOTICE123_DIR", extract_dir)
+    db_actual.init_db()
+
+    inner = "July 2026 Price Change - Notice 123"
+    folder = tmp_path / "zip_src" / inner
+    folder.mkdir(parents=True)
+    (folder / "PM Retail.csv").write_text(PM_RETAIL_SAMPLE, encoding="utf-8")
+    (folder / "FCM & EDDM - Retail.csv").write_text(FCM_RETAIL_SAMPLE, encoding="utf-8")
+    (folder / "FCM - Comm Flats.csv").write_text(FCM_COMM_FLATS_SAMPLE, encoding="utf-8")
+
+    zip_path = tmp_path / "notice.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for f in folder.rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(tmp_path / "zip_src"))
+
+    out = importer.import_notice123_rate_case(
+        zip_path, db_path, effective_date="2026-07-01", dest_dir=extract_dir
+    )
+    assert out["effective_date"] == "2026-07-01"
+    assert out["priority_mail"]["rows_imported"] > 0
+    assert out["flats"]["rows_imported"] == 2
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        pm_count = conn.execute(
+            "SELECT COUNT(*) FROM priority_mail_retail WHERE effective_date = ?",
+            ("2026-07-01",),
+        ).fetchone()[0]
+        flat_count = conn.execute(
+            "SELECT COUNT(*) FROM flat_rate_costs WHERE effective_date = ?",
+            ("2026-07-01",),
+        ).fetchone()[0]
+        assert pm_count > 0
+        assert flat_count == 2
+    finally:
+        conn.close()
+
+
+def test_find_notice123_csv_prefers_nested_notice_folder(tmp_path):
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "PM Retail.csv").write_text("stale", encoding="utf-8")
+    nested = root / "July 2026 Price Change - Notice 123"
+    nested.mkdir()
+    (nested / "PM Retail.csv").write_text("nested", encoding="utf-8")
+
+    chosen, count = importer._find_notice123_csv(root, "PM Retail.csv")
+    assert count == 2
+    assert chosen == nested / "PM Retail.csv"
+
+
+def test_import_notice123_rate_case_replaces_stale_root_csvs(monkeypatch, tmp_path):
+    import sqlite3
+    import zipfile
+
+    import db as db_actual
+
+    db_path = tmp_path / "notice.db"
+    notice_dir = tmp_path / "Notice123"
+    notice_dir.mkdir()
+    (notice_dir / "PM Retail.csv").write_text("stale-root", encoding="utf-8")
+
+    monkeypatch.setattr(db_actual, "DB_PATH", db_path)
+    monkeypatch.setattr(importer, "NOTICE123_DIR", notice_dir)
+    db_actual.init_db()
+
+    inner = "July 2026 Price Change - Notice 123"
+    folder = tmp_path / "zip_src" / inner
+    folder.mkdir(parents=True)
+    (folder / "PM Retail.csv").write_text(PM_RETAIL_SAMPLE, encoding="utf-8")
+    (folder / "FCM & EDDM - Retail.csv").write_text(FCM_RETAIL_SAMPLE, encoding="utf-8")
+    (folder / "FCM - Comm Flats.csv").write_text(FCM_COMM_FLATS_SAMPLE, encoding="utf-8")
+
+    zip_path = tmp_path / "notice.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for f in folder.rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(tmp_path / "zip_src"))
+
+    out = importer.import_notice123_rate_case(
+        zip_path, db_path, effective_date="2026-07-01", dest_dir=notice_dir
+    )
+    assert out["priority_mail"]["rows_imported"] > 0
+    assert out["flats"]["rows_imported"] == 2
+    assert not (notice_dir / "PM Retail.csv").exists()
+    assert (notice_dir / inner / "PM Retail.csv").exists()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        pm_count = conn.execute(
+            "SELECT COUNT(*) FROM priority_mail_retail WHERE effective_date = ?",
+            ("2026-07-01",),
+        ).fetchone()[0]
+        assert pm_count > 0
+    finally:
+        conn.close()
