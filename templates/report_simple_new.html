@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>New Report</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="header header-with-nav">
+      <a class="btn btn-nav" href="{{ url_for('scheduler.scheduler_dashboard_page') }}">&#8592; Scheduled Reports</a>
+      <a class="btn btn-nav" href="{{ url_for('scheduler.report_settings_page') }}">Report Settings</a>
+      <h1>New Report</h1>
+    </header>
+
+    <div id="banner" class="system-banner hidden" role="status"></div>
+    <div id="error" class="error-banner hidden" role="alert"></div>
+
+    <section class="panel">
+      <h2 class="system-section-title">What to send</h2>
+      <p class="system-hint">Drop report files into the folder below. At the time and days you choose, the system emails whatever files are in the folder, then moves them into a <code>Sent</code> subfolder.</p>
+      <label class="field grow">
+        <span class="field-label">Report name</span>
+        <input type="text" id="reportName" placeholder="e.g. Daily Parcel Summary" />
+      </label>
+      <label class="field grow">
+        <span class="field-label">Folder to watch</span>
+        <div class="input-group">
+          <input type="text" id="attachmentFolder" placeholder="\\FileServer\Reports\DailyParcel\" />
+          <button type="button" class="btn btn-browse" id="btnBrowseFolder">Browse&hellip;</button>
+        </div>
+      </label>
+      <div class="system-actions">
+        <button type="button" class="btn" id="btnCheckFolder">Check folder now</button>
+      </div>
+      <div id="folderPreview" class="scheduler-preview hidden"></div>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">When to send</h2>
+      <label class="field">
+        <span class="field-label">Time of day</span>
+        <input type="time" id="scheduledTime" />
+      </label>
+      <span class="field-label">Days of week</span>
+      <div id="daysOfWeekGroup" class="schedule-dow-row" role="group" aria-label="Days of week">
+        <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Mon" /> Mon</label>
+        <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Tue" /> Tue</label>
+        <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Wed" /> Wed</label>
+        <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Thu" /> Thu</label>
+        <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Fri" /> Fri</label>
+        <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Sat" /> Sat</label>
+        <label class="check schedule-dow"><input type="checkbox" class="dow-cb" value="Sun" /> Sun</label>
+      </div>
+      <div class="system-actions">
+        <button type="button" class="btn" id="btnWeekdays">Mon&ndash;Fri</button>
+        <button type="button" class="btn" id="btnEveryDay">Every day</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Who receives it</h2>
+      <label class="field grow">
+        <span class="field-label">Recipients (one email per line)</span>
+        <textarea id="recipients" rows="4" placeholder="person@example.com"></textarea>
+      </label>
+      <label class="field grow">
+        <span class="field-label">Recipient groups (optional)</span>
+        <select id="recipientGroups" multiple size="4"></select>
+      </label>
+    </section>
+
+    <section class="panel">
+      <h2 class="system-section-title">Email text</h2>
+      <p class="system-hint">Tokens: <code>{JOB_NAME}</code>, <code>{YYYY}</code>, <code>{MM}</code>, <code>{DD}</code>, <code>{DOW}</code>, <code>{FILE_LIST}</code>.</p>
+      <label class="field grow">
+        <span class="field-label">Subject</span>
+        <input type="text" id="subjectTemplate" value="{JOB_NAME} - {YYYY}-{MM}-{DD}" />
+      </label>
+      <label class="field grow">
+        <span class="field-label">Body</span>
+        <textarea id="bodyTemplate" rows="6">Attached are the {JOB_NAME} files for {YYYY}-{MM}-{DD}.
+
+{FILE_LIST}</textarea>
+      </label>
+    </section>
+
+    <section class="panel">
+      <div class="system-actions">
+        <button type="button" class="btn btn-primary" id="btnSave">Create report</button>
+      </div>
+    </section>
+  </div>
+  <script src="{{ url_for('static', filename='folder_picker.js') }}"></script>
+  <script src="{{ url_for('static', filename='report_simple.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+This message was sent to you automatically by LMS SFTP Server on the following event: File Upload.
+Server Local Time: 05/22/26 10:30:20 AM
+
+Full Name: riversca
+
+File Name: RIVPCFTP.zip
+
+File Size: 11989 bytes
+
+Lineage Mailing Services

@@ -20,6 +20,7 @@
       <span class="watcher-dot" id="watcherDot" aria-hidden="true"></span>
       <span class="watcher-label" id="watcherLabel">Watcher …</span>
       <button type="button" class="btn btn-scan" id="btnScan">&#128260; Scan Now</button>
+      <button type="button" class="btn btn-scan" id="btnRestart">&#8635; Restart server</button>
     </div>
 
     <section class="panel controls-panel">
@@ -59,6 +60,7 @@
         <span class="readiness-dot" id="reportReadinessDot" aria-hidden="true"></span>
         <span class="readiness-label" id="reportReadinessLabel">Checking reports…</span>
       </div>
+      <div class="daily-report-notice hidden" id="dailyReportsNotice" role="status" aria-live="polite"></div>
       <div class="noclass-notice hidden" id="noclassNotice" role="status" aria-live="polite"></div>
       <div class="controls-row controls-options">
         <label class="check"><input type="checkbox" id="showParents" checked /> Show Parent Accounts</label>
@@ -144,7 +146,7 @@
         <span class="export-btn-spinner hidden" aria-hidden="true"></span>
       </button>
       <button type="button" class="btn btn-export" id="btnExportEfdDailyReport">
-        <span class="export-btn-label">&#128229; Export EFD Daily Report</span>
+        <span class="export-btn-label">&#128229; Export Daily reports</span>
         <span class="export-btn-spinner hidden" aria-hidden="true"></span>
       </button>
       <button type="button" class="btn btn-export" id="btnExportConsolidatedVolumes">

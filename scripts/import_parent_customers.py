@@ -12,7 +12,7 @@ import importer  # noqa: E402
 
 
 def main() -> None:
-    csv_path = ROOT / "Parent Customer .csv"
+    csv_path = ROOT / "projectfiles" / "data" / "Parent Customer .csv"
     if not csv_path.is_file():
         print(f"Missing file: {csv_path}", file=sys.stderr)
         sys.exit(1)

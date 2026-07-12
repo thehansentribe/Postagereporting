@@ -10,6 +10,7 @@ import pytest
 
 import db as dbmod
 import email_service
+import scheduler
 import scheduler_db
 import scheduler_tokens
 from scheduler import evaluate_data_readiness
@@ -107,3 +108,107 @@ def test_data_readiness_all_required(tmp_path):
     }
     data = evaluate_data_readiness(job, date.today(), {})
     assert data["ready"] is True
+
+
+def test_folder_mode_empty_not_ready(tmp_path):
+    folder = tmp_path / "reports"
+    folder.mkdir()
+    job = {"name": "Folder job", "attachment_folder": str(folder)}
+    data = evaluate_data_readiness(job, date.today(), {})
+    assert data["ready"] is False
+    assert data["folder_mode"] is True
+    assert data["resolved"] == []
+
+
+def test_folder_mode_with_files_ready(tmp_path):
+    folder = tmp_path / "reports"
+    folder.mkdir()
+    (folder / "a.csv").write_text("x\n")
+    (folder / "b.csv").write_text("y\n")
+    # A subfolder should be ignored by folder scanning.
+    (folder / "Sent").mkdir()
+    job = {"name": "Folder job", "attachment_folder": str(folder)}
+    data = evaluate_data_readiness(job, date.today(), {})
+    assert data["ready"] is True
+    assert len(data["resolved"]) == 2
+    assert all(p.endswith(".csv") for p in data["resolved"])
+
+
+def test_folder_mode_send_and_archive(monkeypatch, tmp_path):
+    db_path = tmp_path / "sched.db"
+    monkeypatch.setattr(dbmod, "DB_PATH", db_path)
+    dbmod.init_db()
+
+    folder = tmp_path / "reports"
+    folder.mkdir()
+    (folder / "one.csv").write_text("111\n")
+    (folder / "two.csv").write_text("222\n")
+    email_root = tmp_path / "email"
+
+    conn = dbmod.get_connection()
+    try:
+        job = scheduler_db.create_job(
+            conn,
+            {
+                "name": "Parcel Summary",
+                "schedule_type": "weekly",
+                "scheduled_time": "08:00",
+                "days_of_week_csv": "Mon,Tue,Wed,Thu,Fri",
+                "attachment_folder": str(folder),
+                "subject_template": "{JOB_NAME} {YYYY}-{MM}-{DD}",
+                "body_template": "Files: {FILE_LIST}",
+                "recipients": ["dest@example.com"],
+            },
+        )
+        conn.commit()
+
+        settings = dbmod.get_scheduler_settings(conn)
+        settings[dbmod.SETTING_EMAIL_ROOT_PATH] = str(email_root)
+
+        result = scheduler.execute_job_send(
+            conn, job, settings, fire_date="2026-05-22"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert result.get("success") is True
+    # Originals moved out of the watch folder.
+    assert not (folder / "one.csv").exists()
+    assert not (folder / "two.csv").exists()
+    # Archived into Sent/<fire_date>/.
+    archive = folder / "Sent" / "2026-05-22"
+    assert (archive / "one.csv").is_file()
+    assert (archive / "two.csv").is_file()
+    # Email drop written with a .dat trigger and attachment copies.
+    assert list(email_root.glob("*.dat"))
+
+
+def test_folder_mode_job_roundtrip(monkeypatch, tmp_path):
+    db_path = tmp_path / "sched.db"
+    monkeypatch.setattr(dbmod, "DB_PATH", db_path)
+    dbmod.init_db()
+    conn = dbmod.get_connection()
+    try:
+        created = scheduler_db.create_job(
+            conn,
+            {
+                "name": "RT",
+                "schedule_type": "weekly",
+                "days_of_week_csv": "Mon",
+                "scheduled_time": "09:00",
+                "attachment_folder": "/tmp/watch",
+                "post_send_action": "archive",
+                "archive_subdir": "Sent",
+                "subject_template": "S",
+                "body_template": "B",
+                "recipients": ["x@y.com"],
+            },
+        )
+        conn.commit()
+        fetched = scheduler_db.get_job(conn, created["id"])
+        assert fetched["attachment_folder"] == "/tmp/watch"
+        assert fetched["post_send_action"] == "archive"
+        assert fetched["archive_subdir"] == "Sent"
+    finally:
+        conn.close()

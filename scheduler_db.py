@@ -32,6 +32,9 @@ def _row_to_job(row: sqlite3.Row, conn: sqlite3.Connection) -> dict[str, Any]:
         "send_failure_notification": bool(row["send_failure_notification"]),
         "retry_count": int(row["retry_count"] or 0),
         "retry_delay_seconds": int(row["retry_delay_seconds"] or 60),
+        "attachment_folder": row["attachment_folder"],
+        "post_send_action": row["post_send_action"] or "archive",
+        "archive_subdir": row["archive_subdir"] or "Sent",
         "required_files": list_job_required_files(conn, job_id),
         "attachments": list_job_attachments(conn, job_id),
         "recipients": list_job_recipients(conn, job_id),
@@ -181,8 +184,9 @@ def create_job(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, A
             effective_start_date, effective_end_date,
             subject_template, body_template, data_readiness_mode,
             stale_file_threshold_minutes, expiration_hours,
-            send_failure_notification, retry_count, retry_delay_seconds
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            send_failure_notification, retry_count, retry_delay_seconds,
+            attachment_folder, post_send_action, archive_subdir
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(payload["name"]).strip(),
@@ -203,6 +207,11 @@ def create_job(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, A
             1 if payload.get("send_failure_notification") else 0,
             int(payload.get("retry_count") or 0),
             int(payload.get("retry_delay_seconds") or 60),
+            (str(payload.get("attachment_folder")).strip() or None)
+            if payload.get("attachment_folder")
+            else None,
+            payload.get("post_send_action") or "archive",
+            payload.get("archive_subdir") or "Sent",
         ),
     )
     job_id = int(cur.lastrowid)
@@ -226,6 +235,7 @@ def update_job(conn: sqlite3.Connection, job_id: int, payload: dict[str, Any]) -
             subject_template = ?, body_template = ?, data_readiness_mode = ?,
             stale_file_threshold_minutes = ?, expiration_hours = ?,
             send_failure_notification = ?, retry_count = ?, retry_delay_seconds = ?,
+            attachment_folder = ?, post_send_action = ?, archive_subdir = ?,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
@@ -248,6 +258,11 @@ def update_job(conn: sqlite3.Connection, job_id: int, payload: dict[str, Any]) -
             1 if merged.get("send_failure_notification") else 0,
             int(merged.get("retry_count") or 0),
             int(merged.get("retry_delay_seconds") or 60),
+            (str(merged.get("attachment_folder")).strip() or None)
+            if merged.get("attachment_folder")
+            else None,
+            merged.get("post_send_action") or "archive",
+            merged.get("archive_subdir") or "Sent",
             job_id,
         ),
     )

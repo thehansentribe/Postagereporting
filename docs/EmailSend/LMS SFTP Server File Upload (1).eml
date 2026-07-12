@@ -1,0 +1,58 @@
+Received: from MW5PR22MB3394.namprd22.prod.outlook.com (2603:10b6:303:1aa::15)
+ by PH3PPF4EB60FE07.namprd22.prod.outlook.com with HTTPS; Fri, 22 May 2026
+ 15:34:39 +0000
+Received: from SN4PR22MB2935.namprd22.prod.outlook.com (2603:10b6:806:20e::16)
+ by MW5PR22MB3394.namprd22.prod.outlook.com (2603:10b6:303:1aa::15) with
+ Microsoft SMTP Server (version=TLS1_2,
+ cipher=TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384) id 15.21.48.17; Fri, 22 May
+ 2026 15:34:37 +0000
+Received: from SN4PR22MB2935.namprd22.prod.outlook.com ([::1]) by
+ SN4PR22MB2935.namprd22.prod.outlook.com ([fe80::581a:2326:16bb:a6e8%3]) with
+ Microsoft SMTP Server id 15.21.0048.016; Fri, 22 May 2026 15:34:37 +0000
+From: LMS DataProcessing <LMSDataProcessing@trustlineage.com>
+To: "Hailey.Erickson@riverside.courts.ca.gov"
+	<Hailey.Erickson@riverside.courts.ca.gov>, LMS DataProcessing
+	<LMSDataProcessing@trustlineage.com>
+Subject: LMS SFTP Server File Upload
+Thread-Topic: LMS SFTP Server File Upload
+Thread-Index: AQHc6gB/H+7uzFVZrkuK6DtfmPkY1A==
+X-MS-Exchange-MessageSentRepresentingType: 1
+Date: Fri, 22 May 2026 15:33:32 +0000
+Message-ID:
+	<dea1ba1a074c442b9fd06111f41e2a8b@SN4PR22MB2935.namprd22.prod.outlook.com>
+Content-Language: en-US
+X-MS-Exchange-Organization-AuthMechanism: 06
+X-MS-Exchange-Organization-AuthSource:
+	PH3PPF4EB60FE07.namprd22.prod.outlook.com
+X-MS-Has-Attach:
+X-MS-Exchange-Organization-AutoForwarded: true
+X-MS-Exchange-Organization-Network-Message-Id:
+	1958fed1-13ba-467e-7d9a-08deb817a219
+X-MS-Exchange-Inbox-Rules-Loop: LMSDataProcessing@TrustLineage.com
+X-MS-TNEF-Correlator:
+X-MS-Exchange-Organization-RecordReviewCfmType: 0
+x-ms-publictraffictype: Email
+Resent-From: <LMSDataProcessing@TrustLineage.com>
+x-clientproxiedby: DS7PR03CA0276.namprd03.prod.outlook.com
+ (2603:10b6:5:3ad::11) To PH3PPF4EB60FE07.namprd22.prod.outlook.com
+ (2603:10b6:518:1::6a1)
+X-Microsoft-Antispam-Mailbox-Delivery:
+	ucf:0;jmr:0;auth:0;dest:I;ENG:(910005)(944506478)(944626604)(920097)(425001)(930201)(20251009189)(140003);
+X-Microsoft-Antispam-Message-Info:
+	YRZypnCGXzBvCZESSQNhYLgjPjlETzSWlW2burgUukV/8n3I1Op8Mei+c6xMa9iMZB+EtIyF52r33ZISm7gKYu4fZP6zFobREMxQ81TCE+PTQSQwStZqHo7INo279EgzocVbrs41fX/JHaTcjak/PowNEk9mO6d2axClvIRh1g0LFMfY7qKNBKldMrQeSeyn+9tLGX1u61vqoEfKVFyzZmdYKNGUIog7uJt/pKD8jE21NHTilXGBZs5JRpbTpBQ5O6BlKVzcaW9ISXX0dliJkPTaxWwbYVP9xQxbmwgXKsEEX5Ioj+BR2/4hjMij6X8Aoi2/9Jn9NROBJPNmGK9FkdHU6hdf+c54hI6ShMsrdvcjTgaXOq14VveaDiuhWoGQRBvBWEDe6a0FvULRjkNOguIqwmbJPtMuko1s6NcXAUIYw7EaoewPLuFjnpjAFNgZxFB+A10DYvV/VzTCOkLIfeGwMmCYrNW6BflOhZ+6n9YwWJOwBSu27iFLm44Z0nS7WTuPDnQRzLbgIt/YdSKX0Uf02OE1DAaI0zCy1TxPCe4QzrDNbdf62If0MR22xmKNk2x8VtcHGHmVGvTHkhfLPbzvtBGCDE9pF3b2dcqO+6+urTe7a/uHW1FqAOAbTZ5gkXPhYtuIjvSAN/JFpsVjZJybcqBnjdNFav8ojgWUKfsG3WaQ3pPlJojaayeETJYhHuo1yRn0x6ZBUQESpcLYqX8wJJ6wOS8jEL3oWNMU46t9hkIkMQ+1CkrcgFvZ0uJ7TUJicWshpIL/ho6z/IVmP+UijOPlvotjSedCUAnJtgv/TWJkTAmPUq0MCcLqH4Iv
+Content-Type: text/plain; charset="iso-8859-1"
+Content-Transfer-Encoding: quoted-printable
+MIME-Version: 1.0
+
+
+This message was sent to you automatically by LMS SFTP Server on the follow=
+ing event: File Upload.
+Server Local Time: 05/22/26 10:30:20 AM
+
+Full Name: riversca
+
+File Name: RIVPCFTP.zip
+
+File Size: 11989 bytes
+
+Lineage Mailing Services

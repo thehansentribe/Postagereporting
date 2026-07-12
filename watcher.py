@@ -215,7 +215,57 @@ def scan_once() -> dict[str, Any]:
             _log_line(f"{fts} | FAIL | {fpath.name} | {e}")
             failed.append({"file": fpath.name, "error": str(e)})
 
+    if processed:
+        try:
+            generate_ready_daily_reports()
+        except Exception:
+            fts = time.strftime("%Y-%m-%d %H:%M:%S")
+            _log_line(f"{fts} | FAIL | daily_reports | {traceback.format_exc()}")
+
     return {"processed": processed, "failed": failed}
+
+
+def generate_ready_daily_reports(window_days: int = 14) -> list[dict[str, Any]]:
+    """Generate daily report sets for ready, incomplete business days in a trailing window.
+
+    Bounded to the last ``window_days`` days and idempotent (skips complete folders).
+    """
+    import exports
+
+    from datetime import timedelta
+
+    today = date_cls.today()
+    start = (today - timedelta(days=window_days)).isoformat()
+    end = today.isoformat()
+
+    conn = db.get_connection()
+    try:
+        readiness = db.query_report_readiness(conn, start, end)
+    finally:
+        conn.close()
+
+    generated: list[dict[str, Any]] = []
+    for item in readiness.get("daily_reports", []):
+        if not item.get("date"):
+            continue
+        d = item["date"]
+        if item.get("complete"):
+            continue
+        # Only ready days appear as candidates; skip days still missing sources.
+        conn = db.get_connection()
+        try:
+            day_ready = db.query_report_readiness(conn, d, d).get("ready", False)
+        finally:
+            conn.close()
+        if not day_ready:
+            continue
+        result = exports.save_daily_report_set(d)
+        generated.append(result)
+        _log_line(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} | DAILY | {d} | "
+            f"saved {len(result['saved'])}, failed {len(result['failed'])}"
+        )
+    return generated
 
 
 def watch_loop(interval_sec: int = 60) -> None:

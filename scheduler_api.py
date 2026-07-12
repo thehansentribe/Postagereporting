@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import re
+import string
 from typing import Any
 
 from flask import Blueprint, Response, jsonify, render_template, request
@@ -71,6 +73,11 @@ def scheduler_job_new_page():
     return render_template("scheduler_job_editor.html", job_id=None)
 
 
+@bp.route("/scheduler/reports/new")
+def report_simple_new_page():
+    return render_template("report_simple_new.html")
+
+
 @bp.route("/scheduler/jobs/<int:job_id>")
 def scheduler_job_edit_page(job_id: int):
     return render_template("scheduler_job_editor.html", job_id=job_id)
@@ -127,6 +134,91 @@ def api_test_email_root():
     if not result.get("ok"):
         return jsonify(result), 400
     return jsonify(result)
+
+
+def _windows_drive_roots() -> list[dict[str, str]]:
+    roots: list[dict[str, str]] = []
+    for letter in string.ascii_uppercase:
+        drive = f"{letter}:\\"
+        if os.path.exists(drive):
+            roots.append({"name": drive, "path": drive})
+    return roots
+
+
+def _browse_root_listing() -> dict[str, Any]:
+    if os.name == "nt":
+        return {
+            "current": "",
+            "parent": None,
+            "folders": _windows_drive_roots(),
+            "separator": "\\",
+        }
+    entries = _list_subdirectories("/")
+    return {"current": "/", "parent": None, "folders": entries, "separator": "/"}
+
+
+def _list_subdirectories(path: str) -> list[dict[str, str]]:
+    folders: list[dict[str, str]] = []
+    with os.scandir(path) as it:
+        for entry in it:
+            try:
+                if entry.is_dir():
+                    folders.append({"name": entry.name, "path": entry.path})
+            except OSError:
+                continue
+    folders.sort(key=lambda f: f["name"].lower())
+    return folders
+
+
+@bp.get("/api/scheduler/browse-folders")
+def api_browse_folders():
+    raw = (request.args.get("path") or "").strip()
+    sep = "\\" if os.name == "nt" else "/"
+    if not raw:
+        return jsonify(_browse_root_listing())
+    try:
+        if not os.path.isdir(raw):
+            return jsonify({"error": f"Not a folder: {raw}"}), 400
+        current = os.path.abspath(raw) if not raw.startswith("\\\\") else raw
+        parent = os.path.dirname(current.rstrip("\\/")) or None
+        if parent == current:
+            parent = None
+        # A drive root (e.g. "C:\\") or UNC share root should map back to the drive list / null.
+        if os.name == "nt" and parent and len(parent) <= 2 and parent.endswith(":"):
+            parent = parent + "\\"
+        folders = _list_subdirectories(current)
+        return jsonify(
+            {
+                "current": current,
+                "parent": parent,
+                "folders": folders,
+                "separator": sep,
+            }
+        )
+    except PermissionError:
+        return jsonify({"error": f"Permission denied: {raw}"}), 400
+    except FileNotFoundError:
+        return jsonify({"error": f"Folder not found: {raw}"}), 400
+    except OSError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@bp.get("/api/scheduler/folder-files")
+def api_folder_files():
+    raw = (request.args.get("path") or "").strip()
+    if not raw:
+        return jsonify({"error": "path required"}), 400
+    try:
+        files = scheduler._folder_files(raw)
+        return jsonify(
+            {
+                "folder": raw,
+                "files": [{"name": os.path.basename(f), "path": f} for f in files],
+                "count": len(files),
+            }
+        )
+    except OSError as e:
+        return jsonify({"error": str(e)}), 400
 
 
 @bp.get("/api/scheduler/dashboard")

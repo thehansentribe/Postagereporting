@@ -245,10 +245,15 @@ def test_parse_bm_raw_csv_synthetic(tmp_path):
 
 def test_parse_bm_raw_csv_fixture_bm_3_19_26():
     root = Path(__file__).resolve().parent.parent
-    fixture = root / "BM 3.19.26.csv"
-    report = root / "BM_3_19_26_report.csv"
+    samples = root / "projectfiles" / "samples"
+    fixture = samples / "BM 3.19.26.csv"
     if not fixture.is_file():
-        pytest.skip("BM 3.19.26.csv not in project root")
+        fixture = root / "BM 3.19.26.csv"
+    report = samples / "BM_3_19_26_report.csv"
+    if not report.is_file():
+        report = root / "BM_3_19_26_report.csv"
+    if not fixture.is_file():
+        pytest.skip("BM 3.19.26.csv not found (checked projectfiles/samples and root)")
     rows = importer.parse_bm_raw_csv(str(fixture))
     assert len(rows) == 3312
     assert rows[0]["account_code"] == "8393"

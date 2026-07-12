@@ -11,6 +11,7 @@
     <header class="header header-with-nav">
       <a class="btn btn-nav" href="{{ url_for('index') }}">&#8592; Dashboard</a>
       <a class="btn btn-nav" href="{{ url_for('scheduler.scheduler_dashboard_page') }}">Scheduled Reports</a>
+      <a class="btn btn-nav" href="{{ url_for('scheduler.report_simple_new_page') }}">New Report</a>
       <h1>Report Settings</h1>
     </header>
 
@@ -23,7 +24,10 @@
       <div class="system-inline-fields">
         <label class="field grow">
           <span class="field-label">Report source path</span>
-          <input type="text" id="reportSourcePath" placeholder="\\FileServer\Reports\" />
+          <div class="input-group">
+            <input type="text" id="reportSourcePath" placeholder="\\FileServer\Reports\" />
+            <button type="button" class="btn btn-browse" id="btnBrowseReportSource" data-target="reportSourcePath">Browse…</button>
+          </div>
         </label>
         <label class="field">
           <span class="field-label">Poll interval (seconds)</span>
@@ -50,7 +54,10 @@
       <div class="system-inline-fields">
         <label class="field grow">
           <span class="field-label">Email root path</span>
-          <input type="text" id="emailRootPath" placeholder="\\DPM2\Email\" />
+          <div class="input-group">
+            <input type="text" id="emailRootPath" placeholder="\\DPM2\Email\" />
+            <button type="button" class="btn btn-browse" id="btnBrowseEmailRoot" data-target="emailRootPath">Browse…</button>
+          </div>
         </label>
         <label class="field grow">
           <span class="field-label">Admin notification email</span>
@@ -62,6 +69,28 @@
         <button type="button" class="btn btn-primary" id="btnSaveSettings">Save</button>
       </div>
     </section>
+
+    <div class="modal-overlay hidden" id="folderPickerOverlay" role="dialog" aria-modal="true" aria-hidden="true">
+      <div class="modal" role="document" aria-labelledby="folderPickerTitle">
+        <div class="modal-header">
+          <h2 class="modal-title" id="folderPickerTitle">Choose a folder</h2>
+          <button type="button" class="btn btn-modal-close" id="btnCloseFolderPicker" aria-label="Close">&#10005;</button>
+        </div>
+        <div class="modal-body">
+          <div class="folder-picker-path">
+            <input type="text" id="folderPickerCurrent" placeholder="Type or paste a path and press Enter" />
+            <button type="button" class="btn" id="btnFolderPickerGo">Go</button>
+            <button type="button" class="btn" id="btnFolderPickerUp">&#8593; Up</button>
+          </div>
+          <div class="folder-picker-error error-banner hidden" id="folderPickerError" role="alert"></div>
+          <ul class="folder-list" id="folderPickerList"></ul>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn" id="btnFolderPickerCancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="btnFolderPickerUse">Use this folder</button>
+        </div>
+      </div>
+    </div>
   </div>
   <script src="{{ url_for('static', filename='report_settings.js') }}"></script>
 </body>

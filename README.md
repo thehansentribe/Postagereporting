@@ -21,11 +21,24 @@ See **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)** for run commands, testing, an
 
 ## Run
 
+### Double-click launcher (recommended)
+
+- **macOS:** double-click **`run.command`**.
+- **Windows:** double-click **`run.bat`**.
+
+The launcher creates/updates the `.venv`, installs dependencies, starts the server on port **8080** (served by [waitress](https://github.com/Pylons/waitress)), opens your browser, and prints the URLs to use.
+
+The app is reachable from other computers on the same network at **`http://<this-computer-IP>:8080`** (the launcher prints the exact address). On first run, allow the firewall prompt (macOS "Allow incoming connections" / Windows "Allow access") so other computers can connect. For a stable address, give the host a static IP or a reserved DHCP lease.
+
+> Access is unauthenticated and all users share one database — intended for a trusted, firewalled, internet-isolated internal network only.
+
+### Manual run
+
 ```bash
 python app.py
 ```
 
-Open [http://localhost:5000](http://localhost:5000). Override the port with `PORT=8080 python app.py`.
+Open [http://localhost:5000](http://localhost:5000). Override with env vars, e.g. `PORT=8080 python app.py`, or `HOST=127.0.0.1` to force local-only. If `waitress` is installed it is used automatically; otherwise the Flask dev server is used as a fallback.
 
 On first run the app creates `postage.db` and the `watch/` folder layout. Drop import files in `watch/incoming/` (or `input/`); the background watcher polls about every 60 seconds, or use **Scan Now** in the UI.
 

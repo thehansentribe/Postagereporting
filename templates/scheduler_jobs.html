@@ -20,7 +20,8 @@
 
     <section class="panel">
       <div class="system-actions">
-        <a class="btn btn-primary" href="{{ url_for('scheduler.scheduler_job_new_page') }}">New job</a>
+        <a class="btn btn-primary" href="{{ url_for('scheduler.report_simple_new_page') }}">New report</a>
+        <a class="btn" href="{{ url_for('scheduler.scheduler_job_new_page') }}">New job (advanced)</a>
         <input type="search" id="jobSearch" placeholder="Search jobs…" class="scheduler-search" />
         <button type="button" class="btn" id="btnBulkEnable">Enable selected</button>
         <button type="button" class="btn" id="btnBulkDisable">Disable selected</button>

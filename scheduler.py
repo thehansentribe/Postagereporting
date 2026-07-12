@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import threading
 import time
 import traceback
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import db
@@ -129,9 +132,65 @@ def _expiration_deadline(job: dict[str, Any], today: date, settings: dict[str, A
     return start + timedelta(hours=exp_h)
 
 
+def _folder_files(folder: str) -> list[str]:
+    """Top-level, non-empty files in a watched report folder (subfolders skipped)."""
+    p = Path(folder)
+    if not p.is_dir():
+        return []
+    out: list[str] = []
+    try:
+        for entry in os.scandir(p):
+            try:
+                if entry.is_file() and entry.stat().st_size > 0:
+                    out.append(entry.path)
+            except OSError:
+                continue
+    except OSError:
+        return []
+    out.sort(key=lambda s: s.lower())
+    return out
+
+
+def _archive_sent_files(
+    folder: str, files: list[str], archive_subdir: str, fire_date: str
+) -> None:
+    """Move already-sent files into <folder>/<archive_subdir>/<fire_date>/."""
+    dest_dir = Path(folder) / (archive_subdir or "Sent") / fire_date
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        _log.error("Could not create archive dir %s: %s", dest_dir, e)
+        return
+    for f in files:
+        src = Path(f)
+        if not src.exists():
+            continue
+        dest = dest_dir / src.name
+        if dest.exists():
+            dest = dest_dir / f"{dest.stem}_{int(time.time() * 1000)}{dest.suffix}"
+        try:
+            shutil.move(str(src), str(dest))
+        except OSError as e:
+            _log.error("Could not archive %s: %s", src, e)
+
+
 def evaluate_data_readiness(
     job: dict[str, Any], today: date, settings: dict[str, Any]
 ) -> dict[str, Any]:
+    folder = str(job.get("attachment_folder") or "").strip()
+    if folder:
+        files = _folder_files(folder)
+        stale = job.get("stale_file_threshold_minutes")
+        checks = [file_check(f, stale) for f in files]
+        ready = len(files) > 0
+        return {
+            "ready": ready,
+            "resolved": files,
+            "checks": checks,
+            "missing": [] if ready else [folder],
+            "present": files,
+            "folder_mode": True,
+        }
     patterns = [f["file_path_pattern"] for f in job.get("required_files") or []]
     if not patterns:
         return {"ready": True, "resolved": [], "missing": [], "present": []}
@@ -174,14 +233,20 @@ def execute_job_send(
     body = resolve_tokens(
         job["body_template"], today, job_name=job["name"], file_list=file_list
     )
-    attach_patterns = [a["file_path_pattern"] for a in job.get("attachments") or []]
-    attachments = resolve_patterns(attach_patterns, today, job_name=job["name"])
+    folder = str(job.get("attachment_folder") or "").strip()
+    if folder:
+        attachments = data.get("resolved") or []
+    else:
+        attach_patterns = [a["file_path_pattern"] for a in job.get("attachments") or []]
+        attachments = resolve_patterns(attach_patterns, today, job_name=job["name"])
     recipients = scheduler_db.expand_job_recipients(conn, job)
     if not recipients:
         return {"success": False, "error": "No recipients configured"}
 
-    if not manual and job.get("required_files") and not data["ready"]:
+    if not manual and (job.get("required_files") or folder) and not data["ready"]:
         return {"success": False, "error": "Required files not ready", "waiting": True}
+    if folder and not attachments:
+        return {"success": False, "error": "No files in folder", "waiting": True}
 
     for ap in attachments:
         chk = file_check(ap, job.get("stale_file_threshold_minutes"))
@@ -203,6 +268,10 @@ def execute_job_send(
         }
     )
     if result.get("success"):
+        if folder and (job.get("post_send_action") or "archive") == "archive":
+            _archive_sent_files(
+                folder, attachments, job.get("archive_subdir") or "Sent", fdate
+            )
         scheduler_db.mark_job_fired(
             conn, int(job["id"]), fdate, result.get("baseName"), "success"
         )
@@ -417,8 +486,12 @@ def preview_job(conn, job: dict[str, Any], settings: dict[str, Any]) -> dict[str
     body = resolve_tokens(
         job["body_template"], today, job_name=job["name"], file_list=file_list
     )
-    attach_patterns = [a["file_path_pattern"] for a in job.get("attachments") or []]
-    attachments = resolve_patterns(attach_patterns, today, job_name=job["name"])
+    folder = str(job.get("attachment_folder") or "").strip()
+    if folder:
+        attachments = data.get("resolved") or []
+    else:
+        attach_patterns = [a["file_path_pattern"] for a in job.get("attachments") or []]
+        attachments = resolve_patterns(attach_patterns, today, job_name=job["name"])
     attach_checks = [
         file_check(p, job.get("stale_file_threshold_minutes")) for p in attachments
     ]

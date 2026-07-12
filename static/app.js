@@ -1263,6 +1263,63 @@
     }
   }
 
+  const _dailyReportsInFlight = new Set();
+  const _dailyReportsAttempted = new Set();
+
+  async function autoCreateDailyReports(startDate, endDate) {
+    const key = `${startDate}|${endDate}`;
+    // Fire at most once per range per session to avoid loops when a ready day
+    // still can't produce a complete set.
+    if (_dailyReportsInFlight.has(key) || _dailyReportsAttempted.has(key)) return;
+    _dailyReportsInFlight.add(key);
+    try {
+      const r = await fetch("/api/export/daily-reports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ start_date: startDate, end_date: endDate }),
+      });
+      if (r.ok) {
+        _dailyReportsAttempted.add(key);
+        refreshReportReadiness();
+      }
+    } catch {
+      // Non-fatal; readiness stays "All reports ready" until next refresh.
+    } finally {
+      _dailyReportsInFlight.delete(key);
+    }
+  }
+
+  function updateDailyReportsNotice(j) {
+    const el = $("dailyReportsNotice");
+    if (!el) return;
+    const count = j.business_day_count || 0;
+    const entry = (j.daily_reports || [])[0];
+    if (count !== 1 || !entry) {
+      el.classList.add("hidden");
+      el.classList.remove("generated", "pending");
+      el.textContent = "";
+      return;
+    }
+    const dateLabel = fmtDisplayDate(entry.date);
+    const skipped = entry.skipped || [];
+    const failed = entry.failed || [];
+    const notes = [
+      ...skipped.map((s) => `${s.label}: ${s.error || "no mail for this day"}`),
+      ...failed.map((f) => `${f.label}: ${f.error || "error"}`),
+    ];
+    const notesSuffix = notes.length
+      ? ` (ran with exceptions - ${notes.join("; ")})`
+      : "";
+    el.classList.remove("hidden", "generated", "pending");
+    if (entry.complete) {
+      el.classList.add("generated");
+      el.textContent = `Daily report files generated for ${dateLabel} - saved to ${entry.folder_relative}${notesSuffix}`;
+    } else {
+      el.classList.add("pending");
+      el.textContent = `Daily reports not generated yet for ${dateLabel}${notesSuffix}`;
+    }
+  }
+
   async function refreshReportReadiness() {
     const dot = $("reportReadinessDot");
     const label = $("reportReadinessLabel");
@@ -1273,6 +1330,7 @@
       if (!r.ok) throw new Error(j.error || "Readiness check failed");
 
       const count = j.business_day_count || 0;
+      updateDailyReportsNotice(j);
       if (count === 0) {
         dot.classList.remove("ready");
         label.textContent = "No business days in this date range (weekends only).";
@@ -1281,11 +1339,13 @@
 
       if (j.ready) {
         dot.classList.add("ready");
-        label.textContent = `All reports ready (${formatReadinessRangeLabel(
-          j.start_date,
-          j.end_date,
-          count
-        )})`;
+        const rangeLabel = formatReadinessRangeLabel(j.start_date, j.end_date, count);
+        if (j.reports_created) {
+          label.textContent = `Reports created (${rangeLabel})`;
+        } else {
+          label.textContent = `All reports ready (${rangeLabel})`;
+          autoCreateDailyReports(j.start_date, j.end_date);
+        }
         return;
       }
 
@@ -1307,6 +1367,12 @@
     } catch {
       dot.classList.remove("ready");
       label.textContent = "Report readiness unavailable";
+      const notice = $("dailyReportsNotice");
+      if (notice) {
+        notice.classList.add("hidden");
+        notice.classList.remove("generated", "pending");
+        notice.textContent = "";
+      }
     }
   }
 
@@ -2189,6 +2255,40 @@
     }
   });
 
+  $("btnRestart").addEventListener("click", async () => {
+    if (!confirm("Restart the server now? In-flight work will be interrupted.")) return;
+    const btn = $("btnRestart");
+    btn.disabled = true;
+    const label = $("watcherLabel");
+    if (label) label.textContent = "Restarting server...";
+    try {
+      await fetch("/api/system/restart", { method: "POST" });
+    } catch {
+      // Expected: the process may die before the response returns.
+    }
+    const start = Date.now();
+    const poll = async () => {
+      try {
+        const r = await fetch("/api/watcher/status", { cache: "no-store" });
+        if (r.ok) {
+          location.reload();
+          return;
+        }
+      } catch {
+        // Server still coming back up.
+      }
+      if (Date.now() - start > 30000) {
+        btn.disabled = false;
+        $("errorBanner").textContent =
+          "Server did not come back within 30s. Check the terminal running the app.";
+        $("errorBanner").classList.remove("hidden");
+        return;
+      }
+      setTimeout(poll, 1000);
+    };
+    setTimeout(poll, 1500);
+  });
+
   $("btnExportPostage").addEventListener("click", async () => {
     const sel = $("selectAccount");
     const opt = sel.selectedOptions[0];
@@ -2448,72 +2548,41 @@
     }
   });
 
-  const EFD_DAILY_VOLUME_PARENTS = [
-    { parent_number: 3901, label: "BCBS" },
-    { parent_number: 3899, label: "GEHA" },
-    { parent_number: 3900, label: "Zinnia" },
-  ];
-
-  function efdDailyVolumesBaseQuery() {
-    const p = queryParams();
-    p.delete("parent_number");
-    p.delete("customer_number");
-    p.set("hide_customer_numbers", $("hideCustomerNumbers")?.checked ? "true" : "false");
-    if (!state.consolidatedDefaultsTouched.removeZeros) {
-      p.set("remove_zeros", "true");
-    }
-    p.set("parcel_discount", String(parseParcelDiscount()));
-    return p;
-  }
-
-  async function downloadEfdDailyVolumesExport(queryString, defaultName) {
-    const r = await fetch("/api/export/efd-daily-volumes-xlsx?" + queryString);
-    if (!r.ok) {
-      const j = await r.json().catch(() => ({}));
-      throw new Error(j.error || "Export failed");
-    }
-    const blob = await r.blob();
-    const name =
-      filenameFromContentDisposition(r.headers.get("Content-Disposition") || "") ||
-      defaultName;
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = name;
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }
-
   $("btnExportEfdDailyReport").addEventListener("click", async () => {
     const btn = $("btnExportEfdDailyReport");
     setExportLoading(btn, true);
-    const failed = [];
-    let downloaded = 0;
     try {
-      const baseQ = efdDailyVolumesBaseQuery();
-      for (let i = 0; i < EFD_DAILY_VOLUME_PARENTS.length; i++) {
-        const { parent_number: pn, label } = EFD_DAILY_VOLUME_PARENTS[i];
-        const q = new URLSearchParams(baseQ.toString());
-        q.set("parent_number", String(pn));
-        q.set("account_scope", `${label} (${pn})`);
-        const defaultName = `efd_daily_${label}_${pn}.xlsx`;
-        try {
-          await downloadEfdDailyVolumesExport(q.toString(), defaultName);
-          downloaded += 1;
-          if (downloaded < EFD_DAILY_VOLUME_PARENTS.length) {
-            await new Promise((resolve) => setTimeout(resolve, 400));
-          }
-        } catch (e) {
-          failed.push(label);
-        }
+      const start = $("startDate").value;
+      const end = $("endDate").value;
+      if (!start || !end) {
+        alert("Choose a start and end date first.");
+        return;
       }
-      if (failed.length > 0) {
-        const missing = failed.join(", ");
-        const got = EFD_DAILY_VOLUME_PARENTS.length - failed.length;
-        alert(
-          `Not all EFD daily reports were generated (${got} of ${EFD_DAILY_VOLUME_PARENTS.length}). ` +
-            `No data available for: ${missing}.`
-        );
+      const r = await fetch("/api/export/daily-reports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ start_date: start, end_date: end }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "Daily report generation failed");
+      const generated = j.generated || [];
+      const skipped = j.skipped || [];
+      if (!generated.length && !skipped.length) {
+        alert("No business days in the selected range.");
+        return;
       }
+      const folders = generated.map((g) => g.folder_relative).filter(Boolean);
+      const withMissing = generated.filter((g) => (g.failed || []).length > 0);
+      let msg = `Saved daily reports for ${generated.length} day(s).`;
+      if (folders.length) msg += `\nFolder(s): ${folders.join(", ")}`;
+      if (skipped.length) msg += `\nSkipped (already complete): ${skipped.join(", ")}`;
+      if (withMissing.length) {
+        msg += `\nMissing reports logged for: ${withMissing
+          .map((g) => g.report_date)
+          .join(", ")}`;
+      }
+      alert(msg);
+      refreshReportReadiness();
     } catch (e) {
       alert(String(e.message || e));
     } finally {

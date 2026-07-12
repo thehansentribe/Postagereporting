@@ -792,3 +792,224 @@ def test_export_efd_weekly_invoice_single_account_workbook(monkeypatch) -> None:
 def test_efd_weekly_summary_label_invalid_parent() -> None:
     with pytest.raises(ValueError, match="3901"):
         exports.efd_weekly_summary_label(9999)
+
+
+def test_daily_report_naming_helpers(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(exports, "POSTAGE_REPORTS_DIR", tmp_path / "PostageReports")
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "naming.db"
+        monkeypatch.setattr(db, "DB_PATH", p)
+        db.init_db()
+        conn = db.get_connection()
+        conn.execute(
+            "INSERT INTO customers (customer_number, customer_name) VALUES (3906, 'KC Presort LLC')"
+        )
+        conn.commit()
+        conn.close()
+
+        assert exports.daily_report_folder_name("2026-07-08") == "7-8-2026"
+        assert (
+            exports.daily_report_flats_filename("2026-07-08")
+            == "KC Presort LLC (3906) Flats Report 7-8-2026.csv"
+        )
+        names = exports.expected_daily_report_filenames("2026-07-08")
+        assert names == [
+            "KC Presort LLC (3906) Flats Report 7-8-2026.csv",
+            "BCBS (3901) 7-8-2026.xlsx",
+            "GEHA (3899) 7-8-2026.xlsx",
+            "Zinnia (3900) 7-8-2026.xlsx",
+        ]
+
+        out_dir = exports.daily_report_output_dir("2026-07-08")
+        assert out_dir.is_dir()
+        assert out_dir == tmp_path / "PostageReports" / "DailyReports" / "7-8-2026"
+
+
+def test_save_daily_report_set_writes_four_files(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(exports, "POSTAGE_REPORTS_DIR", tmp_path / "PostageReports")
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "daily_ok.db"
+        monkeypatch.setattr(db, "DB_PATH", p)
+        db.init_db()
+        conn = db.get_connection()
+        for cn, name in [
+            (3906, "KC Presort LLC"),
+            (3901, "BCBS"),
+            (3899, "GEHA"),
+            (3900, "Zinnia"),
+        ]:
+            conn.execute(
+                "INSERT INTO customers (customer_number, customer_name) VALUES (?, ?)",
+                (cn, name),
+            )
+        conn.execute(
+            "INSERT INTO postage_imports (file_name, file_date, row_count) VALUES ('x.csv', '2026-07-08', 1)"
+        )
+        for account in (3906, 3901, 3899, 3900):
+            conn.execute(
+                """
+                INSERT INTO postage_data (
+                    import_id, file_date, account_code, mail_class,
+                    weight_oz, pieces, total_cost, unmatched_account
+                ) VALUES (1, '2026-07-08', ?, '1ClFlat', 2.0, 5, 10.0, 0)
+                """,
+                (account,),
+            )
+        conn.commit()
+        conn.close()
+
+        result = exports.save_daily_report_set("2026-07-08")
+        assert result["complete"] is True
+        assert result["failed"] == []
+        assert set(result["saved"]) == {
+            "KC Presort LLC (3906) Flats Report 7-8-2026.csv",
+            "BCBS (3901) 7-8-2026.xlsx",
+            "GEHA (3899) 7-8-2026.xlsx",
+            "Zinnia (3900) 7-8-2026.xlsx",
+        }
+
+        out_dir = tmp_path / "PostageReports" / "DailyReports" / "7-8-2026"
+        for name in exports.expected_daily_report_filenames("2026-07-08"):
+            assert (out_dir / name).is_file()
+        assert not (out_dir / "MISSING_REPORTS_7-8-2026.log").exists()
+        assert exports.daily_report_set_complete("2026-07-08") is True
+
+
+def test_save_daily_report_set_no_data_skips_without_log(monkeypatch, tmp_path) -> None:
+    """A day with no volume produces skips (not failures) and no MISSING log."""
+    monkeypatch.setattr(exports, "POSTAGE_REPORTS_DIR", tmp_path / "PostageReports")
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "daily_missing.db"
+        monkeypatch.setattr(db, "DB_PATH", p)
+        db.init_db()
+        conn = db.get_connection()
+        for cn, name in [
+            (3906, "KC Presort LLC"),
+            (3901, "BCBS"),
+            (3899, "GEHA"),
+            (3900, "Zinnia"),
+        ]:
+            conn.execute(
+                "INSERT INTO customers (customer_number, customer_name) VALUES (?, ?)",
+                (cn, name),
+            )
+        conn.commit()
+        conn.close()
+
+        result = exports.save_daily_report_set("2026-07-08")
+        # No data at all -> nothing saved, everything skipped, no hard failures.
+        assert result["saved"] == []
+        assert result["failed"] == []
+        assert len(result["skipped"]) == 4
+        assert result["complete"] is False
+
+        out_dir = tmp_path / "PostageReports" / "DailyReports" / "7-8-2026"
+        assert not (out_dir / "MISSING_REPORTS_7-8-2026.log").exists()
+        assert exports.daily_report_set_complete("2026-07-08") is False
+
+
+def test_save_daily_report_set_partial_volume_is_complete(monkeypatch, tmp_path) -> None:
+    """When one EFD account has no volume it is skipped and the set still completes."""
+    monkeypatch.setattr(exports, "POSTAGE_REPORTS_DIR", tmp_path / "PostageReports")
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "daily_partial.db"
+        monkeypatch.setattr(db, "DB_PATH", p)
+        db.init_db()
+        conn = db.get_connection()
+        for cn, name in [
+            (3906, "KC Presort LLC"),
+            (3901, "BCBS"),
+            (3899, "GEHA"),
+            (3900, "Zinnia"),
+        ]:
+            conn.execute(
+                "INSERT INTO customers (customer_number, customer_name) VALUES (?, ?)",
+                (cn, name),
+            )
+        conn.execute(
+            "INSERT INTO postage_imports (file_name, file_date, row_count) VALUES ('x.csv', '2026-07-08', 1)"
+        )
+        # All parents except GEHA (3899) have volume.
+        for account in (3906, 3901, 3900):
+            conn.execute(
+                """
+                INSERT INTO postage_data (
+                    import_id, file_date, account_code, mail_class,
+                    weight_oz, pieces, total_cost, unmatched_account
+                ) VALUES (1, '2026-07-08', ?, '1ClFlat', 2.0, 5, 10.0, 0)
+                """,
+                (account,),
+            )
+        conn.commit()
+        conn.close()
+
+        result = exports.save_daily_report_set("2026-07-08")
+        assert result["complete"] is True
+        assert result["failed"] == []
+        skipped_labels = [s["label"] for s in result["skipped"]]
+        assert any("GEHA" in lbl for lbl in skipped_labels)
+        assert len(result["saved"]) == 3
+
+        out_dir = tmp_path / "PostageReports" / "DailyReports" / "7-8-2026"
+        assert not (out_dir / "MISSING_REPORTS_7-8-2026.log").exists()
+        assert exports.daily_report_set_complete("2026-07-08") is True
+
+        status = exports.daily_report_set_status("2026-07-08")
+        assert status is not None
+        assert status["complete"] is True
+        assert any("GEHA" in s["label"] for s in status["skipped"])
+
+
+def test_save_daily_report_set_hard_failure_writes_log(monkeypatch, tmp_path) -> None:
+    """A non-'no data' error is a hard failure that writes the MISSING log."""
+    monkeypatch.setattr(exports, "POSTAGE_REPORTS_DIR", tmp_path / "PostageReports")
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "daily_fail.db"
+        monkeypatch.setattr(db, "DB_PATH", p)
+        db.init_db()
+        conn = db.get_connection()
+        for cn, name in [
+            (3906, "KC Presort LLC"),
+            (3901, "BCBS"),
+            (3899, "GEHA"),
+            (3900, "Zinnia"),
+        ]:
+            conn.execute(
+                "INSERT INTO customers (customer_number, customer_name) VALUES (?, ?)",
+                (cn, name),
+            )
+        conn.execute(
+            "INSERT INTO postage_imports (file_name, file_date, row_count) VALUES ('x.csv', '2026-07-08', 1)"
+        )
+        for account in (3906, 3901, 3899, 3900):
+            conn.execute(
+                """
+                INSERT INTO postage_data (
+                    import_id, file_date, account_code, mail_class,
+                    weight_oz, pieces, total_cost, unmatched_account
+                ) VALUES (1, '2026-07-08', ?, '1ClFlat', 2.0, 5, 10.0, 0)
+                """,
+                (account,),
+            )
+        conn.commit()
+        conn.close()
+
+        import exports_consolidated_volumes
+
+        def boom(*a, **k):
+            raise RuntimeError("boom while building workbook")
+
+        monkeypatch.setattr(
+            exports_consolidated_volumes, "export_consolidated_volumes_xlsx", boom
+        )
+
+        result = exports.save_daily_report_set("2026-07-08")
+        assert result["complete"] is False
+        assert len(result["failed"]) == 3
+
+        out_dir = tmp_path / "PostageReports" / "DailyReports" / "7-8-2026"
+        log_path = out_dir / "MISSING_REPORTS_7-8-2026.log"
+        assert log_path.is_file()
+        log_text = log_path.read_text(encoding="utf-8")
+        assert "Failed reports:" in log_text
+        assert exports.daily_report_set_complete("2026-07-08") is False

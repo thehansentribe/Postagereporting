@@ -60,6 +60,49 @@ def test_report_readiness_all_present(monkeypatch):
     assert r["missing"]["ws3_presort"] == []
 
 
+def test_report_readiness_reports_created(monkeypatch):
+    import exports as exportsmod
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "created.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", p)
+        monkeypatch.setattr(
+            exportsmod, "POSTAGE_REPORTS_DIR", Path(td) / "PostageReports"
+        )
+        dbmod.init_db()
+        conn = dbmod.get_connection()
+        try:
+            _seed_all_three(conn, "2026-05-12")
+            conn.commit()
+
+            r = dbmod.query_report_readiness(conn, "2026-05-12", "2026-05-12")
+            assert r["ready"] is True
+            assert r["reports_created"] is False
+            assert r["daily_reports"] == [
+                {
+                    "date": "2026-05-12",
+                    "complete": False,
+                    "folder_relative": None,
+                    "skipped": [],
+                    "failed": [],
+                }
+            ]
+
+            # Simulate a complete folder with all 4 expected files.
+            out_dir = exportsmod.daily_report_output_dir("2026-05-12")
+            for name in exportsmod.expected_daily_report_filenames("2026-05-12"):
+                (out_dir / name).write_text("x", encoding="utf-8")
+
+            r2 = dbmod.query_report_readiness(conn, "2026-05-12", "2026-05-12")
+            assert r2["reports_created"] is True
+            assert r2["daily_reports"][0]["complete"] is True
+            assert r2["daily_reports"][0]["folder_relative"] == (
+                "PostageReports/DailyReports/5-12-2026"
+            )
+        finally:
+            conn.close()
+
+
 def test_report_readiness_missing_ws3(monkeypatch):
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "no_ws3.db"

@@ -449,6 +449,9 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
     send_failure_notification   INTEGER NOT NULL DEFAULT 0,
     retry_count                 INTEGER NOT NULL DEFAULT 0,
     retry_delay_seconds         INTEGER NOT NULL DEFAULT 60,
+    attachment_folder           TEXT,
+    post_send_action            TEXT    NOT NULL DEFAULT 'archive',
+    archive_subdir              TEXT    NOT NULL DEFAULT 'Sent',
     created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -584,6 +587,7 @@ def get_connection() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
     _migrate_flat_rate_costs_effective_date(conn)
+    _migrate_scheduled_jobs_folder_columns(conn)
     _ensure_app_settings(conn)
     return conn
 
@@ -673,6 +677,19 @@ def _migrate_ws3_mail_detail_usps_cost_per_piece(conn: sqlite3.Connection) -> No
           AND postage_claimed IS NOT NULL
         """
     )
+
+
+def _migrate_scheduled_jobs_folder_columns(conn: sqlite3.Connection) -> None:
+    """Add folder-watch report columns to scheduled_jobs for existing databases."""
+    for col, typedef in (
+        ("attachment_folder", "TEXT"),
+        ("post_send_action", "TEXT NOT NULL DEFAULT 'archive'"),
+        ("archive_subdir", "TEXT NOT NULL DEFAULT 'Sent'"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE scheduled_jobs ADD COLUMN {col} {typedef}")
+        except sqlite3.OperationalError:
+            pass
 
 
 def _migrate_app_settings_columns(conn: sqlite3.Connection) -> None:
@@ -827,6 +844,7 @@ def init_db() -> None:
     _migrate_ws3_profiles_reject_fee(conn)
     _migrate_ws3_mail_detail_usps_cost_per_piece(conn)
     _migrate_flat_rate_costs_effective_date(conn)
+    _migrate_scheduled_jobs_folder_columns(conn)
     _ensure_app_settings(conn)
     clamp_negative_ws3_reject_counts(conn)
     conn.commit()
@@ -5266,6 +5284,46 @@ def query_report_readiness(
         and not missing_ws3
     )
 
+    day_ready = {
+        d: (d not in missing_postage and d not in missing_parcel and d not in missing_ws3)
+        for d in expected
+    }
+
+    import exports
+
+    daily_reports: list[dict[str, Any]] = []
+    for d in expected:
+        status = exports.daily_report_set_status(d) or {}
+        skipped = status.get("skipped") or []
+        failed = status.get("failed") or []
+        if not day_ready[d]:
+            daily_reports.append(
+                {
+                    "date": d,
+                    "complete": False,
+                    "folder_relative": None,
+                    "skipped": skipped,
+                    "failed": failed,
+                }
+            )
+            continue
+        complete = exports.daily_report_set_complete(d, conn=conn)
+        daily_reports.append(
+            {
+                "date": d,
+                "complete": complete,
+                "folder_relative": (
+                    f"PostageReports/DailyReports/{exports.daily_report_folder_name(d)}"
+                    if complete
+                    else None
+                ),
+                "skipped": skipped,
+                "failed": failed,
+            }
+        )
+
+    reports_created = ready and all(item["complete"] for item in daily_reports)
+
     return {
         "ready": ready,
         "start_date": start_date,
@@ -5276,6 +5334,8 @@ def query_report_readiness(
             "parcel": missing_parcel,
             "ws3_presort": missing_ws3,
         },
+        "reports_created": reports_created,
+        "daily_reports": daily_reports,
     }
 
 

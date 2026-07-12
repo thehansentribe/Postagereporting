@@ -1,6 +1,7 @@
 <nav class="scheduler-subnav" aria-label="Scheduled reports">
   <a class="btn btn-nav{% if active == 'dashboard' %} active{% endif %}" href="{{ url_for('scheduler.scheduler_dashboard_page') }}">Dashboard</a>
   <a class="btn btn-nav{% if active == 'jobs' %} active{% endif %}" href="{{ url_for('scheduler.scheduler_jobs_page') }}">Jobs</a>
+  <a class="btn btn-nav{% if active == 'new_report' %} active{% endif %}" href="{{ url_for('scheduler.report_simple_new_page') }}">New Report</a>
   <a class="btn btn-nav{% if active == 'groups' %} active{% endif %}" href="{{ url_for('scheduler.scheduler_groups_page') }}">Recipient Groups</a>
   <a class="btn btn-nav{% if active == 'log' %} active{% endif %}" href="{{ url_for('scheduler.scheduler_log_page') }}">Execution Log</a>
   <a class="btn btn-nav" href="{{ url_for('scheduler.report_settings_page') }}">Report Settings</a>

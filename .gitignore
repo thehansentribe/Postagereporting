@@ -25,6 +25,7 @@ PostageReports/
 Helper Files/
 Postage Price/
 Notice123/
+projectfiles/
 
 # DB backups / local dumps
 postage.db.bak-*

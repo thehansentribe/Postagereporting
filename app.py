@@ -5,8 +5,10 @@ from __future__ import annotations
 from datetime import date, datetime
 import os
 import shutil
+import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from flask import Flask, after_this_request, jsonify, render_template, request, send_file
@@ -812,6 +814,27 @@ def api_watcher_status():
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/system/restart", methods=["POST"])
+def api_system_restart():
+    """Restart the server process in place (os.execv).
+
+    Replies immediately, then re-execs after a short delay so the response can
+    flush. The re-exec releases DB locks/connections and restarts the watcher.
+    """
+
+    def _reexec() -> None:
+        time.sleep(0.75)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_reexec, daemon=True).start()
+    return jsonify({"ok": True, "restarting": True})
 
 
 @app.route("/api/scan", methods=["POST"])
@@ -1802,6 +1825,48 @@ def api_export_efd_daily_volumes_xlsx():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/export/daily-reports", methods=["POST"])
+def api_export_daily_reports():
+    """Generate and save the daily report set to disk for one day or a range.
+
+    Accepts ``report_date`` (single) or ``start_date`` + ``end_date`` (range).
+    Idempotent: business days whose folder is already complete are skipped.
+    """
+    payload = request.get_json(silent=True) or {}
+
+    def _arg(name: str) -> str | None:
+        val = payload.get(name)
+        if val is None:
+            val = request.args.get(name) or request.form.get(name)
+        return str(val).strip() if val else None
+
+    report_date = _arg("report_date")
+    start = _arg("start_date")
+    end = _arg("end_date")
+
+    if report_date:
+        dates = [report_date]
+    elif start and end:
+        dates = db._business_days_in_range(start, end)
+    else:
+        return jsonify({"error": "report_date or start_date+end_date required"}), 400
+
+    if not dates:
+        return jsonify({"error": "no business days in range"}), 400
+
+    try:
+        generated: list[dict] = []
+        skipped: list[str] = []
+        for d in dates:
+            if exports.daily_report_set_complete(d):
+                skipped.append(d)
+                continue
+            generated.append(exports.save_daily_report_set(d))
+        return jsonify({"generated": generated, "skipped": skipped})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/export/parcel-zone-summary")
 def api_export_parcel_zone_summary():
     start = request.args.get("start_date")
@@ -1868,8 +1933,15 @@ def api_export_parcel_zone_summary():
 
 
 def main() -> None:
+    host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    try:
+        from waitress import serve
+
+        print(f"Serving on http://{host}:{port} (waitress)")
+        serve(app, host=host, port=port, threads=8)
+    except ImportError:
+        app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
 # Apply a staged restore (if any) before opening the DB, so postage.db is never

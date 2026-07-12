@@ -1,3 +1,4 @@
 # Runtime only — use requirements-dev.txt for pytest (see docs/DEVELOPMENT.md).
 flask>=3.0,<4
 openpyxl>=3.1,<4
+waitress>=3.0,<4

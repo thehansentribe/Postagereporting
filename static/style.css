@@ -240,6 +240,26 @@ body {
   line-height: 1.35;
 }
 
+.daily-report-notice {
+  border-radius: var(--radius);
+  padding: 0.55rem 0.85rem;
+  margin-bottom: 0.65rem;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.daily-report-notice.generated {
+  background: #dcfce7;
+  border: 1px solid #86efac;
+  color: #166534;
+}
+
+.daily-report-notice.pending {
+  background: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  color: #475569;
+}
+
 .noclass-notice {
   background: #fef3c7;
   border: 1px solid #fcd34d;
@@ -756,6 +776,71 @@ select {
   padding: 0.85rem 1rem;
   border-top: 1px solid var(--color-table-border);
   background: #f8fafc;
+}
+
+.input-group {
+  display: flex;
+  gap: 0.4rem;
+  align-items: stretch;
+}
+
+.input-group input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.btn-browse {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.folder-picker-path {
+  display: flex;
+  gap: 0.4rem;
+  align-items: stretch;
+  margin-bottom: 0.6rem;
+}
+
+.folder-picker-path input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.folder-picker-error {
+  margin-bottom: 0.6rem;
+}
+
+.folder-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 45vh;
+  overflow-y: auto;
+  border: 1px solid var(--color-table-border);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.folder-item {
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+  border-bottom: 1px solid #f1f5f9;
+  color: #1f2937;
+  user-select: none;
+}
+
+.folder-item:last-child {
+  border-bottom: none;
+}
+
+.folder-item:hover {
+  background: #f5f3ff;
+}
+
+.folder-empty {
+  padding: 0.75rem;
+  color: #6b7280;
+  font-style: italic;
 }
 
 .edit-context {

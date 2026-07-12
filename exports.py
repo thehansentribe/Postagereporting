@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 import csv
 from functools import cmp_to_key
+import json
 import os
 import re
 import shutil
@@ -2960,8 +2961,12 @@ def efd_weekly_bundle_output_dir(end_date: str) -> Path:
     return out_dir
 
 
-def _efd_weekly_customer_name(parent_number: int) -> str:
-    conn = db.get_connection()
+def _efd_weekly_customer_name(
+    parent_number: int, conn: sqlite3.Connection | None = None
+) -> str:
+    own_conn = conn is None
+    if own_conn:
+        conn = db.get_connection()
     try:
         row = conn.execute(
             "SELECT customer_name FROM customers WHERE customer_number = ?",
@@ -2969,7 +2974,8 @@ def _efd_weekly_customer_name(parent_number: int) -> str:
         ).fetchone()
         return (row["customer_name"] if row else f"Account {parent_number}").strip()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def _save_temp_export(temp: Path, out_dir: Path, filename: str) -> None:
@@ -3113,6 +3119,257 @@ def save_efd_weekly_bundle(
         "saved": saved,
         "failed": failed,
     }
+
+
+DAILY_REPORT_EFD_PARENTS: tuple[int, ...] = (3901, 3899, 3900)
+DAILY_REPORT_FLATS_PARENT = 3906
+
+
+def _daily_reports_dir() -> Path:
+    """Root DailyReports dir, resolved at call time so tests can patch the base."""
+    return POSTAGE_REPORTS_DIR / "DailyReports"
+
+
+def _csv_is_empty(path: Path) -> bool:
+    """True when a CSV has only a header row (or nothing) — i.e. no data rows."""
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            data_rows = 0
+            for i, line in enumerate(f):
+                if i == 0:
+                    continue
+                if line.strip():
+                    data_rows += 1
+                    break
+            return data_rows == 0
+    except OSError:
+        return True
+
+
+def daily_report_folder_name(report_date: str) -> str:
+    """Folder name for a daily report set, e.g. ``7-8-2026``."""
+    return _short_mdy(report_date)
+
+
+def daily_report_output_dir(report_date: str) -> Path:
+    """``PostageReports/DailyReports/{M-D-YYYY}/`` under project root."""
+    out_dir = _daily_reports_dir() / daily_report_folder_name(report_date)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def daily_report_flats_filename(
+    report_date: str, conn: sqlite3.Connection | None = None
+) -> str:
+    """e.g. ``KC Presort LLC (3906) Flats Report 7-8-2026.csv``."""
+    cust_name = _efd_weekly_customer_name(DAILY_REPORT_FLATS_PARENT, conn=conn)
+    return (
+        f"{cust_name} ({DAILY_REPORT_FLATS_PARENT}) "
+        f"Flats Report {_short_mdy(report_date)}.csv"
+    )
+
+
+def expected_daily_report_filenames(
+    report_date: str, conn: sqlite3.Connection | None = None
+) -> list[str]:
+    """The 4 expected filenames for a daily report set."""
+    import exports_consolidated_volumes
+
+    names = [daily_report_flats_filename(report_date, conn=conn)]
+    for pn in DAILY_REPORT_EFD_PARENTS:
+        scope = efd_report_scope_label(pn)
+        names.append(
+            exports_consolidated_volumes.consolidated_volumes_download_name(
+                scope, report_date
+            )
+        )
+    return names
+
+
+DAILY_REPORT_MANIFEST_NAME = ".daily_report_manifest.json"
+
+
+def _daily_report_manifest_path(out_dir: Path) -> Path:
+    return out_dir / DAILY_REPORT_MANIFEST_NAME
+
+
+def daily_report_set_status(report_date: str) -> dict[str, Any] | None:
+    """Return the saved generation manifest for a day, or ``None`` if never run.
+
+    The manifest includes ``complete``, ``saved``, ``skipped`` (accounts with no
+    volume) and ``failed`` (hard errors), each item having ``label``/``error``.
+    """
+    out_dir = _daily_reports_dir() / daily_report_folder_name(report_date)
+    manifest_path = _daily_report_manifest_path(out_dir)
+    if not manifest_path.is_file():
+        return None
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def daily_report_set_complete(
+    report_date: str, conn: sqlite3.Connection | None = None
+) -> bool:
+    """True when the daily report set for ``report_date`` is complete.
+
+    "Complete" means a generation run finished with no hard failures and at
+    least one report was saved. EFD accounts with no volume for the day are
+    skipped (not treated as missing), so a light day still counts as complete.
+
+    Uses the generation manifest when present; falls back to the legacy
+    all-4-files check for folders created before manifests existed.
+
+    Pass ``conn`` to reuse an existing connection and avoid opening a nested
+    one (important when called while another connection is held, e.g. from
+    ``db.query_report_readiness``).
+    """
+    out_dir = _daily_reports_dir() / daily_report_folder_name(report_date)
+    if not out_dir.exists():
+        return False
+
+    manifest_path = _daily_report_manifest_path(out_dir)
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not manifest.get("complete"):
+            return False
+        saved = manifest.get("saved") or []
+        return bool(saved) and all((out_dir / name).exists() for name in saved)
+
+    # Legacy fallback: require all 4 expected files.
+    for name in expected_daily_report_filenames(report_date, conn=conn):
+        if not (out_dir / name).exists():
+            return False
+    return True
+
+
+def _is_no_data_error(exc: Exception) -> bool:
+    """A "no rows / no data" outcome is an expected skip, not a hard failure."""
+    msg = str(exc).lower()
+    return "no data" in msg or "no rows" in msg
+
+
+def save_daily_report_set(report_date: str) -> dict[str, Any]:
+    """
+    Generate the daily report set (KC Presort flats CSV + 3 EFD consolidated
+    volume XLSX) for ``report_date`` and save under
+    ``PostageReports/DailyReports/{report date}/``.
+
+    An account with no volume for the day is skipped (recorded in ``skipped``),
+    not failed. The set is "complete" when there are no hard failures and at
+    least one report was saved. A manifest is written for readiness/UI, and
+    ``MISSING_REPORTS_{date}.log`` is written only when a report hard-fails.
+    """
+    import exports_consolidated_volumes
+
+    out_dir = daily_report_output_dir(report_date)
+    folder_relative = f"PostageReports/DailyReports/{daily_report_folder_name(report_date)}"
+    saved: list[str] = []
+    skipped: list[dict[str, str]] = []
+    failed: list[dict[str, str]] = []
+
+    # 1. KC Presort LLC (3906) flats report (allocate presort rejects, hide customer numbers).
+    flats_label = f"KC Presort flats report ({DAILY_REPORT_FLATS_PARENT})"
+    try:
+        temp = export_flats_data_grid_csv(
+            report_date,
+            report_date,
+            parent_number=DAILY_REPORT_FLATS_PARENT,
+            customer_number=None,
+            show_parents=True,
+            show_main=True,
+            remove_zeros=True,
+            hide_costs=True,
+            hide_customer_numbers=True,
+            allocate_presort_rejects=True,
+        )
+        if _csv_is_empty(temp):
+            temp.unlink(missing_ok=True)
+            raise ValueError("no data for this date")
+        name = daily_report_flats_filename(report_date)
+        _save_temp_export(temp, out_dir, name)
+        saved.append(name)
+    except Exception as e:
+        (skipped if _is_no_data_error(e) else failed).append(
+            {"label": flats_label, "error": str(e)}
+        )
+
+    # 2-4. EFD consolidated volumes per parent.
+    for pn in DAILY_REPORT_EFD_PARENTS:
+        scope = efd_report_scope_label(pn)
+        label = f"EFD consolidated volumes ({scope})"
+        try:
+            temp = exports_consolidated_volumes.export_consolidated_volumes_xlsx(
+                report_date,
+                report_date,
+                pn,
+                None,
+                show_parents=True,
+                show_main=True,
+                consolidate=False,
+                remove_zeros=True,
+                hide_costs_summary=True,
+                hide_customer_numbers=True,
+                account_scope_label=scope,
+                parcel_discount=0.25,
+            )
+            name = exports_consolidated_volumes.consolidated_volumes_download_name(
+                scope, report_date
+            )
+            _save_temp_export(temp, out_dir, name)
+            saved.append(name)
+        except Exception as e:
+            (skipped if _is_no_data_error(e) else failed).append(
+                {"label": label, "error": str(e)}
+            )
+
+    complete = len(failed) == 0 and len(saved) > 0
+
+    log_path = out_dir / f"MISSING_REPORTS_{daily_report_folder_name(report_date)}.log"
+    if failed:
+        lines = [
+            f"Daily report set for {report_date} is incomplete.",
+            f"Generated at: {datetime.now().isoformat(timespec='seconds')}",
+            f"Saved {len(saved)}, skipped (no data) {len(skipped)}, failed {len(failed)}.",
+            "",
+            "Failed reports:",
+        ]
+        for item in failed:
+            lines.append(f"  - {item['label']}: {item['error']}")
+        if skipped:
+            lines.append("")
+            lines.append("Skipped (no volume for this day):")
+            for item in skipped:
+                lines.append(f"  - {item['label']}")
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    else:
+        # No hard failures: remove any stale missing-reports log from a prior run.
+        log_path.unlink(missing_ok=True)
+
+    result = {
+        "report_date": report_date,
+        "folder": str(out_dir.resolve()),
+        "folder_relative": folder_relative,
+        "saved": saved,
+        "skipped": skipped,
+        "failed": failed,
+        "complete": complete,
+    }
+
+    manifest = dict(result)
+    manifest["generated_at"] = datetime.now().isoformat(timespec="seconds")
+    try:
+        _daily_report_manifest_path(out_dir).write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+    return result
 
 
 # Stacked zone block uses columns A–I (Parcel Summary Final example.xlsx).
