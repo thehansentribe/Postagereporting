@@ -35,6 +35,7 @@ def _row_to_job(row: sqlite3.Row, conn: sqlite3.Connection) -> dict[str, Any]:
         "attachment_folder": row["attachment_folder"],
         "post_send_action": row["post_send_action"] or "archive",
         "archive_subdir": row["archive_subdir"] or "Sent",
+        "archived": bool(row["archived"]),
         "required_files": list_job_required_files(conn, job_id),
         "attachments": list_job_attachments(conn, job_id),
         "recipients": list_job_recipients(conn, job_id),
@@ -98,13 +99,38 @@ def list_job_recipient_group_ids(conn: sqlite3.Connection, job_id: int) -> list[
     return [int(r["group_id"]) for r in cur.fetchall()]
 
 
-def list_jobs(conn: sqlite3.Connection, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+def list_jobs(
+    conn: sqlite3.Connection,
+    *,
+    enabled_only: bool = False,
+    include_archived: bool = False,
+    archived_only: bool = False,
+) -> list[dict[str, Any]]:
     sql = "SELECT * FROM scheduled_jobs"
+    clauses = []
     if enabled_only:
-        sql += " WHERE enabled = 1"
+        clauses.append("enabled = 1")
+    if archived_only:
+        clauses.append("archived = 1")
+    elif not include_archived:
+        clauses.append("archived = 0")
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY name COLLATE NOCASE"
     rows = conn.execute(sql).fetchall()
     return [_row_to_job(r, conn) for r in rows]
+
+
+def set_job_archived(conn: sqlite3.Connection, job_id: int, archived: bool) -> dict[str, Any]:
+    cur = conn.execute(
+        "UPDATE scheduled_jobs SET archived = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (1 if archived else 0, job_id),
+    )
+    if cur.rowcount == 0:
+        raise ValueError(f"Job {job_id} not found")
+    out = get_job(conn, job_id)
+    assert out is not None
+    return out
 
 
 def get_job(conn: sqlite3.Connection, job_id: int) -> dict[str, Any] | None:
@@ -185,8 +211,8 @@ def create_job(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, A
             subject_template, body_template, data_readiness_mode,
             stale_file_threshold_minutes, expiration_hours,
             send_failure_notification, retry_count, retry_delay_seconds,
-            attachment_folder, post_send_action, archive_subdir
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            attachment_folder, post_send_action, archive_subdir, archived
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(payload["name"]).strip(),
@@ -212,6 +238,7 @@ def create_job(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, A
             else None,
             payload.get("post_send_action") or "archive",
             payload.get("archive_subdir") or "Sent",
+            1 if payload.get("archived") else 0,
         ),
     )
     job_id = int(cur.lastrowid)
@@ -236,6 +263,7 @@ def update_job(conn: sqlite3.Connection, job_id: int, payload: dict[str, Any]) -
             stale_file_threshold_minutes = ?, expiration_hours = ?,
             send_failure_notification = ?, retry_count = ?, retry_delay_seconds = ?,
             attachment_folder = ?, post_send_action = ?, archive_subdir = ?,
+            archived = ?,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
@@ -263,6 +291,7 @@ def update_job(conn: sqlite3.Connection, job_id: int, payload: dict[str, Any]) -
             else None,
             merged.get("post_send_action") or "archive",
             merged.get("archive_subdir") or "Sent",
+            1 if merged.get("archived") else 0,
             job_id,
         ),
     )

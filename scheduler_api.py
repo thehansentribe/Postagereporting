@@ -235,13 +235,30 @@ def api_dashboard():
 
 @bp.get("/api/scheduler/jobs")
 def api_list_jobs():
+    archived_only = request.args.get("archived") in ("1", "true", "yes")
     try:
         conn = _conn()
-        jobs = scheduler_db.list_jobs(conn)
+        jobs = scheduler_db.list_jobs(conn, archived_only=archived_only)
         conn.close()
         return jsonify({"jobs": jobs})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@bp.post("/api/scheduler/jobs/<int:job_id>/archive")
+def api_archive_job(job_id: int):
+    payload = request.get_json(silent=True) or {}
+    archived = payload.get("archived", True)
+    try:
+        conn = _conn()
+        with conn:
+            job = scheduler_db.set_job_archived(conn, job_id, bool(archived))
+        conn.close()
+        return jsonify(job)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 
 @bp.get("/api/scheduler/jobs/<int:job_id>")

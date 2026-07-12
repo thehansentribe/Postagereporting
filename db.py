@@ -452,6 +452,7 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
     attachment_folder           TEXT,
     post_send_action            TEXT    NOT NULL DEFAULT 'archive',
     archive_subdir              TEXT    NOT NULL DEFAULT 'Sent',
+    archived                    INTEGER NOT NULL DEFAULT 0,
     created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -685,6 +686,7 @@ def _migrate_scheduled_jobs_folder_columns(conn: sqlite3.Connection) -> None:
         ("attachment_folder", "TEXT"),
         ("post_send_action", "TEXT NOT NULL DEFAULT 'archive'"),
         ("archive_subdir", "TEXT NOT NULL DEFAULT 'Sent'"),
+        ("archived", "INTEGER NOT NULL DEFAULT 0"),
     ):
         try:
             conn.execute(f"ALTER TABLE scheduled_jobs ADD COLUMN {col} {typedef}")

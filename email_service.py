@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import threading
@@ -61,6 +62,19 @@ def _atomic_write_text(path: Path, content: str) -> None:
     os.replace(tmp, path)
 
 
+def _friendly_os_error(e: OSError, root: Path) -> str:
+    """Turn low-level OS errors into an actionable message for the email folder."""
+    if getattr(e, "errno", None) in (errno.EPERM, errno.EACCES):
+        return (
+            f"Cannot write to the email folder '{root}': permission denied "
+            f"({e}). Make sure the app has write access to this folder. On macOS, "
+            f"grant the launcher Full Disk Access (System Settings > Privacy & "
+            f"Security) or use an email folder outside ~/Documents and ~/Desktop; "
+            f"on Windows, confirm write permission to the network share."
+        )
+    return str(e)
+
+
 def _validate_file(path: Path) -> str | None:
     if not path.is_file():
         return f"Missing file: {path}"
@@ -88,7 +102,9 @@ def send(request: EmailSendRequest) -> EmailSendResult:
     try:
         root.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        return EmailSendResult(success=False, base_name=base_name, error=str(e))
+        return EmailSendResult(
+            success=False, base_name=base_name, error=_friendly_os_error(e, root)
+        )
 
     subject_path = root / f"{base_name}subject.txt"
     body_path = root / f"{base_name}body.txt"
@@ -136,7 +152,9 @@ def send(request: EmailSendRequest) -> EmailSendResult:
 
     except OSError as e:
         _cleanup_partial(root, base_name, attach_dir)
-        return EmailSendResult(success=False, base_name=base_name, error=str(e))
+        return EmailSendResult(
+            success=False, base_name=base_name, error=_friendly_os_error(e, root)
+        )
 
     return EmailSendResult(success=True, base_name=base_name)
 
