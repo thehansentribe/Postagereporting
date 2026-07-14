@@ -372,12 +372,13 @@ CREATE INDEX IF NOT EXISTS idx_ws3_detail_profile ON ws3_mail_detail (profile_id
 
 CREATE TABLE IF NOT EXISTS ws3_imports (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_name    TEXT NOT NULL UNIQUE,
+    file_name    TEXT NOT NULL,
     mail_date    TEXT NOT NULL,
     run_id       INTEGER NOT NULL REFERENCES ws3_mail_runs (run_id) ON DELETE CASCADE,
     row_count    INTEGER,
     imported_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_ws3_imports_file_name ON ws3_imports(file_name);
 
 CREATE TABLE IF NOT EXISTS ws3_parent_daily_rejects (
     mail_date                TEXT    NOT NULL,
@@ -589,6 +590,7 @@ def get_connection() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 30000")
     _migrate_flat_rate_costs_effective_date(conn)
     _migrate_scheduled_jobs_folder_columns(conn)
+    _migrate_ws3_imports_drop_filename_unique(conn)
     _ensure_app_settings(conn)
     return conn
 
@@ -677,6 +679,50 @@ def _migrate_ws3_mail_detail_usps_cost_per_piece(conn: sqlite3.Connection) -> No
           AND num_pieces > 0
           AND postage_claimed IS NOT NULL
         """
+    )
+
+
+def _ws3_imports_has_filename_unique(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='ws3_imports'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return False
+    return "UNIQUE" in str(row[0]).upper()
+
+
+def _migrate_ws3_imports_drop_filename_unique(conn: sqlite3.Connection) -> None:
+    """
+    Drop the legacy UNIQUE(file_name) constraint on ws3_imports.
+
+    WS3 mailings are de-duplicated by content identity (mail_date, mail_id) via
+    ws3_mail_runs. Browsers reuse download suffixes like "(15)", so the same filename
+    can carry unrelated mailings; a unique filename wrongly skipped genuinely new data.
+    """
+    if not _ws3_imports_has_filename_unique(conn):
+        return
+    conn.execute(
+        """
+        CREATE TABLE ws3_imports_new (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_name    TEXT NOT NULL,
+            mail_date    TEXT NOT NULL,
+            run_id       INTEGER NOT NULL REFERENCES ws3_mail_runs (run_id) ON DELETE CASCADE,
+            row_count    INTEGER,
+            imported_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO ws3_imports_new (id, file_name, mail_date, run_id, row_count, imported_at)
+        SELECT id, file_name, mail_date, run_id, row_count, imported_at FROM ws3_imports
+        """
+    )
+    conn.execute("DROP TABLE ws3_imports")
+    conn.execute("ALTER TABLE ws3_imports_new RENAME TO ws3_imports")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ws3_imports_file_name ON ws3_imports(file_name)"
     )
 
 
@@ -845,6 +891,7 @@ def init_db() -> None:
     conn.executescript(SCHEDULER_SCHEMA)
     _migrate_ws3_profiles_reject_fee(conn)
     _migrate_ws3_mail_detail_usps_cost_per_piece(conn)
+    _migrate_ws3_imports_drop_filename_unique(conn)
     _migrate_flat_rate_costs_effective_date(conn)
     _migrate_scheduled_jobs_folder_columns(conn)
     _ensure_app_settings(conn)

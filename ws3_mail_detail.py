@@ -27,8 +27,25 @@ SKIP_COL0 = {
     "Sort:",
     "Date:",
 }
-RATE_TYPES = frozenset({"ThreeDigitAuto", "ADC Auto", "MXD ADC Auto", "Single Piece"})
+# Rate-type labels captured from column 19. NetSort renamed some labels when the new
+# postage rates took effect (e.g. "MXD ADC Auto" -> "MXDAuto"); both spellings are kept
+# and stored as-is so historical and new mailings both import. "ADCAuto" is included
+# defensively, mirroring the same rename pattern for "ADC Auto".
+RATE_TYPES = frozenset(
+    {
+        "ThreeDigitAuto",
+        "ADC Auto",
+        "ADCAuto",
+        "MXD ADC Auto",
+        "MXDAuto",
+        "Single Piece",
+    }
+)
 TOTAL_LABELS = frozenset({"Profile Total", "Customer Total"})
+
+# Rate-like labels that are intentionally NOT imported (non-automation categories).
+# Kept separate so they don't trigger the unrecognized-label warning below.
+KNOWN_IGNORED_RATE_TYPES = frozenset({"MXD ADC Machinable"})
 
 
 def parse_date_from_filename(path: str) -> str | None:
@@ -180,6 +197,24 @@ def parse_ws3_xlsx(xlsx_path: str) -> tuple[str | None, str | None, dict[str, st
             # No `continue`: this NetSort layout puts the first rate type on the
             # same row as the profile name, so fall through to the rate block.
 
+        if (
+            col19
+            and col19 not in RATE_TYPES
+            and col19 not in TOTAL_LABELS
+            and col19 not in KNOWN_IGNORED_RATE_TYPES
+            and current_customer_code
+            and (parse_currency(g(40)) is not None or parse_int(g(66)) is not None)
+        ):
+            # Looks like a rate row (has postage/pieces) but the label is unknown.
+            # NetSort has renamed rate labels before; warn so future renames are not
+            # silently dropped from profit reports.
+            logger.warning(
+                "WS3 unrecognized rate_type %r skipped (customer_code=%s, profile=%r)",
+                col19,
+                current_customer_code,
+                current_profile_name,
+            )
+
         if col19 in RATE_TYPES and current_customer_code:
             is_single = col19 == "Single Piece"
             num_pieces = parse_int(g(66))
@@ -269,7 +304,10 @@ def process_ws3_mail_detail_file(
 ) -> dict[str, Any]:
     """
     Convert .xls to .xlsx, parse, insert into postage.db, refresh mail_detail_export.csv.
-    Skips if file_name already in ws3_imports. Skips if (mail_date, mail_id) already exists.
+
+    De-duplication is by mailing identity (mail_date, mail_id) from cell BI8, not by
+    filename: browsers reuse download suffixes like "(15)", so the same name can hold
+    unrelated mailings. Skips if (mail_date, mail_id) already exists.
     """
     db_path = Path(db_path)
     file_name = os.path.basename(xls_path)
@@ -283,17 +321,6 @@ def process_ws3_mail_detail_file(
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-
-    dup = conn.execute(
-        "SELECT 1 FROM ws3_imports WHERE file_name = ?", (file_name,)
-    ).fetchone()
-    if dup:
-        conn.close()
-        return {
-            "skipped": True,
-            "reason": "already_imported",
-            "file_name": file_name,
-        }
 
     xlsx_path = resolve_xlsx_path(xls_path)
 
