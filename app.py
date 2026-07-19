@@ -1344,10 +1344,12 @@ def api_profit_flats():
         show_parents = bool(body.get("show_parents", True))
         show_main = bool(body.get("show_main", True))
         discount = body.get("discount")
+        discount_efd = body.get("discount_efd")
         try:
             discount = float(discount) if discount is not None else None
+            discount_efd = float(discount_efd) if discount_efd is not None else None
         except (TypeError, ValueError):
-            return jsonify({"error": "discount must be a number"}), 400
+            return jsonify({"error": "discount and discount_efd must be numbers"}), 400
     else:
         start = request.args.get("start_date")
         end = request.args.get("end_date")
@@ -1356,17 +1358,22 @@ def api_profit_flats():
         show_parents = _bool_param("show_parents", True)
         show_main = _bool_param("show_main", True)
         discount = request.args.get("discount", type=float)
+        discount_efd = request.args.get("discount_efd", type=float)
     if not start or not end:
         return jsonify({"error": "start_date and end_date required"}), 400
     terms = _stored_pricing_terms(end)
     discount, discount_src = _resolve_knob(discount, terms, "flats_customer_discount")
+    discount_efd, discount_efd_src = _resolve_knob(discount_efd, terms, "flats_efd_discount")
     if discount < 0:
         return jsonify({"error": "discount must be non-negative"}), 400
+    if discount_efd < 0:
+        return jsonify({"error": "discount_efd must be non-negative"}), 400
 
-    retail_rate = 1.63
-    sell_to_rate = round(float(retail_rate) - float(discount), 4)
     try:
         conn = db.get_connection()
+        retail_view = db.get_flats_retail_rate(conn, as_of_date=end)
+        retail_rate = retail_view["rate"]
+        sell_to_rate = round(float(retail_rate) - float(discount), 4)
         if request.method == "POST":
             profit_ids, parcel_fee, perr = _profit_request_extras_post(conn, body)
         else:
@@ -1383,7 +1390,8 @@ def api_profit_flats():
             customer_number=cn,
             show_parents=show_parents,
             show_main=show_main,
-            sell_to_rate=sell_to_rate,
+            customer_discount=discount,
+            efd_discount=discount_efd,
             profit_account_ids=profit_ids,
         )
         rate_summary = db.query_ws3_flats_profit_rate_type_summary(
@@ -1394,7 +1402,8 @@ def api_profit_flats():
             customer_number=cn,
             show_parents=show_parents,
             show_main=show_main,
-            sell_to_rate=sell_to_rate,
+            customer_discount=discount,
+            efd_discount=discount_efd,
             profit_account_ids=profit_ids,
         )
         detail = db.query_ws3_flats_profit_detail(
@@ -1405,7 +1414,8 @@ def api_profit_flats():
             customer_number=cn,
             show_parents=show_parents,
             show_main=show_main,
-            sell_to_rate=sell_to_rate,
+            customer_discount=discount,
+            efd_discount=discount_efd,
             profit_account_ids=profit_ids,
         )
         conn.close()
@@ -1420,13 +1430,16 @@ def api_profit_flats():
                             "start_date": start,
                             "end_date": end,
                             "retail_rate": retail_rate,
+                            "tariff_effective_date": retail_view["tariff_effective_date"],
                             "discount": float(discount),
+                            "discount_efd": float(discount_efd),
                             "sell_to_rate": sell_to_rate,
                             "profit_accounts": profit_ids,
                             "parcel_fee": float(parcel_fee),
                             "terms_effective_date": terms["effective_date"],
                             "terms_source": {
                                 "discount": discount_src,
+                                "discount_efd": discount_efd_src,
                                 "parcel_fee": parcel_fee_src,
                             },
                         },
@@ -1444,13 +1457,16 @@ def api_profit_flats():
                     "start_date": start,
                     "end_date": end,
                     "retail_rate": retail_rate,
+                    "tariff_effective_date": retail_view["tariff_effective_date"],
                     "discount": float(discount),
+                    "discount_efd": float(discount_efd),
                     "sell_to_rate": sell_to_rate,
                     "profit_accounts": profit_ids,
                     "parcel_fee": float(parcel_fee),
                     "terms_effective_date": terms["effective_date"],
                     "terms_source": {
                         "discount": discount_src,
+                        "discount_efd": discount_efd_src,
                         "parcel_fee": parcel_fee_src,
                     },
                 },

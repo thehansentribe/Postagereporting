@@ -61,6 +61,10 @@ KC_PRESORT_METERED_MAIL_CLASSES_UPPER: tuple[str, ...] = ("NOCLASS", "OTHERCLS")
 # WS3 flats profit: rows with this rate_type use USPS cost as sell-to (pass-through, no margin).
 WS3_FLATS_SINGLE_PIECE_RATE_TYPE = "Single Piece"
 
+# WS3 flats have no per-piece weight; the sell price is anchored to this
+# flat_rate_costs retail tier (1 oz) as of each run's mail date.
+WS3_FLATS_RETAIL_WEIGHT_OZ = 1
+
 # Profit report / API: max distinct customer numbers in ``profit_accounts`` (CSV or JSON array).
 MAX_PROFIT_ACCOUNT_IDS = 2000
 
@@ -2056,6 +2060,123 @@ def _ws3_scope_where_clause(
     return " AND ".join(conditions), params
 
 
+def default_flats_retail_rate() -> float:
+    """Fallback 1-oz flats retail when flat_rate_costs has no usable tier."""
+    for row in DEFAULT_FLATS_RETAIL_RATES:
+        if int(row["weight_not_over_oz"]) == WS3_FLATS_RETAIL_WEIGHT_OZ:
+            return float(row["rate_retail"])
+    return float(DEFAULT_FLATS_RETAIL_RATES[0]["rate_retail"])
+
+
+def get_flats_retail_rate(
+    conn: sqlite3.Connection, as_of_date: str | None = None
+) -> dict[str, Any]:
+    """
+    First-Class flats retail (1-oz tier) from the dated tariff table.
+
+    Returns {"rate", "tariff_effective_date"}; the latest tariff on or before
+    ``as_of_date`` (default today) wins, falling back to the built-in default
+    when the table has no usable tier.
+    """
+    as_of = str(as_of_date) if as_of_date else date.today().isoformat()
+    row = conn.execute(
+        """
+        SELECT rate_retail, effective_date FROM flat_rate_costs
+        WHERE CAST(weight_not_over_oz AS INTEGER) = ?
+          AND rate_retail IS NOT NULL
+          AND (effective_date IS NULL OR effective_date <= ?)
+        ORDER BY
+            CASE WHEN effective_date IS NULL THEN 1 ELSE 0 END,
+            effective_date DESC
+        LIMIT 1
+        """,
+        (WS3_FLATS_RETAIL_WEIGHT_OZ, as_of),
+    ).fetchone()
+    if row is None:
+        return {"rate": default_flats_retail_rate(), "tariff_effective_date": None}
+    return {
+        "rate": float(row["rate_retail"]),
+        "tariff_effective_date": row["effective_date"],
+    }
+
+
+def _ws3_flats_priced_rows_sql(
+    where_sql: str,
+    where_params: list[Any],
+    *,
+    customer_discount: float,
+    efd_discount: float,
+    retail_fallback: float | None,
+) -> tuple[str, list[Any]]:
+    """
+    Relation of WS3 flats rows priced at both layers, for the profit queries.
+
+    Each row carries `retail_rate` (dated 1-oz tariff as of the run's mail
+    date), `price_to_customer` (retail - customer discount: what EFD bills the
+    end customer) and `price_to_efd` (retail - EFD discount: what the supplier
+    bills EFD). ``WS3_FLATS_SINGLE_PIECE_RATE_TYPE`` rows pass through at USPS
+    cost on both layers (no margin).
+    """
+    fallback = (
+        float(retail_fallback) if retail_fallback is not None else default_flats_retail_rate()
+    )
+    inner = f"""
+        SELECT
+            r.mail_date,
+            r.mail_id,
+            p.profile_name,
+            p.parent_customer_number,
+            COALESCE(par.parent_name, par.customer_name) AS parent_customer_name,
+            d.id AS detail_id,
+            d.customer_code,
+            nc.customer_name,
+            d.rate_type,
+            d.num_pieces,
+            d.pcs_rejected,
+            d.postage_claimed,
+            d.usps_cost_per_piece,
+            COALESCE(
+                (SELECT f.rate_retail FROM flat_rate_costs f
+                 WHERE CAST(f.weight_not_over_oz AS INTEGER) = ?
+                   AND f.rate_retail IS NOT NULL
+                   AND (f.effective_date IS NULL OR f.effective_date <= r.mail_date)
+                 ORDER BY
+                     CASE WHEN f.effective_date IS NULL THEN 1 ELSE 0 END,
+                     f.effective_date DESC
+                 LIMIT 1),
+                ?
+            ) AS retail_rate
+        FROM ws3_mail_detail d
+        JOIN ws3_mail_runs r ON r.run_id = d.run_id
+        JOIN ws3_profiles p ON p.id = d.profile_id
+        JOIN customers par ON par.customer_number = p.parent_customer_number
+        JOIN ws3_netsort_customers nc ON nc.customer_code = d.customer_code
+        WHERE {where_sql}
+          AND d.usps_cost_per_piece IS NOT NULL
+          AND d.num_pieces IS NOT NULL
+          AND d.num_pieces > 0
+    """
+    sql = f"""
+        SELECT
+            e.*,
+            CASE WHEN e.rate_type = ? THEN e.usps_cost_per_piece
+                 ELSE ROUND(e.retail_rate - ?, 4) END AS price_to_customer,
+            CASE WHEN e.rate_type = ? THEN e.usps_cost_per_piece
+                 ELSE ROUND(e.retail_rate - ?, 4) END AS price_to_efd
+        FROM ({inner}) e
+    """
+    params: list[Any] = [
+        WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
+        float(customer_discount),
+        WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
+        float(efd_discount),
+        WS3_FLATS_RETAIL_WEIGHT_OZ,
+        fallback,
+        *where_params,
+    ]
+    return sql, params
+
+
 def query_ws3_flats_profit_detail(
     conn: sqlite3.Connection,
     start_date: str,
@@ -2065,17 +2186,22 @@ def query_ws3_flats_profit_detail(
     customer_number: int | None,
     show_parents: bool,
     show_main: bool,
-    sell_to_rate: float,
+    customer_discount: float,
+    efd_discount: float,
+    retail_fallback: float | None = None,
     profit_account_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Detail-level WS3 flats profit rows over the date range and account scope.
 
-    Profit is computed at the WS3 sort (rate_type) level:
-      profit_per_piece = effective_sell - usps_cost_per_piece
-      total_profit = profit_per_piece * num_pieces
-    For rate_type ``WS3_FLATS_SINGLE_PIECE_RATE_TYPE``, effective_sell = usps_cost_per_piece
-    (pass-through at cost). Otherwise effective_sell = sell_to_rate.
+    Two-layer profit per WS3 sort (rate_type) row, from the dated retail tariff:
+      price_to_customer = retail - customer_discount   (EFD -> end customer)
+      price_to_efd      = retail - efd_discount        (supplier -> EFD)
+      supplier profit/pc = price_to_efd - usps_cost_per_piece
+      EFD profit/pc      = price_to_customer - price_to_efd
+    ``WS3_FLATS_SINGLE_PIECE_RATE_TYPE`` passes through at USPS cost (no margin).
+    Legacy keys (`sell_to_rate`, `profit_per_piece`, `total_profit`) carry the
+    combined customer-price margin.
     """
     where_sql, params = _ws3_scope_where_clause(
         conn,
@@ -2090,61 +2216,27 @@ def query_ws3_flats_profit_detail(
         profile_alias="p",
         parent_customer_alias="par",
     )
+    priced_sql, priced_params = _ws3_flats_priced_rows_sql(
+        where_sql,
+        params,
+        customer_discount=customer_discount,
+        efd_discount=efd_discount,
+        retail_fallback=retail_fallback,
+    )
     cur = conn.execute(
         f"""
         SELECT
-            r.mail_date,
-            r.mail_id,
-            p.profile_name,
-            p.parent_customer_number,
-            COALESCE(par.parent_name, par.customer_name) AS parent_customer_name,
-            d.customer_code,
-            nc.customer_name,
-            d.rate_type,
-            d.num_pieces,
-            d.pcs_rejected,
-            d.postage_claimed,
-            d.usps_cost_per_piece,
-            CASE
-                WHEN d.rate_type = ? THEN d.usps_cost_per_piece
-                ELSE ?
-            END AS sell_to_rate,
-            ROUND(
-                CASE
-                    WHEN d.rate_type = ? THEN d.usps_cost_per_piece
-                    ELSE ?
-                END - d.usps_cost_per_piece,
-                4
-            ) AS profit_per_piece,
-            ROUND(
-                (
-                    CASE
-                        WHEN d.rate_type = ? THEN d.usps_cost_per_piece
-                        ELSE ?
-                    END - d.usps_cost_per_piece
-                ) * d.num_pieces,
-                2
-            ) AS total_profit
-        FROM ws3_mail_detail d
-        JOIN ws3_mail_runs r ON r.run_id = d.run_id
-        JOIN ws3_profiles p ON p.id = d.profile_id
-        JOIN customers par ON par.customer_number = p.parent_customer_number
-        JOIN ws3_netsort_customers nc ON nc.customer_code = d.customer_code
-        WHERE {where_sql}
-          AND d.usps_cost_per_piece IS NOT NULL
-          AND d.num_pieces IS NOT NULL
-          AND d.num_pieces > 0
-        ORDER BY r.mail_date, nc.customer_name COLLATE NOCASE, d.customer_code, d.id
+            pr.*,
+            ROUND(pr.price_to_customer - pr.usps_cost_per_piece, 4) AS profit_per_piece,
+            ROUND((pr.price_to_customer - pr.usps_cost_per_piece) * pr.num_pieces, 2) AS total_profit,
+            ROUND(pr.price_to_efd - pr.usps_cost_per_piece, 4) AS supplier_profit_per_piece,
+            ROUND((pr.price_to_efd - pr.usps_cost_per_piece) * pr.num_pieces, 2) AS supplier_profit_total,
+            ROUND(pr.price_to_customer - pr.price_to_efd, 4) AS efd_profit_per_piece,
+            ROUND((pr.price_to_customer - pr.price_to_efd) * pr.num_pieces, 2) AS efd_profit_total
+        FROM ({priced_sql}) pr
+        ORDER BY pr.mail_date, pr.customer_name COLLATE NOCASE, pr.customer_code, pr.detail_id
         """,
-        [
-            WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
-            float(sell_to_rate),
-            WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
-            float(sell_to_rate),
-            WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
-            float(sell_to_rate),
-            *params,
-        ],
+        priced_params,
     )
     out: list[dict[str, Any]] = []
     for r in cur.fetchall():
@@ -2166,7 +2258,15 @@ def query_ws3_flats_profit_detail(
                 "pcs_rejected": int(r["pcs_rejected"] or 0),
                 "postage_claimed": round(float(r["postage_claimed"] or 0.0), 2),
                 "usps_cost_per_piece": round(float(r["usps_cost_per_piece"] or 0.0), 4),
-                "sell_to_rate": round(float(r["sell_to_rate"] or 0.0), 4),
+                "retail_rate": round(float(r["retail_rate"] or 0.0), 4),
+                "price_to_customer": round(float(r["price_to_customer"] or 0.0), 4),
+                "price_to_efd": round(float(r["price_to_efd"] or 0.0), 4),
+                "supplier_profit_per_piece": round(float(r["supplier_profit_per_piece"] or 0.0), 4),
+                "supplier_profit_total": round(float(r["supplier_profit_total"] or 0.0), 2),
+                "efd_profit_per_piece": round(float(r["efd_profit_per_piece"] or 0.0), 4),
+                "efd_profit_total": round(float(r["efd_profit_total"] or 0.0), 2),
+                # Legacy combined-margin keys (customer price vs USPS cost).
+                "sell_to_rate": round(float(r["price_to_customer"] or 0.0), 4),
                 "profit_per_piece": round(float(r["profit_per_piece"] or 0.0), 4),
                 "total_profit": round(float(r["total_profit"] or 0.0), 2),
             }
@@ -2183,14 +2283,17 @@ def query_ws3_flats_profit_rate_type_summary(
     customer_number: int | None,
     show_parents: bool,
     show_main: bool,
-    sell_to_rate: float,
+    customer_discount: float,
+    efd_discount: float,
+    retail_fallback: float | None = None,
     profit_account_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    WS3 flats profit summary grouped by `rate_type` (sort level) over the range.
+    WS3 flats profit summary grouped by `rate_type` and tariff retail rate.
 
-    Uses weighted average USPS cost per piece (weighted by num_pieces).
-    Sell-to / profit for ``WS3_FLATS_SINGLE_PIECE_RATE_TYPE`` use pass-through at USPS cost.
+    A date range spanning a rate case yields one row per (rate_type, retail),
+    so per-row prices stay exact. Uses weighted average USPS cost per piece.
+    ``WS3_FLATS_SINGLE_PIECE_RATE_TYPE`` passes through at USPS cost.
     """
     where_sql, params = _ws3_scope_where_clause(
         conn,
@@ -2205,73 +2308,48 @@ def query_ws3_flats_profit_rate_type_summary(
         profile_alias="p",
         parent_customer_alias="par",
     )
+    priced_sql, priced_params = _ws3_flats_priced_rows_sql(
+        where_sql,
+        params,
+        customer_discount=customer_discount,
+        efd_discount=efd_discount,
+        retail_fallback=retail_fallback,
+    )
     cur = conn.execute(
         f"""
         SELECT
-            d.rate_type,
-            SUM(d.num_pieces) AS total_pieces,
-            ROUND(SUM(d.usps_cost_per_piece * d.num_pieces) / NULLIF(SUM(d.num_pieces), 0), 4)
+            pr.rate_type,
+            pr.retail_rate,
+            SUM(pr.num_pieces) AS total_pieces,
+            ROUND(SUM(pr.usps_cost_per_piece * pr.num_pieces) / NULLIF(SUM(pr.num_pieces), 0), 4)
               AS avg_usps_cost_per_piece,
+            ROUND(SUM(pr.price_to_customer * pr.num_pieces) / NULLIF(SUM(pr.num_pieces), 0), 4)
+              AS sell_to_rate,
+            ROUND(SUM(pr.price_to_efd * pr.num_pieces) / NULLIF(SUM(pr.num_pieces), 0), 4)
+              AS avg_price_to_efd,
             ROUND(
-                SUM(
-                    (
-                        CASE
-                            WHEN d.rate_type = ? THEN d.usps_cost_per_piece
-                            ELSE ?
-                        END
-                    ) * d.num_pieces
-                ) / NULLIF(SUM(d.num_pieces), 0),
-                4
-            ) AS sell_to_rate,
-            ROUND(
-                SUM(
-                    (
-                        CASE
-                            WHEN d.rate_type = ? THEN d.usps_cost_per_piece
-                            ELSE ?
-                        END
-                    ) * d.num_pieces
-                ) / NULLIF(SUM(d.num_pieces), 0)
-                - SUM(d.usps_cost_per_piece * d.num_pieces) / NULLIF(SUM(d.num_pieces), 0),
+                SUM(pr.price_to_customer * pr.num_pieces) / NULLIF(SUM(pr.num_pieces), 0)
+                - SUM(pr.usps_cost_per_piece * pr.num_pieces) / NULLIF(SUM(pr.num_pieces), 0),
                 4
             ) AS avg_profit_per_piece,
-            ROUND(
-                SUM(
-                    (
-                        CASE
-                            WHEN d.rate_type = ? THEN d.usps_cost_per_piece
-                            ELSE ?
-                        END - d.usps_cost_per_piece
-                    ) * d.num_pieces
-                ),
-                2
-            ) AS total_profit
-        FROM ws3_mail_detail d
-        JOIN ws3_mail_runs r ON r.run_id = d.run_id
-        JOIN ws3_profiles p ON p.id = d.profile_id
-        JOIN customers par ON par.customer_number = p.parent_customer_number
-        WHERE {where_sql}
-          AND d.usps_cost_per_piece IS NOT NULL
-          AND d.num_pieces IS NOT NULL
-          AND d.num_pieces > 0
-        GROUP BY d.rate_type
-        ORDER BY total_pieces DESC, d.rate_type
+            ROUND(SUM((pr.price_to_customer - pr.usps_cost_per_piece) * pr.num_pieces), 2)
+              AS total_profit,
+            ROUND(SUM((pr.price_to_efd - pr.usps_cost_per_piece) * pr.num_pieces), 2)
+              AS supplier_profit_total,
+            ROUND(SUM((pr.price_to_customer - pr.price_to_efd) * pr.num_pieces), 2)
+              AS efd_profit_total
+        FROM ({priced_sql}) pr
+        GROUP BY pr.rate_type, pr.retail_rate
+        ORDER BY total_pieces DESC, pr.rate_type, pr.retail_rate
         """,
-        [
-            WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
-            float(sell_to_rate),
-            WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
-            float(sell_to_rate),
-            WS3_FLATS_SINGLE_PIECE_RATE_TYPE,
-            float(sell_to_rate),
-            *params,
-        ],
+        priced_params,
     )
     out: list[dict[str, Any]] = []
     for r in cur.fetchall():
         out.append(
             {
                 "rate_type": str(r["rate_type"] or ""),
+                "retail_rate": round(float(r["retail_rate"] or 0.0), 4),
                 "total_pieces": int(r["total_pieces"] or 0),
                 "avg_usps_cost_per_piece": (
                     round(float(r["avg_usps_cost_per_piece"]), 4)
@@ -2279,12 +2357,15 @@ def query_ws3_flats_profit_rate_type_summary(
                     else None
                 ),
                 "sell_to_rate": round(float(r["sell_to_rate"] or 0.0), 4),
+                "avg_price_to_efd": round(float(r["avg_price_to_efd"] or 0.0), 4),
                 "avg_profit_per_piece": (
                     round(float(r["avg_profit_per_piece"]), 4)
                     if r["avg_profit_per_piece"] is not None
                     else None
                 ),
                 "total_profit": round(float(r["total_profit"] or 0.0), 2),
+                "supplier_profit_total": round(float(r["supplier_profit_total"] or 0.0), 2),
+                "efd_profit_total": round(float(r["efd_profit_total"] or 0.0), 2),
             }
         )
     return out
@@ -2299,10 +2380,17 @@ def query_ws3_flats_profit_totals(
     customer_number: int | None,
     show_parents: bool,
     show_main: bool,
-    sell_to_rate: float,
+    customer_discount: float,
+    efd_discount: float,
+    retail_fallback: float | None = None,
     profit_account_ids: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Overall totals for WS3 flats profit over the range/scope (Single Piece pass-through at USPS cost)."""
+    """
+    Overall totals for WS3 flats profit over the range/scope.
+
+    ``total_profit`` is the legacy combined margin (customer price - USPS cost);
+    ``total_supplier_profit`` / ``total_efd_profit`` split it by layer.
+    """
     where_sql, params = _ws3_scope_where_clause(
         conn,
         start_date,
@@ -2316,41 +2404,45 @@ def query_ws3_flats_profit_totals(
         profile_alias="p",
         parent_customer_alias="par",
     )
+    priced_sql, priced_params = _ws3_flats_priced_rows_sql(
+        where_sql,
+        params,
+        customer_discount=customer_discount,
+        efd_discount=efd_discount,
+        retail_fallback=retail_fallback,
+    )
     row = conn.execute(
         f"""
         SELECT
-            COUNT(DISTINCT p.parent_customer_number) AS parent_accounts,
-            COUNT(DISTINCT r.mail_date) AS run_days,
-            COALESCE(SUM(d.num_pieces), 0) AS total_pieces,
-            ROUND(
-                SUM(
-                    (
-                        CASE
-                            WHEN d.rate_type = ? THEN d.usps_cost_per_piece
-                            ELSE ?
-                        END - d.usps_cost_per_piece
-                    ) * d.num_pieces
-                ),
-                2
-            ) AS total_profit
-        FROM ws3_mail_detail d
-        JOIN ws3_mail_runs r ON r.run_id = d.run_id
-        JOIN ws3_profiles p ON p.id = d.profile_id
-        JOIN customers par ON par.customer_number = p.parent_customer_number
-        WHERE {where_sql}
-          AND d.usps_cost_per_piece IS NOT NULL
-          AND d.num_pieces IS NOT NULL
-          AND d.num_pieces > 0
+            COUNT(DISTINCT pr.parent_customer_number) AS parent_accounts,
+            COUNT(DISTINCT pr.mail_date) AS run_days,
+            COALESCE(SUM(pr.num_pieces), 0) AS total_pieces,
+            ROUND(SUM((pr.price_to_customer - pr.usps_cost_per_piece) * pr.num_pieces), 2)
+              AS total_profit,
+            ROUND(SUM((pr.price_to_efd - pr.usps_cost_per_piece) * pr.num_pieces), 2)
+              AS total_supplier_profit,
+            ROUND(SUM((pr.price_to_customer - pr.price_to_efd) * pr.num_pieces), 2)
+              AS total_efd_profit
+        FROM ({priced_sql}) pr
         """,
-        [WS3_FLATS_SINGLE_PIECE_RATE_TYPE, float(sell_to_rate), *params],
+        priced_params,
     ).fetchone()
     if not row:
-        return {"parent_accounts": 0, "run_days": 0, "total_pieces": 0, "total_profit": 0.0}
+        return {
+            "parent_accounts": 0,
+            "run_days": 0,
+            "total_pieces": 0,
+            "total_profit": 0.0,
+            "total_supplier_profit": 0.0,
+            "total_efd_profit": 0.0,
+        }
     return {
         "parent_accounts": int(row["parent_accounts"] or 0),
         "run_days": int(row["run_days"] or 0),
         "total_pieces": int(row["total_pieces"] or 0),
         "total_profit": round(float(row["total_profit"] or 0.0), 2),
+        "total_supplier_profit": round(float(row["total_supplier_profit"] or 0.0), 2),
+        "total_efd_profit": round(float(row["total_efd_profit"] or 0.0), 2),
     }
 
 

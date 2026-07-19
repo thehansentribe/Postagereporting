@@ -27,20 +27,10 @@ import db
 POSTAGE_INVOICE_FLAT_MAIL_CLASSES = db.POSTAGE_INVOICE_FLAT_MAIL_CLASSES
 POSTAGE_INVOICE_FLAT_MAIL_SQL_IN = db.POSTAGE_INVOICE_FLAT_MAIL_SQL_IN
 
+# Last-resort postage-invoice fallback; the dated flat_rate_costs tariff is authoritative.
 DEFAULT_FLAT_RETAIL_BY_OZ: dict[int, float] = {
-    1: 1.63,
-    2: 1.9,
-    3: 2.17,
-    4: 2.44,
-    5: 2.72,
-    6: 3.0,
-    7: 3.28,
-    8: 3.56,
-    9: 3.84,
-    10: 4.14,
-    11: 4.44,
-    12: 4.74,
-    13: 5.04,
+    int(r["weight_not_over_oz"]): float(r["rate_retail"])
+    for r in db.DEFAULT_FLATS_RETAIL_RATES
 }
 
 
@@ -924,19 +914,20 @@ def export_profit_report_xlsx(
     """
     Profit report workbook matching Helper Files/Profit Report Example.xlsx layout:
 
-    Summary uses Excel formulas (B6–B10, flats table D–G, parcel mini-table, combined EFD/Lineage).
+    Summary uses Excel formulas (B6–B10, flats table E–H, parcel mini-table, combined EFD/Supplier).
     ``efd_parcel_fee`` is Summary B10 (per-piece adder to billing on the Parcel Profit sheet column Y).
     Parcel Profit sheet is the full EFD Parcel Invoice (same as standalone EFD export).
-    Flats Detail uses WS3 detail with sell-to = retail minus customer discount (preview parity).
+    Retail comes from the dated flats tariff (1-oz tier) per mail date; the flats
+    table carries one row per (rate type, tariff retail).
     """
-    RETAIL_RATE = 1.63
     discount_cust = max(0.0, float(flats_discount or 0.0))
     discount_efd = max(0.0, float(flats_discount_efd or 0.0))
     fee_efd = max(0.0, float(efd_parcel_fee or 0.0))
-    sell_to_detail = round(float(RETAIL_RATE) - float(discount_cust), 4)
 
     conn = db.get_connection()
     try:
+        retail_view = db.get_flats_retail_rate(conn, as_of_date=end_date)
+        retail_rate = float(retail_view["rate"])
         totals = db.query_ws3_flats_profit_totals(
             conn,
             start_date,
@@ -945,7 +936,8 @@ def export_profit_report_xlsx(
             customer_number=customer_number,
             show_parents=show_parents,
             show_main=show_main,
-            sell_to_rate=sell_to_detail,
+            customer_discount=discount_cust,
+            efd_discount=discount_efd,
             profit_account_ids=profit_account_ids,
         )
         rate_summary = db.query_ws3_flats_profit_rate_type_summary(
@@ -956,7 +948,8 @@ def export_profit_report_xlsx(
             customer_number=customer_number,
             show_parents=show_parents,
             show_main=show_main,
-            sell_to_rate=sell_to_detail,
+            customer_discount=discount_cust,
+            efd_discount=discount_efd,
             profit_account_ids=profit_account_ids,
         )
         detail = db.query_ws3_flats_profit_detail(
@@ -967,7 +960,8 @@ def export_profit_report_xlsx(
             customer_number=customer_number,
             show_parents=show_parents,
             show_main=show_main,
-            sell_to_rate=sell_to_detail,
+            customer_discount=discount_cust,
+            efd_discount=discount_efd,
             profit_account_ids=profit_account_ids,
         )
         parcel_raw = db.query_parcel_profit_totals(
@@ -1062,8 +1056,11 @@ def export_profit_report_xlsx(
         ws["E3"].number_format = int_fmt
         ws["E4"].number_format = int_fmt
 
-        ws["A6"] = "Retail rate"
-        ws["B6"] = float(RETAIL_RATE)
+        tariff_eff = retail_view.get("tariff_effective_date")
+        ws["A6"] = (
+            f"Retail rate (tariff eff. {tariff_eff})" if tariff_eff else "Retail rate"
+        )
+        ws["B6"] = float(retail_rate)
         ws["A7"] = "Flats discount to Customer"
         ws["B7"] = discount_cust
         ws["A8"] = "Flats discount to EFD"
@@ -1088,11 +1085,12 @@ def export_profit_report_xlsx(
         sum_headers = [
             "Rate Type",
             "Pieces",
+            "Retail / pc",
             "Avg USPS cost / pc",
             "Price To customer",
             "Price to EFD",
             "EFD profit",
-            "Lineage Profit",
+            "Supplier (Lineage) Profit",
         ]
         for col, h in enumerate(sum_headers, start=1):
             c = ws.cell(flats_hdr, col, h)
@@ -1106,7 +1104,7 @@ def export_profit_report_xlsx(
         sp_type = db.WS3_FLATS_SINGLE_PIECE_RATE_TYPE
 
         if n_rates == 0:
-            ws.merge_cells(start_row=data_start, start_column=1, end_row=data_start, end_column=7)
+            ws.merge_cells(start_row=data_start, start_column=1, end_row=data_start, end_column=8)
             c = ws.cell(
                 data_start,
                 1,
@@ -1115,10 +1113,10 @@ def export_profit_report_xlsx(
             c.font = Font(name="Calibri", italic=True, size=11)
             c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
             sum_row = data_start + 1
-            ws.cell(sum_row, 6, 0).number_format = money_fmt
             ws.cell(sum_row, 7, 0).number_format = money_fmt
-            ws.cell(sum_row, 6).font = body_font
+            ws.cell(sum_row, 8, 0).number_format = money_fmt
             ws.cell(sum_row, 7).font = body_font
+            ws.cell(sum_row, 8).font = body_font
         else:
             for i, row in enumerate(rate_summary):
                 rr = data_start + i
@@ -1132,35 +1130,42 @@ def export_profit_report_xlsx(
                 bcell.border = grid
                 bcell.number_format = int_fmt
                 bcell.alignment = Alignment(horizontal="right", vertical="center")
+                # Per-row tariff retail: rows split by (rate type, retail) so a
+                # range spanning a rate case keeps each tariff's prices exact.
+                rcell = ws.cell(rr, 3, row.get("retail_rate"))
+                rcell.font = body_font
+                rcell.border = grid
+                rcell.number_format = rate4_fmt
+                rcell.alignment = Alignment(horizontal="right", vertical="center")
                 avg_usps = row.get("avg_usps_cost_per_piece")
-                cc = ws.cell(rr, 3, avg_usps)
+                cc = ws.cell(rr, 4, avg_usps)
                 cc.font = body_font
                 cc.border = grid
                 cc.number_format = rate4_fmt
                 cc.alignment = Alignment(horizontal="right", vertical="center")
                 if rt == sp_type:
-                    ws.cell(rr, 4, "=$B$6").font = body_font
-                    ws.cell(rr, 5, f"=D{rr}").font = body_font
+                    ws.cell(rr, 5, f"=C{rr}").font = body_font
+                    ws.cell(rr, 6, f"=E{rr}").font = body_font
                 else:
-                    ws.cell(rr, 4, "=$B$6-$B$7").font = body_font
-                    ws.cell(rr, 5, "=$B$6-$B$8").font = body_font
-                for cidx in (4, 5):
+                    ws.cell(rr, 5, f"=C{rr}-$B$7").font = body_font
+                    ws.cell(rr, 6, f"=C{rr}-$B$8").font = body_font
+                for cidx in (5, 6):
                     ws.cell(rr, cidx).border = grid
                     ws.cell(rr, cidx).number_format = rate4_fmt
                     ws.cell(rr, cidx).alignment = Alignment(horizontal="right", vertical="center")
-                ws.cell(rr, 6, f"=(D{rr}-E{rr})*B{rr}").font = body_font
-                ws.cell(rr, 6).border = grid
-                ws.cell(rr, 6).number_format = money_fmt
-                ws.cell(rr, 7, f"=(E{rr}-C{rr})*B{rr}").font = body_font
+                ws.cell(rr, 7, f"=(E{rr}-F{rr})*B{rr}").font = body_font
                 ws.cell(rr, 7).border = grid
                 ws.cell(rr, 7).number_format = money_fmt
+                ws.cell(rr, 8, f"=(F{rr}-D{rr})*B{rr}").font = body_font
+                ws.cell(rr, 8).border = grid
+                ws.cell(rr, 8).number_format = money_fmt
             sum_row = data_start + n_rates
-            ws.cell(sum_row, 6, f"=SUM(F{data_start}:F{sum_row - 1})").font = body_font
-            ws.cell(sum_row, 6).border = grid
-            ws.cell(sum_row, 6).number_format = money_fmt
             ws.cell(sum_row, 7, f"=SUM(G{data_start}:G{sum_row - 1})").font = body_font
             ws.cell(sum_row, 7).border = grid
             ws.cell(sum_row, 7).number_format = money_fmt
+            ws.cell(sum_row, 8, f"=SUM(H{data_start}:H{sum_row - 1})").font = body_font
+            ws.cell(sum_row, 8).border = grid
+            ws.cell(sum_row, 8).number_format = money_fmt
 
         parcel_title_row = sum_row + 2
         ws.cell(parcel_title_row, 1, "Parcel Profit").font = Font(name="Calibri", bold=True, size=12)
@@ -1220,11 +1225,11 @@ def export_profit_report_xlsx(
         comb_r = r8 + 2
         ws.cell(comb_r, 1, "Combined profit summary").font = Font(name="Calibri", bold=True, size=12)
         ws.cell(comb_r + 1, 2, "EFD").font = subhdr_font
-        ws.cell(comb_r + 1, 3, "Lineage").font = subhdr_font
+        ws.cell(comb_r + 1, 3, "Supplier (Lineage)").font = subhdr_font
         ws.cell(comb_r + 2, 1, "Flats total profit").font = subhdr_font
-        ws.cell(comb_r + 2, 2, f"=F{sum_row}").font = body_font
+        ws.cell(comb_r + 2, 2, f"=G{sum_row}").font = body_font
         ws.cell(comb_r + 2, 2).number_format = money_fmt
-        ws.cell(comb_r + 2, 3, f"=G{sum_row}").font = body_font
+        ws.cell(comb_r + 2, 3, f"=H{sum_row}").font = body_font
         ws.cell(comb_r + 2, 3).number_format = money_fmt
         ws.cell(comb_r + 3, 1, "Parcel ").font = subhdr_font
         ws.cell(comb_r + 3, 2, f"=C{r8}").font = body_font
@@ -1237,7 +1242,16 @@ def export_profit_report_xlsx(
         ws.cell(comb_r + 4, 3, f"=SUM(C{comb_r + 2}:C{comb_r + 3})").font = body_font
         ws.cell(comb_r + 4, 3).number_format = money_fmt
 
-        for col_letter, w in (("A", 34), ("B", 16), ("C", 14), ("D", 12), ("E", 14), ("F", 14), ("G", 16)):
+        for col_letter, w in (
+            ("A", 34),
+            ("B", 16),
+            ("C", 12),
+            ("D", 14),
+            ("E", 14),
+            ("F", 14),
+            ("G", 14),
+            ("H", 18),
+        ):
             ws.column_dimensions[col_letter].width = w
 
         ws2 = wb.create_sheet("Flats Detail", 1)
@@ -1253,9 +1267,13 @@ def export_profit_report_xlsx(
             "Rejected",
             "Postage Claimed",
             "USPS cost / pc",
-            "Sell-to / pc",
-            "Profit / pc",
-            "Total profit",
+            "Retail / pc",
+            "Price to customer / pc",
+            "Price to EFD / pc",
+            "Supplier profit / pc",
+            "Supplier profit total",
+            "EFD profit / pc",
+            "EFD profit total",
         ]
         det_rows: list[list[Any]] = []
         for r in detail:
@@ -1272,9 +1290,13 @@ def export_profit_report_xlsx(
                     int(r.get("pcs_rejected") or 0),
                     r.get("postage_claimed"),
                     r.get("usps_cost_per_piece"),
-                    r.get("sell_to_rate"),
-                    r.get("profit_per_piece"),
-                    r.get("total_profit"),
+                    r.get("retail_rate"),
+                    r.get("price_to_customer"),
+                    r.get("price_to_efd"),
+                    r.get("supplier_profit_per_piece"),
+                    r.get("supplier_profit_total"),
+                    r.get("efd_profit_per_piece"),
+                    r.get("efd_profit_total"),
                 ]
             )
         write_table(
@@ -1282,13 +1304,13 @@ def export_profit_report_xlsx(
             det_headers,
             det_rows,
             int_cols={8, 9},
-            money_cols={10, 14},
-            rate4_cols={11, 12, 13},
+            money_cols={10, 16, 18},
+            rate4_cols={11, 12, 13, 14, 15, 17},
         )
         if not det_rows:
             ws2["A3"] = "No WS3 detail rows found for this date range/account scope."
             ws2["A3"].font = Font(name="Calibri", italic=True, size=11)
-        widths = [12, 14, 18, 28, 14, 26, 16, 10, 10, 14, 14, 12, 12, 14]
+        widths = [12, 14, 18, 28, 14, 26, 16, 10, 10, 14, 12, 12, 14, 14, 14, 14, 12, 14]
         for i, w in enumerate(widths, start=1):
             ws2.column_dimensions[get_column_letter(i)].width = w
 
