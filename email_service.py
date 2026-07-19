@@ -83,6 +83,12 @@ def _validate_file(path: Path) -> str | None:
     return None
 
 
+def _format_attach_list_path(email_root: str, base_name: str, filename: str) -> str:
+    """Windows-style path for VB6 attach.txt from the configured email root."""
+    root = email_root.strip().replace("/", "\\").rstrip("\\")
+    return f"{root}\\{base_name}\\{filename}"
+
+
 def send(request: EmailSendRequest) -> EmailSendResult:
     """
     Write email files per VB6 watcher protocol. Never writes .dat until prior files validate.
@@ -126,7 +132,12 @@ def send(request: EmailSendRequest) -> EmailSendResult:
                 shutil.copy2(str(src_p), str(dest))
                 copied_attach_paths.append(dest)
 
-            attach_lines = [str(p.resolve()) for p in copied_attach_paths]
+            attach_lines = [
+                _format_attach_list_path(
+                    request.email_root_path, base_name, p.name
+                )
+                for p in copied_attach_paths
+            ]
             _atomic_write_text(attach_list_path, "\n".join(attach_lines) + _LINE_ENDING)
 
         _atomic_write_text(body_path, request.body)

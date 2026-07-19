@@ -72,6 +72,57 @@ def test_email_service_success_crlf_and_dat_last():
         assert "two@test.com" in dat_text
 
 
+def test_format_attach_list_path_windows_style():
+    """Working-sample shape: c:\\email\\<base>\\<file> with backslashes only."""
+    name = "BCBS (3901) 7-10-2026.xlsx"
+    assert (
+        email_service._format_attach_list_path(r"c:\email", "260712104351", name)
+        == r"c:\email\260712104351\BCBS (3901) 7-10-2026.xlsx"
+    )
+    assert (
+        email_service._format_attach_list_path("c:/email/", "260712104351", name)
+        == r"c:\email\260712104351\BCBS (3901) 7-10-2026.xlsx"
+    )
+    assert (
+        email_service._format_attach_list_path(r"c:\email\\", "260712104351", name)
+        == r"c:\email\260712104351\BCBS (3901) 7-10-2026.xlsx"
+    )
+
+
+def test_attach_txt_uses_configured_root_with_backslashes(tmp_path):
+    """attach.txt lists configured root\\base\\file, not Path.resolve() host paths."""
+    write_root = tmp_path / "email_drop"
+    write_root.mkdir()
+    src = tmp_path / "BCBS (3901) 7-10-2026.xlsx"
+    src.write_bytes(b"xlsx-bytes")
+
+    result = email_service.send(
+        email_service.EmailSendRequest(
+            subject="Parcel reports",
+            body="Attached.",
+            recipients=["dest@example.com"],
+            email_root_path=str(write_root),
+            attachments=[str(src)],
+            timezone="America/Chicago",
+        )
+    )
+    assert result.success
+    base = result.base_name
+    attach_list = write_root / f"{base}attach.txt"
+    assert attach_list.is_file()
+    lines = [
+        ln for ln in attach_list.read_text(encoding="latin-1").splitlines() if ln.strip()
+    ]
+    assert len(lines) == 1
+    expected = email_service._format_attach_list_path(str(write_root), base, src.name)
+    assert lines[0] == expected
+    assert "\\" in lines[0]
+    assert "/" not in lines[0]
+    assert not lines[0].startswith("/")
+    assert lines[0].endswith(f"\\{base}\\{src.name}")
+    assert lines[0] != str((write_root / base / src.name).resolve())
+
+
 def test_duplicate_fire_prevention(monkeypatch):
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "sched.db"
