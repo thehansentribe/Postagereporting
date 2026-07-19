@@ -112,6 +112,29 @@
     </section>
 
     <section class="panel">
+      <h2 class="system-section-title">Pitney Detail Transactions</h2>
+      <p class="system-hint">
+        Upload the Pitney billing export (<code>…Pitney Detail Transactions.xlsx</code>). Transactions
+        are de-duplicated by transaction ID and matched to parcels by tracking number; refunds and
+        under/overpaid adjustments feed the Profit tab's <strong>Pitney reconciliation</strong> and the
+        trued-up supplier profit. Files dropped in <code>input/</code> import automatically.
+      </p>
+      <div class="system-actions system-inline-fields">
+        <label class="field">
+          <span class="field-label">Pitney transactions (.xlsx)</span>
+          <input
+            type="file"
+            id="pitneyTransactionsFile"
+            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+          />
+        </label>
+        <button type="button" class="btn btn-primary" id="btnUploadPitneyTransactions">
+          Import Pitney transactions
+        </button>
+      </div>
+    </section>
+
+    <section class="panel">
       <h2 class="system-section-title">Current flats retail &amp; presort rates</h2>
       <p class="system-hint">
         Read-only view of flat mail rates active as of today. Click to load the latest tariff on or

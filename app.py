@@ -997,6 +997,42 @@ def api_import_flatrates():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/import/pitney-transactions", methods=["POST"])
+def api_import_pitney_transactions():
+    if "file" not in request.files:
+        return jsonify({"error": "file required"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "empty filename"}), 400
+    path = Path(watcher.INCOMING) / secure_filename(f.filename)
+    watcher.ensure_dirs()
+    f.save(path)
+    try:
+        result = importer.import_pitney_detail_transactions(str(path), db.DB_PATH)
+        path.unlink(missing_ok=True)
+        return jsonify(result)
+    except Exception as e:
+        path.unlink(missing_ok=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/pitney/reconciliation")
+def api_pitney_reconciliation():
+    start = request.args.get("start_date")
+    end = request.args.get("end_date")
+    if not start or not end:
+        return jsonify({"error": "start_date and end_date required"}), 400
+    try:
+        conn = db.get_connection()
+        try:
+            out = db.query_pitney_reconciliation(conn, start, end)
+        finally:
+            conn.close()
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/import/notice123-rate-case", methods=["POST"])
 def api_import_notice123_rate_case():
     if "file" not in request.files:
@@ -1572,12 +1608,23 @@ def api_profit_parcels():
             profit_account_ids=profit_ids,
             parcel_customer_discount=parcel_discount,
         )
+        pitney_adj = db.query_pitney_cost_adjustments(
+            conn,
+            start,
+            end,
+            parent_number=pn,
+            customer_number=cn,
+            show_parents=show_parents,
+            show_main=show_main,
+            profit_account_ids=profit_ids,
+        )
         conn.close()
 
         pp = db.parcel_profit_from_raw(
             raw,
             parcel_fee_per_piece=float(parcel_fee),
             customer_price_total=customer_price["total_customer_price"],
+            pitney_adjustments=pitney_adj,
         )
 
         return jsonify(
@@ -1590,6 +1637,10 @@ def api_profit_parcels():
                     "efd_parcel_fee": float(fee_efd),
                     "parcel_discount": float(parcel_discount),
                     "customer_price_fallback_count": customer_price["fallback_count"],
+                    "pitney": {
+                        "has_data": pitney_adj["has_data"],
+                        "unattributed_count": pitney_adj["unattributed_count"],
+                    },
                     "terms_effective_date": terms["effective_date"],
                     "terms_source": {
                         "parcel_fee": parcel_fee_src,

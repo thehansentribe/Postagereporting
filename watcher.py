@@ -101,6 +101,14 @@ def _is_bm_raw_export(name: str) -> bool:
     return suf in (".csv", ".xlsx", ".xls")
 
 
+def _is_pitney_detail_transactions(name: str) -> bool:
+    """Pitney Detail Transactions ledger, e.g. 05.31.26_Pitney Detail Transactions.xlsx."""
+    low = name.lower()
+    if Path(name).suffix.lower() != ".xlsx":
+        return False
+    return "pitney" in low and "transaction" in low
+
+
 def _is_ws3_customer_mail_detail(name: str) -> bool:
     """NetSort WS3 FCFL Customer Mail Detail (xls/xlsx)."""
     low = name.lower().replace(" ", "")
@@ -124,6 +132,8 @@ def process_one_file(path: Path) -> dict:
         return importer.import_priority_mail_retail(str(path), db_path)
     if _is_ground_advantage_retail_csv(name):
         return importer.import_ground_advantage_retail(str(path), db_path)
+    if _is_pitney_detail_transactions(name):
+        return importer.import_pitney_detail_transactions(str(path), db_path)
     if _is_billing_csv(name) and name.lower().endswith(".csv"):
         return importer.import_billing_csv(str(path), db_path)
     if _is_bm_report_csv(name):

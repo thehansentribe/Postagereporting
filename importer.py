@@ -1737,3 +1737,158 @@ def import_notice123_rate_case(
     finally:
         if staged_root is not None and staged_root.exists():
             shutil.rmtree(staged_root, ignore_errors=True)
+
+
+# --- Pitney Detail Transactions (per-transaction carrier ledger) ---
+
+_PITNEY_REQUIRED_HEADERS = ("transactionType", "amount", "transactionId", "transactionDateTime")
+_PITNEY_OPTIONAL_HEADERS = (
+    "parcelTrackingNumber",
+    "service",
+    "zone",
+    "weightInOunces",
+    "status",
+    "postageBalance",
+)
+
+
+def _pitney_iso_date(raw: Any) -> str | None:
+    """ISO date from a Pitney transactionDateTime ('2026-05-30 22:04:56' or datetime)."""
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.date().isoformat()
+    s = str(raw).strip()
+    if not s:
+        return None
+    cal = s.split()[0]
+    try:
+        return datetime.strptime(cal[:10], "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        pass
+    for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(cal, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def import_pitney_detail_transactions(xlsx_path: str, db_path: Path | str) -> dict[str, Any]:
+    """
+    Import a Pitney Detail Transactions export (.xlsx) into ``pitney_transactions``.
+
+    Rows are deduplicated by (transactionId, type, datetime): a print and its
+    refund/adjustment share a transactionId, and a refund is re-listed at each
+    lifecycle stage (REQUESTED/ACCEPTED/DENIED), so all such rows are kept while
+    re-importing a file (or overlapping monthly exports) inserts nothing twice.
+    All transaction types are stored, including ``Postage Fund`` deposits;
+    cost/reconciliation queries exclude funds and count refunds only at ACCEPTED.
+    """
+    file_name = os.path.basename(xlsx_path)
+    wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+    try:
+        ws = wb[wb.sheetnames[0]]
+        rows_iter = ws.iter_rows(values_only=True)
+
+        idx: dict[str, int] | None = None
+        header_scan = 0
+        for raw in rows_iter:
+            header_scan += 1
+            cells = [str(c).strip() if c is not None else "" for c in raw]
+            if all(h in cells for h in _PITNEY_REQUIRED_HEADERS):
+                idx = {h: cells.index(h) for h in cells if h}
+                break
+            if header_scan >= 10:
+                break
+        if idx is None:
+            raise ValueError(
+                "Not a Pitney Detail Transactions export (missing "
+                + ", ".join(_PITNEY_REQUIRED_HEADERS)
+                + " header row)"
+            )
+
+        def col(row: tuple, name: str) -> Any:
+            i = idx.get(name)
+            if i is None or i >= len(row):
+                return None
+            return row[i]
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO pitney_imports (file_name, row_count) VALUES (?, 0)",
+                (file_name,),
+            )
+            import_id = cur.lastrowid
+
+            row_count = 0
+            inserted = 0
+            skipped = 0
+            for raw in rows_iter:
+                tx_id = col(raw, "transactionId")
+                tx_type = col(raw, "transactionType")
+                if tx_id is None or str(tx_id).strip() == "":
+                    continue
+                if tx_type is None or str(tx_type).strip() == "":
+                    continue
+                row_count += 1
+                tracking_raw = col(raw, "parcelTrackingNumber")
+                tracking = db.normalize_pitney_tracking(tracking_raw)
+                dt_raw = col(raw, "transactionDateTime")
+                cur.execute(
+                    """
+                    INSERT INTO pitney_transactions (
+                        import_id, transaction_id, transaction_type,
+                        transaction_date, transaction_datetime, amount,
+                        tracking_number, tracking_normalized,
+                        service, zone, weight_oz, status, postage_balance
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(transaction_id, transaction_type, transaction_datetime)
+                    DO NOTHING
+                    """,
+                    (
+                        import_id,
+                        str(tx_id).strip(),
+                        str(tx_type).strip(),
+                        _pitney_iso_date(dt_raw),
+                        str(dt_raw).strip() if dt_raw is not None else "",
+                        safe_real(col(raw, "amount")),
+                        tracking,
+                        tracking,
+                        (str(col(raw, "service")).strip() or None)
+                        if col(raw, "service") is not None
+                        else None,
+                        (str(col(raw, "zone")).strip() or None)
+                        if col(raw, "zone") is not None
+                        else None,
+                        safe_real(col(raw, "weightInOunces")),
+                        (str(col(raw, "status")).strip() or None)
+                        if col(raw, "status") is not None
+                        else None,
+                        safe_real(col(raw, "postageBalance")),
+                    ),
+                )
+                if cur.rowcount > 0:
+                    inserted += 1
+                else:
+                    skipped += 1
+
+            cur.execute(
+                "UPDATE pitney_imports SET row_count = ?, inserted_count = ?, skipped_count = ? WHERE id = ?",
+                (row_count, inserted, skipped, import_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    finally:
+        wb.close()
+
+    return {
+        "file": file_name,
+        "row_count": row_count,
+        "rows_imported": inserted,
+        "skipped_duplicates": skipped,
+    }

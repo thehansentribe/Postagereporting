@@ -1571,6 +1571,70 @@
       // Non-fatal: keep the rest of the Profit tab usable.
       container.innerHTML = `<p class='empty-state'>${escapeHtml(String(e.message || e))}</p>`;
     }
+    loadPitneyReconciliation().catch(() => {});
+  }
+
+  async function loadPitneyReconciliation() {
+    const container = $("pitneyReconBlock");
+    if (!container) return;
+    const p = profitQueryParams();
+    const start = p.get("start_date");
+    const end = p.get("end_date");
+    if (!start || !end) {
+      container.innerHTML = "";
+      return;
+    }
+    try {
+      const r = await fetch(
+        `/api/pitney/reconciliation?start_date=${encodeURIComponent(start)}&end_date=${encodeURIComponent(end)}`
+      );
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || "Reconciliation failed");
+      if (!j.has_data) {
+        container.innerHTML =
+          "<p class='empty-state'>No Pitney transactions in this date range. Import a Pitney Detail Transactions file on the System page (or drop it in input/).</p>";
+        return;
+      }
+      const pr = j.prints || {};
+      const adj = j.adjustments || {};
+      const bill = j.billing || {};
+      const money = (v) => `$${Number(v || 0).toFixed(2)}`;
+      const rows = [
+        ["Pitney postage prints", `${pr.count || 0} (${money(pr.amount)})`],
+        [
+          "Matched to parcels by tracking",
+          `${pr.matched_count || 0} — ${pr.exact_amount_matches || 0} exact amount matches`,
+        ],
+        ["Amount mismatches", String((pr.amount_mismatches || []).length)],
+        ["Prints with no parcel record", String(pr.prints_without_billing || 0)],
+        ["Parcels with no Pitney print", `${bill.without_print || 0} of ${bill.count || 0}`],
+        ["Refunds", money(adj.refund_total)],
+        [
+          "Adjustments (underpaid − overpaid)",
+          money((adj.underpaid_total || 0) - (adj.overpaid_total || 0)),
+        ],
+      ];
+      let html = "<table class='data-table'><tbody>";
+      for (const [label, value] of rows) {
+        html += `<tr><td>${escapeHtml(label)}</td><td class='num'>${escapeHtml(value)}</td></tr>`;
+      }
+      html += "</tbody></table>";
+      const mm = pr.amount_mismatches || [];
+      if (mm.length) {
+        html += "<p class='system-hint'>Largest mismatches: ";
+        html += mm
+          .slice(0, 5)
+          .map(
+            (m) =>
+              `${escapeHtml(m.tracking || "?")} (${money(m.pitney_amount)} vs ${money(m.billing_final_postage)})`
+          )
+          .join(", ");
+        html += "</p>";
+      }
+      container.innerHTML = html;
+    } catch (e) {
+      container.innerHTML = `<p class='empty-state'>${escapeHtml(String(e.message || e))}</p>`;
+    }
   }
 
   function profitSummaryHtml(meta, totals) {

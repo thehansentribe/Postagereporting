@@ -384,6 +384,34 @@
     });
   }
 
+  const btnPitney = $("btnUploadPitneyTransactions");
+  if (btnPitney) {
+    btnPitney.addEventListener("click", async () => {
+      showError("");
+      const fileEl = $("pitneyTransactionsFile");
+      const file = fileEl && fileEl.files && fileEl.files[0] ? fileEl.files[0] : null;
+      if (!file) {
+        showError("Choose a Pitney Detail Transactions .xlsx file.");
+        return;
+      }
+      showBanner("Importing Pitney transactions…");
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      try {
+        const r = await fetch("/api/import/pitney-transactions", { method: "POST", body: fd });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "Import failed");
+        showBanner(
+          `Imported ${j.rows_imported || 0} transaction(s), skipped ${j.skipped_duplicates || 0} duplicate(s) from ${j.file || file.name}.`
+        );
+        if (fileEl) fileEl.value = "";
+      } catch (e) {
+        showBanner("");
+        showError(String(e.message || e));
+      }
+    });
+  }
+
   function renderPricingTermsTable(revisions) {
     const container = $("pricingTermsTable");
     if (!container) return;

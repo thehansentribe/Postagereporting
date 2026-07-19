@@ -445,18 +445,22 @@ CREATE TABLE IF NOT EXISTS pitney_imports (
 CREATE TABLE IF NOT EXISTS pitney_transactions (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     import_id            INTEGER REFERENCES pitney_imports(id) ON DELETE SET NULL,
-    transaction_id       TEXT NOT NULL UNIQUE,
+    -- transactionId is shared by a print and its later refund/adjustment, and a
+    -- refund is re-listed at each lifecycle stage (REQUESTED/ACCEPTED/DENIED),
+    -- so the dedup identity is (id, type, datetime).
+    transaction_id       TEXT NOT NULL,
     transaction_type     TEXT NOT NULL, -- Postage Print / Postage Refund / Postage Adjustment (...) / Postage Fund
     transaction_date     TEXT,          -- ISO date derived from transactionDateTime
-    transaction_datetime TEXT,
+    transaction_datetime TEXT NOT NULL DEFAULT '',
     amount               REAL,
     tracking_number      TEXT,          -- raw value minus leading backtick
     tracking_normalized  TEXT,          -- join key vs billing_records.impb_normalized
     service              TEXT,
     zone                 TEXT,
     weight_oz            REAL,
-    status               TEXT,
-    postage_balance      REAL
+    status               TEXT,          -- refunds count only at status ACCEPTED
+    postage_balance      REAL,
+    UNIQUE (transaction_id, transaction_type, transaction_datetime)
 );
 CREATE INDEX IF NOT EXISTS idx_pitney_tx_date     ON pitney_transactions(transaction_date);
 CREATE INDEX IF NOT EXISTS idx_pitney_tx_tracking ON pitney_transactions(tracking_normalized);
@@ -637,6 +641,7 @@ def get_connection() -> sqlite3.Connection:
     _migrate_scheduled_jobs_folder_columns(conn)
     _migrate_ws3_imports_drop_filename_unique(conn)
     _migrate_billing_records_impb_normalized(conn)
+    _migrate_pitney_transactions_dedup_key(conn)
     _ensure_app_settings(conn)
     _ensure_pricing_terms(conn)
     return conn
@@ -791,6 +796,73 @@ def _migrate_billing_records_impb_normalized(conn: sqlite3.Connection) -> None:
         )
     except sqlite3.OperationalError:
         pass
+
+
+def _migrate_pitney_transactions_dedup_key(conn: sqlite3.Connection) -> None:
+    """
+    Rebuild pitney_transactions with the (transaction_id, transaction_type,
+    transaction_datetime) identity. The original single-column UNIQUE dropped
+    prints/refunds that share a transactionId with their adjustment rows.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='pitney_transactions'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return
+    if "UNIQUE (transaction_id, transaction_type, transaction_datetime)" in str(row[0]):
+        # Clean up a leftover rename target from an interrupted earlier run.
+        conn.execute("DROP TABLE IF EXISTS pitney_transactions_old")
+        conn.commit()
+        return
+    conn.execute("DROP TABLE IF EXISTS pitney_transactions_old")
+    conn.execute("ALTER TABLE pitney_transactions RENAME TO pitney_transactions_old")
+    conn.execute(
+        """
+        CREATE TABLE pitney_transactions (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_id            INTEGER REFERENCES pitney_imports(id) ON DELETE SET NULL,
+            transaction_id       TEXT NOT NULL,
+            transaction_type     TEXT NOT NULL,
+            transaction_date     TEXT,
+            transaction_datetime TEXT NOT NULL DEFAULT '',
+            amount               REAL,
+            tracking_number      TEXT,
+            tracking_normalized  TEXT,
+            service              TEXT,
+            zone                 TEXT,
+            weight_oz            REAL,
+            status               TEXT,
+            postage_balance      REAL,
+            UNIQUE (transaction_id, transaction_type, transaction_datetime)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO pitney_transactions (
+            id, import_id, transaction_id, transaction_type, transaction_date,
+            transaction_datetime, amount, tracking_number, tracking_normalized,
+            service, zone, weight_oz, status, postage_balance
+        )
+        SELECT id, import_id, transaction_id, transaction_type, transaction_date,
+               COALESCE(transaction_datetime, ''), amount, tracking_number,
+               tracking_normalized, service, zone, weight_oz, status, postage_balance
+        FROM pitney_transactions_old
+        """
+    )
+    conn.execute("DROP TABLE pitney_transactions_old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pitney_tx_date ON pitney_transactions(transaction_date)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pitney_tx_tracking ON pitney_transactions(tracking_normalized)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pitney_tx_type ON pitney_transactions(transaction_type)"
+    )
+    # Commit here: python sqlite3 leaves the row copy in an open transaction,
+    # and a caller closing without commit would roll it back mid-rebuild.
+    conn.commit()
 
 
 def _ws3_imports_has_filename_unique(conn: sqlite3.Connection) -> bool:
@@ -1041,6 +1113,7 @@ def init_db() -> None:
     _migrate_flat_rate_costs_effective_date(conn)
     _migrate_scheduled_jobs_folder_columns(conn)
     _migrate_billing_records_impb_normalized(conn)
+    _migrate_pitney_transactions_dedup_key(conn)
     _ensure_app_settings(conn)
     _ensure_pricing_terms(conn)
     clamp_negative_ws3_reject_counts(conn)
@@ -2610,6 +2683,7 @@ def parcel_profit_from_raw(
     *,
     parcel_fee_per_piece: float = 1.25,
     customer_price_total: float | None = None,
+    pitney_adjustments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Parcel Profit lines + computed fields from ``query_parcel_profit_totals`` output.
@@ -2624,6 +2698,12 @@ def parcel_profit_from_raw(
 
     Single-piece full-rate: one parcel with billing, final, and fully-paid totals aligned
     within $0.005 skips the per-piece fee and zeroes both margins.
+
+    ``pitney_adjustments`` (from ``query_pitney_cost_adjustments``) trues up the
+    supplier margin against the actual Pitney ledger:
+      actual USPS cost = final postage + underpaid - overpaid - refunds
+      supplier profit (actual) = billing + fee - actual USPS cost
+    The true-up block is omitted when no Pitney data covers the range.
     """
     parcel_count = int(raw.get("parcel_count") or 0)
     total_final_postage = float(raw.get("total_final_postage") or 0.0)
@@ -2696,6 +2776,47 @@ def parcel_profit_from_raw(
             "value": efd_profit,
         }
     )
+
+    actual_usps_cost: float | None = None
+    supplier_profit_actual: float | None = None
+    adj = pitney_adjustments if (pitney_adjustments or {}).get("has_data") else None
+    if adj is not None and not single_full_rate:
+        refunds = float(adj.get("refund_total") or 0.0)
+        underpaid = float(adj.get("underpaid_total") or 0.0)
+        overpaid = float(adj.get("overpaid_total") or 0.0)
+        actual_usps_cost = round(total_final_postage + underpaid - overpaid - refunds, 2)
+        supplier_profit_actual = round(
+            total_billing_amount + postage_fee - actual_usps_cost, 2
+        )
+        lines.extend(
+            [
+                {
+                    "line_no": 10,
+                    "label": "Pitney refunds",
+                    "kind": "money",
+                    "value": round(refunds, 2),
+                },
+                {
+                    "line_no": 11,
+                    "label": "Pitney adjustments (underpaid − overpaid)",
+                    "kind": "money",
+                    "value": round(underpaid - overpaid, 2),
+                },
+                {
+                    "line_no": 12,
+                    "label": "Actual USPS cost (per Pitney ledger)",
+                    "kind": "money",
+                    "value": actual_usps_cost,
+                },
+                {
+                    "line_no": 13,
+                    "label": "Supplier (Lineage) Profit — trued-up",
+                    "kind": "money",
+                    "value": supplier_profit_actual,
+                },
+            ]
+        )
+
     return {
         "computed": {
             "postage_fee": postage_fee,
@@ -2706,9 +2827,350 @@ def parcel_profit_from_raw(
             "customer_price_total": (
                 round(float(customer_price_total), 2) if customer_price_total is not None else None
             ),
+            "actual_usps_cost": actual_usps_cost,
+            "supplier_profit_actual": supplier_profit_actual,
             "single_full_rate_pass_through": single_full_rate,
         },
         "lines": lines,
+    }
+
+
+PITNEY_PRINT_TYPE = "Postage Print"
+PITNEY_REFUND_TYPE = "Postage Refund"
+PITNEY_UNDERPAID_TYPE = "Postage Adjustment (Underpaid)"
+PITNEY_OVERPAID_TYPE = "Postage Adjustment (Overpaid)"
+PITNEY_FUND_TYPE = "Postage Fund"
+
+
+def query_pitney_reconciliation(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    *,
+    mismatch_limit: int = 200,
+    sample_limit: int = 25,
+) -> dict[str, Any]:
+    """
+    Reconcile the Pitney Detail Transactions ledger against billing_records
+    for transactions dated in [start_date, end_date].
+
+    Postage Prints match billing pieces by tracking number
+    (pitney tracking_normalized = billing impb_normalized); a matched print's
+    amount should equal the piece's final_postage. Refunds and under/overpaid
+    adjustments are listed with account attribution where their tracking
+    matches a billing piece. Postage Fund deposits are informational only.
+    """
+    eps = 0.005
+    prints = conn.execute(
+        """
+        WITH pr AS (
+            SELECT transaction_id,
+                   MIN(transaction_date) AS transaction_date,
+                   MAX(amount) AS amount,
+                   MAX(tracking_normalized) AS tracking_normalized,
+                   MAX(service) AS service
+            FROM pitney_transactions
+            WHERE transaction_type = ?
+              AND transaction_date BETWEEN ? AND ?
+            GROUP BY transaction_id
+        ),
+        bill AS (
+            SELECT impb_normalized,
+                   COUNT(*) AS n,
+                   MIN(final_postage) AS final_postage,
+                   MIN(custom_account_code) AS account_code
+            FROM billing_records
+            WHERE impb_normalized IS NOT NULL
+            GROUP BY impb_normalized
+        )
+        SELECT t.transaction_id, t.transaction_date, t.amount, t.tracking_normalized,
+               t.service, b.impb_normalized AS matched_tracking,
+               b.final_postage AS billing_final, b.account_code
+        FROM pr t
+        LEFT JOIN bill b ON b.impb_normalized = t.tracking_normalized
+        """,
+        (PITNEY_PRINT_TYPE, start_date, end_date),
+    ).fetchall()
+
+    print_count = len(prints)
+    print_amount = 0.0
+    matched = 0
+    matched_amount = 0.0
+    exact = 0
+    mismatches: list[dict[str, Any]] = []
+    unmatched_prints: list[dict[str, Any]] = []
+    for r in prints:
+        amt = float(r["amount"] or 0.0)
+        print_amount += amt
+        matched_row = r["matched_tracking"] is not None
+        if matched_row:
+            matched += 1
+            matched_amount += amt
+            if abs(amt - float(r["billing_final"] or 0.0)) <= eps:
+                exact += 1
+            elif len(mismatches) < mismatch_limit:
+                mismatches.append(
+                    {
+                        "tracking": r["tracking_normalized"],
+                        "transaction_date": r["transaction_date"],
+                        "pitney_amount": round(amt, 2),
+                        "billing_final_postage": round(float(r["billing_final"] or 0.0), 2),
+                        "delta": round(amt - float(r["billing_final"] or 0.0), 2),
+                        "account_code": r["account_code"],
+                    }
+                )
+        elif len(unmatched_prints) < sample_limit:
+            unmatched_prints.append(
+                {
+                    "tracking": r["tracking_normalized"],
+                    "transaction_date": r["transaction_date"],
+                    "amount": round(amt, 2),
+                    "service": r["service"],
+                }
+            )
+
+    prints_without_billing = print_count - matched
+
+    # Billing parcels in the same window with no Pitney print.
+    where_sql, params = _parcel_billing_filters(
+        conn, start_date, end_date, None, None, True, True, None
+    )
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM billing_records br
+        LEFT JOIN customers c ON br.custom_account_code = c.customer_number
+        WHERE {where_sql}
+          AND (br.impb_normalized IS NULL OR NOT EXISTS (
+                SELECT 1 FROM pitney_transactions t
+                WHERE t.transaction_type = ?
+                  AND t.tracking_normalized = br.impb_normalized))
+        """,
+        [*params, PITNEY_PRINT_TYPE],
+    ).fetchone()
+    billing_without_print = int(row["n"] or 0)
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM billing_records br
+        LEFT JOIN customers c ON br.custom_account_code = c.customer_number
+        WHERE {where_sql}
+        """,
+        params,
+    ).fetchone()
+    billing_count = int(row["n"] or 0)
+
+    # One row per adjustment transaction id. Refund lifecycle collapses to its
+    # strongest status (ACCEPTED > DENIED > REQUESTED); only ACCEPTED refunds
+    # count as money returned.
+    adjustments = conn.execute(
+        """
+        WITH per_tx AS (
+            SELECT transaction_id,
+                   transaction_type,
+                   MIN(transaction_date) AS transaction_date,
+                   MAX(amount) AS amount,
+                   MAX(tracking_normalized) AS tracking_normalized,
+                   MAX(CASE WHEN status = 'ACCEPTED' THEN 1 ELSE 0 END) AS any_accepted,
+                   MAX(CASE WHEN status = 'DENIED' THEN 1 ELSE 0 END) AS any_denied
+            FROM pitney_transactions
+            WHERE transaction_type IN (?, ?, ?)
+              AND transaction_date BETWEEN ? AND ?
+            GROUP BY transaction_id, transaction_type
+        ),
+        bill AS (
+            SELECT impb_normalized, MIN(custom_account_code) AS account_code
+            FROM billing_records
+            WHERE impb_normalized IS NOT NULL
+            GROUP BY impb_normalized
+        )
+        SELECT t.*, b.account_code
+        FROM per_tx t
+        LEFT JOIN bill b ON b.impb_normalized = t.tracking_normalized
+        ORDER BY t.transaction_date, t.transaction_id
+        """,
+        (
+            PITNEY_REFUND_TYPE,
+            PITNEY_UNDERPAID_TYPE,
+            PITNEY_OVERPAID_TYPE,
+            start_date,
+            end_date,
+        ),
+    ).fetchall()
+    adj_rows: list[dict[str, Any]] = []
+    refund_total = refund_pending_total = refund_denied_total = 0.0
+    underpaid_total = overpaid_total = 0.0
+    for r in adjustments:
+        amt = float(r["amount"] or 0.0)
+        status = None
+        if r["transaction_type"] == PITNEY_REFUND_TYPE:
+            if r["any_accepted"]:
+                status = "ACCEPTED"
+                refund_total += amt
+            elif r["any_denied"]:
+                status = "DENIED"
+                refund_denied_total += amt
+            else:
+                status = "REQUESTED"
+                refund_pending_total += amt
+        elif r["transaction_type"] == PITNEY_UNDERPAID_TYPE:
+            underpaid_total += amt
+        elif r["transaction_type"] == PITNEY_OVERPAID_TYPE:
+            overpaid_total += amt
+        adj_rows.append(
+            {
+                "type": r["transaction_type"],
+                "status": status,
+                "transaction_date": r["transaction_date"],
+                "amount": round(amt, 2),
+                "tracking": r["tracking_normalized"],
+                "account_code": r["account_code"],
+                "matched": r["account_code"] is not None,
+            }
+        )
+
+    funds = conn.execute(
+        """
+        SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total
+        FROM pitney_transactions
+        WHERE transaction_type = ? AND transaction_date BETWEEN ? AND ?
+        """,
+        (PITNEY_FUND_TYPE, start_date, end_date),
+    ).fetchone()
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "has_data": print_count > 0 or bool(adj_rows) or int(funds["n"] or 0) > 0,
+        "prints": {
+            "count": print_count,
+            "amount": round(print_amount, 2),
+            "matched_count": matched,
+            "matched_amount": round(matched_amount, 2),
+            "exact_amount_matches": exact,
+            "amount_mismatches": mismatches,
+            "prints_without_billing": prints_without_billing,
+            "prints_without_billing_sample": unmatched_prints,
+        },
+        "billing": {
+            "count": billing_count,
+            "without_print": billing_without_print,
+        },
+        "adjustments": {
+            "refund_total": round(refund_total, 2),
+            "refund_pending_total": round(refund_pending_total, 2),
+            "refund_denied_total": round(refund_denied_total, 2),
+            "underpaid_total": round(underpaid_total, 2),
+            "overpaid_total": round(overpaid_total, 2),
+            "rows": adj_rows,
+        },
+        "funds": {
+            "count": int(funds["n"] or 0),
+            "total": round(float(funds["total"] or 0.0), 2),
+        },
+    }
+
+
+def query_pitney_cost_adjustments(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    *,
+    parent_number: int | None = None,
+    customer_number: int | None = None,
+    show_parents: bool = True,
+    show_main: bool = True,
+    profit_account_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """
+    Refund / under- / overpaid totals for the parcel-profit true-up.
+
+    Unscoped requests sum directly by transaction date. Scoped requests count
+    only adjustments whose tracking matches an in-scope billing piece (any
+    date, since an adjustment can post after the mailing window) and report
+    the unattributed remainder.
+
+    Refunds count once per transaction id and only at status ACCEPTED (a
+    refund is re-listed at REQUESTED/ACCEPTED/DENIED stages; only acceptance
+    returns money). Under/overpaid adjustments count once per transaction id.
+    """
+    scoped = bool(profit_account_ids) or parent_number is not None or customer_number is not None
+
+    has_row = conn.execute(
+        "SELECT 1 FROM pitney_transactions WHERE transaction_date BETWEEN ? AND ? LIMIT 1",
+        (start_date, end_date),
+    ).fetchone()
+    if has_row is None:
+        return {
+            "has_data": False,
+            "refund_total": 0.0,
+            "underpaid_total": 0.0,
+            "overpaid_total": 0.0,
+            "unattributed_count": 0,
+            "scoped": scoped,
+        }
+
+    scope_join = ""
+    scope_params: list[Any] = []
+    if scoped:
+        # Scope-only billing filter (all dates) for tracking attribution.
+        where_sql, params = _parcel_billing_filters(
+            conn,
+            "0000-01-01",
+            "9999-12-31",
+            parent_number,
+            customer_number,
+            show_parents,
+            show_main,
+            profit_account_ids,
+        )
+        scope_join = f"""
+          AND t.tracking_normalized IN (
+              SELECT br.impb_normalized
+              FROM billing_records br
+              LEFT JOIN customers c ON br.custom_account_code = c.customer_number
+              WHERE {where_sql} AND br.impb_normalized IS NOT NULL)
+        """
+        scope_params = params
+
+    def _per_tx_total(tx_type: str, *, accepted_only: bool, with_scope: bool) -> tuple[float, int]:
+        status_sql = "AND t.status = 'ACCEPTED'" if accepted_only else ""
+        sq = scope_join if with_scope else ""
+        sp = scope_params if with_scope else []
+        row = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(a), 0) AS total, COUNT(*) AS n FROM (
+                SELECT MAX(t.amount) AS a
+                FROM pitney_transactions t
+                WHERE t.transaction_type = ?
+                  {status_sql}
+                  AND t.transaction_date BETWEEN ? AND ?
+                  {sq}
+                GROUP BY t.transaction_id
+            )
+            """,
+            [tx_type, start_date, end_date, *sp],
+        ).fetchone()
+        return float(row["total"] or 0.0), int(row["n"] or 0)
+
+    refunds, n_ref = _per_tx_total(PITNEY_REFUND_TYPE, accepted_only=True, with_scope=scoped)
+    underpaid, n_under = _per_tx_total(PITNEY_UNDERPAID_TYPE, accepted_only=False, with_scope=scoped)
+    overpaid, n_over = _per_tx_total(PITNEY_OVERPAID_TYPE, accepted_only=False, with_scope=scoped)
+
+    unattributed = 0
+    if scoped:
+        _, all_ref = _per_tx_total(PITNEY_REFUND_TYPE, accepted_only=True, with_scope=False)
+        _, all_under = _per_tx_total(PITNEY_UNDERPAID_TYPE, accepted_only=False, with_scope=False)
+        _, all_over = _per_tx_total(PITNEY_OVERPAID_TYPE, accepted_only=False, with_scope=False)
+        unattributed = (all_ref + all_under + all_over) - (n_ref + n_under + n_over)
+
+    return {
+        "has_data": True,
+        "refund_total": round(refunds, 2),
+        "underpaid_total": round(underpaid, 2),
+        "overpaid_total": round(overpaid, 2),
+        "unattributed_count": unattributed,
+        "scoped": scoped,
     }
 
 
