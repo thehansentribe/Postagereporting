@@ -2252,7 +2252,9 @@ def export_parcel_billing_csv(
                 name = r["name"]
             except (TypeError, KeyError, IndexError):
                 name = r[1] if isinstance(r, (list, tuple)) and len(r) > 1 else None
-            if name:
+            # impb_normalized is an internal join key (Pitney reconciliation),
+            # not part of the raw billing payload consumers already parse.
+            if name and str(name) != "impb_normalized":
                 billing_cols.append(str(name))
         if not billing_cols:
             raise ValueError("No billing_records columns found (table missing?)")

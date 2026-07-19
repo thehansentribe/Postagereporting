@@ -531,7 +531,7 @@ def import_billing_csv(csv_path: str, db_path: Path | str) -> dict[str, Any]:
     unmatched: set[int] = set()
     inserted = 0
 
-    _cols = 97
+    _cols = 98
     insert_sql = (
         """
         INSERT INTO billing_records (
@@ -560,7 +560,7 @@ def import_billing_csv(csv_path: str, db_path: Path | str) -> dict[str, Any]:
             wabcr_symbology5, wabcr_data5,
             job_name, billing_id_ref, permit_origin, permit_number, permit_name,
             ezconfirm_special_services, mail_piece_tag_data, is_open_and_distribute,
-            payment_method, premeter_qual_level, key_line, impb, efn,
+            payment_method, premeter_qual_level, key_line, impb, impb_normalized, efn,
             surcharge_postage, fss, tub_number, postal_discounts,
             hr_address, hr_city, hr_state, hr_zip,
             label_list_installer_version, is_move, is_catalog,
@@ -663,6 +663,7 @@ def import_billing_csv(csv_path: str, db_path: Path | str) -> dict[str, Any]:
                 row.get("Premeter Qual Level"),
                 row.get("KeyLine"),
                 row.get("IMPB"),
+                db.normalize_billing_impb(row.get("IMPB")),
                 row.get("EFN"),
                 safe_real(row.get("Surcharge Postage")),
                 row.get("FSS"),

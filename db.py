@@ -311,6 +311,7 @@ CREATE TABLE IF NOT EXISTS billing_records (
     premeter_qual_level         TEXT,
     key_line                    TEXT,
     impb                        TEXT,
+    impb_normalized             TEXT,
     efn                         TEXT,
     surcharge_postage           REAL,
     fss                         TEXT,
@@ -591,6 +592,7 @@ def get_connection() -> sqlite3.Connection:
     _migrate_flat_rate_costs_effective_date(conn)
     _migrate_scheduled_jobs_folder_columns(conn)
     _migrate_ws3_imports_drop_filename_unique(conn)
+    _migrate_billing_records_impb_normalized(conn)
     _ensure_app_settings(conn)
     return conn
 
@@ -680,6 +682,70 @@ def _migrate_ws3_mail_detail_usps_cost_per_piece(conn: sqlite3.Connection) -> No
           AND postage_claimed IS NOT NULL
         """
     )
+
+
+_IMPB_FNC1_SEPARATOR = "<FNC1>"
+
+
+def normalize_billing_impb(raw: Any) -> str | None:
+    """
+    Tracking number from a billing IMPB barcode string.
+
+    Billing exports store IMPB as '<routing-zip><FNC1><tracking-number>'
+    (e.g. '42094538<FNC1>9434640109627018251640'); carrier ledgers carry only
+    the tracking number, so the join key is everything after the separator.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    idx = s.find(_IMPB_FNC1_SEPARATOR)
+    if idx >= 0:
+        s = s[idx + len(_IMPB_FNC1_SEPARATOR):].strip()
+    return s or None
+
+
+def normalize_pitney_tracking(raw: Any) -> str | None:
+    """Pitney transaction exports prefix tracking numbers with a backtick."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lstrip("`").strip()
+    return s or None
+
+
+def _migrate_billing_records_impb_normalized(conn: sqlite3.Connection) -> None:
+    """
+    Adds `billing_records.impb_normalized` (tracking number without the
+    routing-zip '<FNC1>' prefix) and backfills it, for joins against
+    per-tracking carrier ledgers such as Pitney Detail Transactions.
+    """
+    try:
+        conn.execute("ALTER TABLE billing_records ADD COLUMN impb_normalized TEXT")
+        column_added = True
+    except sqlite3.OperationalError:
+        # Column already exists (or table missing during early init)
+        column_added = False
+    if column_added:
+        conn.execute(
+            """
+            UPDATE billing_records
+            SET impb_normalized = CASE
+                WHEN instr(impb, '<FNC1>') > 0
+                    THEN NULLIF(trim(substr(impb, instr(impb, '<FNC1>') + 6)), '')
+                ELSE NULLIF(trim(impb), '')
+            END
+            WHERE impb IS NOT NULL
+            """
+        )
+    # The index lives here (not in SCHEMA) so pre-column databases don't hit
+    # "no such column" during init_db's executescript before this migration runs.
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_billing_impb_norm ON billing_records(impb_normalized)"
+        )
+    except sqlite3.OperationalError:
+        pass
 
 
 def _ws3_imports_has_filename_unique(conn: sqlite3.Connection) -> bool:
@@ -894,6 +960,7 @@ def init_db() -> None:
     _migrate_ws3_imports_drop_filename_unique(conn)
     _migrate_flat_rate_costs_effective_date(conn)
     _migrate_scheduled_jobs_folder_columns(conn)
+    _migrate_billing_records_impb_normalized(conn)
     _ensure_app_settings(conn)
     clamp_negative_ws3_reject_counts(conn)
     conn.commit()

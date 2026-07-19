@@ -2141,3 +2141,52 @@ def test_api_system_rates_endpoints(monkeypatch):
         assert parcels.status_code == 200
         pj = parcels.get_json()
         assert pj["matrix"][0]["zones"]["1"] == 11.0
+
+
+def test_normalize_impb_and_pitney_tracking_helpers():
+    """Join-key normalization: billing IMPB prefix strip and Pitney backtick strip."""
+    assert (
+        dbmod.normalize_billing_impb("42094538<FNC1>9434640109627018251640")
+        == "9434640109627018251640"
+    )
+    assert dbmod.normalize_billing_impb("9400140109627770712388") == "9400140109627770712388"
+    assert dbmod.normalize_billing_impb("  ") is None
+    assert dbmod.normalize_billing_impb(None) is None
+    assert dbmod.normalize_pitney_tracking("`9400140109627781116380") == "9400140109627781116380"
+    assert dbmod.normalize_pitney_tracking("9400140109627781116380") == "9400140109627781116380"
+    assert dbmod.normalize_pitney_tracking("") is None
+
+
+def test_billing_impb_normalized_backfill_migration(monkeypatch):
+    """Pre-column databases get impb_normalized added, backfilled, and indexed."""
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "legacy.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", p)
+        dbmod.init_db()
+        raw = sqlite3.connect(p)
+        # Simulate a legacy database that predates the column.
+        raw.execute("DROP INDEX IF EXISTS idx_billing_impb_norm")
+        raw.execute("ALTER TABLE billing_records DROP COLUMN impb_normalized")
+        raw.execute("INSERT INTO billing_imports (billing_id, file_name) VALUES ('t1', 'f.csv')")
+        raw.execute(
+            "INSERT INTO billing_records (billing_import_id, impb) VALUES "
+            "(1, '42094538<FNC1>9434640109627018251640'), (1, '940014010962777'), (1, NULL)"
+        )
+        raw.commit()
+        raw.close()
+
+        conn = dbmod.get_connection()
+        try:
+            vals = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT impb_normalized FROM billing_records ORDER BY id"
+                )
+            ]
+            assert vals == ["9434640109627018251640", "940014010962777", None]
+            idx = [r[1] for r in conn.execute("PRAGMA index_list(billing_records)")]
+            assert "idx_billing_impb_norm" in idx
+        finally:
+            conn.close()
