@@ -57,11 +57,34 @@ def _bool_param(name: str, default: bool = False) -> bool:
     return str(v).lower() in ("1", "true", "yes", "on")
 
 
-def _profit_request_extras(conn) -> tuple[list[int] | None, float, str | None]:
+def _stored_pricing_terms(end_date: str | None) -> dict:
+    """
+    Stored pricing terms in effect at ``end_date``.
+
+    Report knobs absent from the request resolve from these; explicit request
+    parameters always win.
+    """
+    conn = db.get_connection()
+    try:
+        return db.get_pricing_terms(conn, as_of_date=end_date)
+    finally:
+        conn.close()
+
+
+def _resolve_knob(explicit: float | None, terms: dict, field: str) -> tuple[float, str]:
+    """Resolved knob value plus its source ("request" or "stored")."""
+    if explicit is not None:
+        return float(explicit), "request"
+    return float(terms[field]), "stored"
+
+
+def _profit_request_extras(conn) -> tuple[list[int] | None, float | None, str | None]:
     """
     Parse optional ``profit_accounts`` CSV and ``parcel_fee`` from the query string.
 
-    Returns ``(profit_account_ids, parcel_fee, error_message)`` where ``error_message`` is set on validation failure.
+    Returns ``(profit_account_ids, parcel_fee, error_message)`` where ``error_message``
+    is set on validation failure; ``parcel_fee`` is None when absent (callers resolve
+    it from stored pricing terms).
     """
     raw_pa = request.args.get("profit_accounts")
     profit_ids: list[int] | None = None
@@ -69,34 +92,33 @@ def _profit_request_extras(conn) -> tuple[list[int] | None, float, str | None]:
         try:
             profit_ids = db.parse_profit_accounts_csv(conn, raw_pa)
         except ValueError as e:
-            return None, 1.25, str(e)
+            return None, None, str(e)
     pf = request.args.get("parcel_fee", type=float)
-    if pf is None:
-        pf = 1.25
-    if pf < 0:
-        return None, 1.25, "parcel_fee must be non-negative"
-    return profit_ids, float(pf), None
+    if pf is not None and pf < 0:
+        return None, None, "parcel_fee must be non-negative"
+    return profit_ids, (float(pf) if pf is not None else None), None
 
 
 def _efd_parcel_fee_pair(
     efd_explicit: float | None,
     parcel_fee_fallback: float | None,
+    default: float = 1.25,
 ) -> tuple[float, str | None]:
     """
     Price-to-EFD adder for invoice column Y and Summary B10 on profit export.
 
-    Prefer ``efd_explicit``; if absent, use ``parcel_fee_fallback`` (legacy query strings);
-    default 1.25.
+    Prefer ``efd_explicit``; if absent, use ``parcel_fee_fallback`` (legacy query
+    strings); else ``default`` (the stored parcel_fee_per_piece term).
     """
     if efd_explicit is not None:
         if efd_explicit < 0:
-            return 1.25, "efd_parcel_fee must be non-negative"
+            return float(default), "efd_parcel_fee must be non-negative"
         return float(efd_explicit), None
     if parcel_fee_fallback is not None:
         if parcel_fee_fallback < 0:
-            return 1.25, "parcel_fee must be non-negative"
+            return float(default), "parcel_fee must be non-negative"
         return float(parcel_fee_fallback), None
-    return 1.25, None
+    return float(default), None
 
 
 def _efd_parcel_fee_from_post_body(body: dict) -> tuple[float | None, str | None]:
@@ -113,28 +135,30 @@ def _efd_parcel_fee_from_post_body(body: dict) -> tuple[float | None, str | None
     return float(f), None
 
 
-def _profit_request_extras_post(conn, data: dict) -> tuple[list[int] | None, float, str | None]:
-    """Parse ``profit_account_ids`` JSON array and ``parcel_fee`` from a POST JSON body."""
+def _profit_request_extras_post(conn, data: dict) -> tuple[list[int] | None, float | None, str | None]:
+    """
+    Parse ``profit_account_ids`` JSON array and ``parcel_fee`` from a POST JSON body.
+
+    ``parcel_fee`` is None when absent (callers resolve it from stored pricing terms).
+    """
     profit_ids: list[int] | None = None
     j = data.get("profit_account_ids")
     if j is not None:
         if not isinstance(j, list):
-            return None, 1.25, "profit_account_ids must be an array"
+            return None, None, "profit_account_ids must be an array"
         try:
             profit_ids = db.parse_profit_account_ids_from_json_list(conn, j)
         except ValueError as e:
-            return None, 1.25, str(e)
+            return None, None, str(e)
     pf = data.get("parcel_fee")
-    if pf is None:
-        pf = 1.25
-    else:
+    if pf is not None:
         try:
             pf = float(pf)
         except (TypeError, ValueError):
-            return None, 1.25, "parcel_fee must be a number"
-    if pf < 0:
-        return None, 1.25, "parcel_fee must be non-negative"
-    return profit_ids, float(pf), None
+            return None, None, "parcel_fee must be a number"
+        if pf < 0:
+            return None, None, "parcel_fee must be non-negative"
+    return profit_ids, (float(pf) if pf is not None else None), None
 
 
 @app.before_request
@@ -269,6 +293,72 @@ def api_system_flats_retail_update():
                 "presort_reject_unit_cost": presort_reject_unit_cost,
             }
         )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/system/pricing-terms")
+def api_system_pricing_terms():
+    try:
+        as_of = request.args.get("as_of")
+        conn = db.get_connection()
+        try:
+            current = db.get_pricing_terms(conn, as_of_date=as_of)
+            revisions = db.list_pricing_terms(conn)
+        finally:
+            conn.close()
+        return jsonify({"current": current, "revisions": revisions})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/system/pricing-terms", methods=["PUT"])
+def api_system_pricing_terms_update():
+    try:
+        payload = request.get_json(silent=True) or {}
+        conn = db.get_connection()
+        try:
+            with conn:
+                db.upsert_pricing_terms(
+                    conn,
+                    payload.get("effective_date"),
+                    flats_customer_discount=payload.get("flats_customer_discount"),
+                    flats_efd_discount=payload.get("flats_efd_discount"),
+                    parcel_customer_discount=payload.get("parcel_customer_discount"),
+                    parcel_fee_per_piece=payload.get("parcel_fee_per_piece"),
+                    notes=payload.get("notes"),
+                )
+            current = db.get_pricing_terms(conn)
+            revisions = db.list_pricing_terms(conn)
+        finally:
+            conn.close()
+        return jsonify({"ok": True, "current": current, "revisions": revisions})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/system/pricing-terms", methods=["DELETE"])
+def api_system_pricing_terms_delete():
+    try:
+        payload = request.get_json(silent=True) or {}
+        eff = request.args.get("effective_date") or payload.get("effective_date")
+        if not eff:
+            return jsonify({"error": "effective_date required"}), 400
+        conn = db.get_connection()
+        try:
+            with conn:
+                deleted = db.delete_pricing_terms(conn, eff)
+            current = db.get_pricing_terms(conn)
+            revisions = db.list_pricing_terms(conn)
+        finally:
+            conn.close()
+        if not deleted:
+            return jsonify({"error": f"No pricing-terms revision at {eff}"}), 404
+        return jsonify({"ok": True, "current": current, "revisions": revisions})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -948,7 +1038,7 @@ def api_export_postage_invoice():
         return jsonify({"error": "parent_number, start_date, end_date required"}), 400
     discount = request.args.get("discount", type=float)
     if discount is None:
-        discount = 0.10
+        discount = _stored_pricing_terms(end)["flats_customer_discount"]
     if discount < 0:
         return jsonify({"error": "discount must be non-negative"}), 400
     show_parents = _bool_param("show_parents", True)
@@ -1151,11 +1241,11 @@ def api_export_profit_report_xlsx():
             cn = int(cn)
         show_parents = bool(body.get("show_parents", True))
         show_main = bool(body.get("show_main", True))
-        discount = body.get("discount", 0.10)
-        discount_efd = body.get("discount_efd", 0.23)
+        discount = body.get("discount")
+        discount_efd = body.get("discount_efd")
         try:
-            discount = float(discount)
-            discount_efd = float(discount_efd)
+            discount = float(discount) if discount is not None else None
+            discount_efd = float(discount_efd) if discount_efd is not None else None
         except (TypeError, ValueError):
             return jsonify({"error": "discount and discount_efd must be numbers"}), 400
     else:
@@ -1166,13 +1256,12 @@ def api_export_profit_report_xlsx():
         show_parents = _bool_param("show_parents", True)
         show_main = _bool_param("show_main", True)
         discount = request.args.get("discount", type=float)
-        if discount is None:
-            discount = 0.10
         discount_efd = request.args.get("discount_efd", type=float)
-        if discount_efd is None:
-            discount_efd = 0.23
     if not start or not end:
         return jsonify({"error": "start_date and end_date required"}), 400
+    terms = _stored_pricing_terms(end)
+    discount, _src = _resolve_knob(discount, terms, "flats_customer_discount")
+    discount_efd, _src = _resolve_knob(discount_efd, terms, "flats_efd_discount")
     if discount < 0:
         return jsonify({"error": "discount must be non-negative"}), 400
     if discount_efd < 0:
@@ -1197,7 +1286,9 @@ def api_export_profit_report_xlsx():
             efd_q = request.args.get("efd_parcel_fee", type=float)
             if efd_q is not None and efd_q < 0:
                 return jsonify({"error": "efd_parcel_fee must be non-negative"}), 400
-        fee_efd, fe_err = _efd_parcel_fee_pair(efd_q, float(parcel_fee))
+        fee_efd, fe_err = _efd_parcel_fee_pair(
+            efd_q, parcel_fee, default=terms["parcel_fee_per_piece"]
+        )
         if fe_err:
             return jsonify({"error": fe_err}), 400
         out = exports.export_profit_report_xlsx(
@@ -1252,9 +1343,9 @@ def api_profit_flats():
             cn = int(cn)
         show_parents = bool(body.get("show_parents", True))
         show_main = bool(body.get("show_main", True))
-        discount = body.get("discount", 0.10)
+        discount = body.get("discount")
         try:
-            discount = float(discount)
+            discount = float(discount) if discount is not None else None
         except (TypeError, ValueError):
             return jsonify({"error": "discount must be a number"}), 400
     else:
@@ -1265,10 +1356,10 @@ def api_profit_flats():
         show_parents = _bool_param("show_parents", True)
         show_main = _bool_param("show_main", True)
         discount = request.args.get("discount", type=float)
-        if discount is None:
-            discount = 0.10
     if not start or not end:
         return jsonify({"error": "start_date and end_date required"}), 400
+    terms = _stored_pricing_terms(end)
+    discount, discount_src = _resolve_knob(discount, terms, "flats_customer_discount")
     if discount < 0:
         return jsonify({"error": "discount must be non-negative"}), 400
 
@@ -1283,6 +1374,7 @@ def api_profit_flats():
         if perr:
             conn.close()
             return jsonify({"error": perr}), 400
+        parcel_fee, parcel_fee_src = _resolve_knob(parcel_fee, terms, "parcel_fee_per_piece")
         totals = db.query_ws3_flats_profit_totals(
             conn,
             start,
@@ -1332,6 +1424,11 @@ def api_profit_flats():
                             "sell_to_rate": sell_to_rate,
                             "profit_accounts": profit_ids,
                             "parcel_fee": float(parcel_fee),
+                            "terms_effective_date": terms["effective_date"],
+                            "terms_source": {
+                                "discount": discount_src,
+                                "parcel_fee": parcel_fee_src,
+                            },
                         },
                         "totals": totals,
                         "rate_summary": [],
@@ -1351,6 +1448,11 @@ def api_profit_flats():
                     "sell_to_rate": sell_to_rate,
                     "profit_accounts": profit_ids,
                     "parcel_fee": float(parcel_fee),
+                    "terms_effective_date": terms["effective_date"],
+                    "terms_source": {
+                        "discount": discount_src,
+                        "parcel_fee": parcel_fee_src,
+                    },
                 },
                 "totals": totals,
                 "rate_summary": rate_summary,
@@ -1387,6 +1489,7 @@ def api_profit_parcels():
         return jsonify({"error": "start_date and end_date required"}), 400
 
     try:
+        terms = _stored_pricing_terms(end)
         conn = db.get_connection()
         if request.method == "POST":
             profit_ids, parcel_fee, perr = _profit_request_extras_post(conn, body)
@@ -1395,6 +1498,7 @@ def api_profit_parcels():
         if perr:
             conn.close()
             return jsonify({"error": perr}), 400
+        parcel_fee, parcel_fee_src = _resolve_knob(parcel_fee, terms, "parcel_fee_per_piece")
         if request.method == "POST":
             efd_raw, efd_err = _efd_parcel_fee_from_post_body(body)
             if efd_err:
@@ -1406,7 +1510,9 @@ def api_profit_parcels():
             if efd_q is not None and efd_q < 0:
                 conn.close()
                 return jsonify({"error": "efd_parcel_fee must be non-negative"}), 400
-        fee_efd, fe_err = _efd_parcel_fee_pair(efd_q, float(parcel_fee))
+        fee_efd, fe_err = _efd_parcel_fee_pair(
+            efd_q, parcel_fee, default=terms["parcel_fee_per_piece"]
+        )
         if fe_err:
             conn.close()
             return jsonify({"error": fe_err}), 400
@@ -1432,6 +1538,8 @@ def api_profit_parcels():
                     "profit_accounts": profit_ids,
                     "parcel_fee": float(parcel_fee),
                     "efd_parcel_fee": float(fee_efd),
+                    "terms_effective_date": terms["effective_date"],
+                    "terms_source": {"parcel_fee": parcel_fee_src},
                 },
                 "raw": raw,
                 "computed": pp["computed"],
@@ -1570,7 +1678,9 @@ def api_export_efd_parcel_invoice_xlsx():
     parcel_fb = request.args.get("parcel_fee", type=float)
     if parcel_fb is not None and parcel_fb < 0:
         return jsonify({"error": "parcel_fee must be non-negative"}), 400
-    fee_efd, fe_err = _efd_parcel_fee_pair(efd_q, parcel_fb)
+    fee_efd, fe_err = _efd_parcel_fee_pair(
+        efd_q, parcel_fb, default=_stored_pricing_terms(end)["parcel_fee_per_piece"]
+    )
     if fe_err:
         return jsonify({"error": fe_err}), 400
     try:
@@ -1602,9 +1712,10 @@ def api_export_efd_weekly_invoice_xlsx():
     end = request.args.get("end_date")
     if not start or not end:
         return jsonify({"error": "start_date and end_date required"}), 400
+    terms = _stored_pricing_terms(end)
     discount = request.args.get("discount", type=float)
     if discount is None:
-        discount = 0.10
+        discount = terms["flats_customer_discount"]
     if discount < 0:
         return jsonify({"error": "discount must be non-negative"}), 400
     efd_q = request.args.get("efd_parcel_fee", type=float)
@@ -1613,7 +1724,9 @@ def api_export_efd_weekly_invoice_xlsx():
     parcel_fb = request.args.get("parcel_fee", type=float)
     if parcel_fb is not None and parcel_fb < 0:
         return jsonify({"error": "parcel_fee must be non-negative"}), 400
-    fee_efd, fe_err = _efd_parcel_fee_pair(efd_q, parcel_fb)
+    fee_efd, fe_err = _efd_parcel_fee_pair(
+        efd_q, parcel_fb, default=terms["parcel_fee_per_piece"]
+    )
     if fe_err:
         return jsonify({"error": fe_err}), 400
     show_parents = _bool_param("show_parents", True)
@@ -1667,9 +1780,10 @@ def api_export_efd_weekly_bundle():
     end = body.get("end_date") or request.args.get("end_date")
     if not start or not end:
         return jsonify({"error": "start_date and end_date required"}), 400
+    terms = _stored_pricing_terms(end)
     discount = body.get("discount", request.args.get("discount", type=float))
     if discount is None:
-        discount = 0.10
+        discount = terms["flats_customer_discount"]
     else:
         discount = float(discount)
     if discount < 0:
@@ -1682,19 +1796,21 @@ def api_export_efd_weekly_bundle():
         return jsonify({"error": "efd_parcel_fee must be non-negative"}), 400
     if parcel_fb_f is not None and parcel_fb_f < 0:
         return jsonify({"error": "parcel_fee must be non-negative"}), 400
-    fee_efd, fe_err = _efd_parcel_fee_pair(efd_q_f, parcel_fb_f)
+    fee_efd, fe_err = _efd_parcel_fee_pair(
+        efd_q_f, parcel_fb_f, default=terms["parcel_fee_per_piece"]
+    )
     if fe_err:
         return jsonify({"error": fe_err}), 400
     parcel_discount = body.get("parcel_discount", request.args.get("parcel_discount"))
     if parcel_discount is None:
-        parcel_discount = 0.25
+        parcel_discount = terms["parcel_customer_discount"]
     else:
         parcel_discount = float(parcel_discount)
     if parcel_discount < 0:
         return jsonify({"error": "parcel_discount must be non-negative"}), 400
     postage_discount = body.get("postage_discount", request.args.get("postage_discount"))
     if postage_discount is None:
-        postage_discount = 0.10
+        postage_discount = terms["flats_customer_discount"]
     else:
         postage_discount = float(postage_discount)
     if postage_discount < 0:
@@ -1744,7 +1860,7 @@ def api_export_consolidated_volumes_xlsx():
     scope = (request.args.get("account_scope") or "All Accounts").strip() or "All Accounts"
     parcel_discount = request.args.get("parcel_discount", type=float)
     if parcel_discount is None:
-        parcel_discount = 0.25
+        parcel_discount = _stored_pricing_terms(end)["parcel_customer_discount"]
     if parcel_discount < 0:
         return jsonify({"error": "parcel_discount must be non-negative"}), 400
     try:
@@ -1793,7 +1909,7 @@ def api_export_efd_daily_volumes_xlsx():
     hide_customer_numbers = _bool_param("hide_customer_numbers", True)
     parcel_discount = request.args.get("parcel_discount", type=float)
     if parcel_discount is None:
-        parcel_discount = 0.25
+        parcel_discount = _stored_pricing_terms(end)["parcel_customer_discount"]
     if parcel_discount < 0:
         return jsonify({"error": "parcel_discount must be non-negative"}), 400
     try:
@@ -1879,7 +1995,7 @@ def api_export_parcel_zone_summary():
     show_main = _bool_param("show_main", True)
     parcel_discount = request.args.get("parcel_discount", type=float)
     if parcel_discount is None:
-        parcel_discount = 0.25
+        parcel_discount = _stored_pricing_terms(end)["parcel_customer_discount"]
     if parcel_discount < 0:
         return jsonify({"error": "parcel_discount must be non-negative"}), 400
     try:

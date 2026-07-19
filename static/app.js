@@ -2743,6 +2743,24 @@
     $("errorBanner").classList.remove("hidden");
   });
 
+  // Prefill pricing knobs from stored terms (System page); typed values still override per report.
+  fetch("/api/system/pricing-terms")
+    .then((r) => (r.ok ? r.json() : null))
+    .then((j) => {
+      const cur = j && j.current;
+      if (!cur) return;
+      const setKnob = (id, v) => {
+        const el = $(id);
+        if (el && v != null && !Number.isNaN(Number(v))) el.value = Number(v).toFixed(2);
+      };
+      setKnob("invoiceDiscount", cur.flats_customer_discount);
+      setKnob("resellerDiscount", cur.flats_efd_discount);
+      setKnob("parcelDiscount", cur.parcel_customer_discount);
+      setKnob("parcelFee", cur.parcel_fee_per_piece);
+      setKnob("efdParcelFee", cur.parcel_fee_per_piece);
+    })
+    .catch(() => {});
+
   setInterval(refreshWatcher, 30000);
   refreshWatcher();
   refreshReportReadiness();

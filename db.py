@@ -556,6 +556,17 @@ PRESORT_REJECT_UNIT_COST_KEY = "presort_reject_unit_cost"
 DEFAULT_PRESORT_REJECT_UNIT_COST = 0.66
 FLAT_RATE_BASELINE_DATE = "1900-01-01"
 
+# Two-layer pricing terms (supplier -> EFD -> end customer), stored with
+# effective dates in `pricing_terms` and editable on the System page.
+# These defaults seed the baseline revision and back missing tables.
+DEFAULT_PRICING_TERMS: dict[str, float] = {
+    "flats_customer_discount": 0.10,   # off retail, EFD -> end customer (flats)
+    "flats_efd_discount": 0.23,        # off retail, supplier -> EFD (flats)
+    "parcel_customer_discount": 0.25,  # off retail, EFD -> end customer (parcels)
+    "parcel_fee_per_piece": 1.25,      # supplier per-package fee charged to EFD
+}
+PRICING_TERMS_FIELDS: tuple[str, ...] = tuple(DEFAULT_PRICING_TERMS)
+
 # Scheduled report email system settings (Report Settings page).
 SETTING_EMAIL_ROOT_PATH = "emailRootPath"
 SETTING_REPORT_SOURCE_PATH = "reportSourcePath"
@@ -594,6 +605,7 @@ def get_connection() -> sqlite3.Connection:
     _migrate_ws3_imports_drop_filename_unique(conn)
     _migrate_billing_records_impb_normalized(conn)
     _ensure_app_settings(conn)
+    _ensure_pricing_terms(conn)
     return conn
 
 
@@ -837,6 +849,41 @@ def _ensure_app_settings(conn: sqlite3.Connection) -> None:
     _seed_scheduler_settings(conn)
 
 
+def _ensure_pricing_terms(conn: sqlite3.Connection) -> None:
+    """Create `pricing_terms` and seed the baseline revision when empty."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pricing_terms (
+            id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+            effective_date            TEXT NOT NULL UNIQUE,
+            flats_customer_discount   REAL NOT NULL,
+            flats_efd_discount        REAL NOT NULL,
+            parcel_customer_discount  REAL NOT NULL,
+            parcel_fee_per_piece      REAL NOT NULL,
+            notes                     TEXT,
+            updated_at                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    if conn.execute("SELECT 1 FROM pricing_terms LIMIT 1").fetchone() is None:
+        conn.execute(
+            """
+            INSERT INTO pricing_terms (
+                effective_date, flats_customer_discount, flats_efd_discount,
+                parcel_customer_discount, parcel_fee_per_piece, notes
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                FLAT_RATE_BASELINE_DATE,
+                DEFAULT_PRICING_TERMS["flats_customer_discount"],
+                DEFAULT_PRICING_TERMS["flats_efd_discount"],
+                DEFAULT_PRICING_TERMS["parcel_customer_discount"],
+                DEFAULT_PRICING_TERMS["parcel_fee_per_piece"],
+                "Baseline terms",
+            ),
+        )
+
+
 def _seed_scheduler_settings(conn: sqlite3.Connection) -> None:
     for key, (kind, default) in SCHEDULER_SETTING_DEFAULTS.items():
         row = conn.execute(
@@ -962,6 +1009,7 @@ def init_db() -> None:
     _migrate_scheduled_jobs_folder_columns(conn)
     _migrate_billing_records_impb_normalized(conn)
     _ensure_app_settings(conn)
+    _ensure_pricing_terms(conn)
     clamp_negative_ws3_reject_counts(conn)
     conn.commit()
     conn.close()
@@ -1116,6 +1164,118 @@ def set_presort_reject_unit_cost(conn: sqlite3.Connection, cost_per_piece: float
         """,
         (PRESORT_REJECT_UNIT_COST_KEY, float(cost_per_piece)),
     )
+
+
+def _pricing_terms_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    out: dict[str, Any] = {"effective_date": row["effective_date"]}
+    for field in PRICING_TERMS_FIELDS:
+        out[field] = float(row[field])
+    out["notes"] = row["notes"]
+    return out
+
+
+def get_pricing_terms(conn: sqlite3.Connection, as_of_date: str | None = None) -> dict[str, Any]:
+    """
+    Pricing terms in effect on ``as_of_date`` (latest revision on or before it).
+
+    Falls back to the earliest stored revision when ``as_of_date`` predates all
+    rows, and to ``DEFAULT_PRICING_TERMS`` when the table is empty.
+    """
+    if as_of_date:
+        row = conn.execute(
+            """
+            SELECT * FROM pricing_terms
+            WHERE effective_date <= ?
+            ORDER BY effective_date DESC LIMIT 1
+            """,
+            (str(as_of_date),),
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT * FROM pricing_terms ORDER BY effective_date ASC LIMIT 1"
+            ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM pricing_terms ORDER BY effective_date DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return {**DEFAULT_PRICING_TERMS, "effective_date": None, "notes": None}
+    return _pricing_terms_row_to_dict(row)
+
+
+def list_pricing_terms(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """All pricing-terms revisions, newest first."""
+    return [
+        _pricing_terms_row_to_dict(r)
+        for r in conn.execute(
+            "SELECT * FROM pricing_terms ORDER BY effective_date DESC"
+        )
+    ]
+
+
+def upsert_pricing_terms(
+    conn: sqlite3.Connection,
+    effective_date: str,
+    *,
+    flats_customer_discount: Any,
+    flats_efd_discount: Any,
+    parcel_customer_discount: Any,
+    parcel_fee_per_piece: Any,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """Insert or replace the pricing-terms revision at ``effective_date``."""
+    try:
+        eff = date.fromisoformat(str(effective_date or "").strip())
+    except ValueError:
+        raise ValueError("effective_date must be YYYY-MM-DD")
+    raw = {
+        "flats_customer_discount": flats_customer_discount,
+        "flats_efd_discount": flats_efd_discount,
+        "parcel_customer_discount": parcel_customer_discount,
+        "parcel_fee_per_piece": parcel_fee_per_piece,
+    }
+    values: dict[str, float] = {}
+    for field, v in raw.items():
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{field} must be a number")
+        if f < 0:
+            raise ValueError(f"{field} must be non-negative")
+        values[field] = f
+    conn.execute(
+        """
+        INSERT INTO pricing_terms (
+            effective_date, flats_customer_discount, flats_efd_discount,
+            parcel_customer_discount, parcel_fee_per_piece, notes
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(effective_date) DO UPDATE SET
+            flats_customer_discount  = excluded.flats_customer_discount,
+            flats_efd_discount       = excluded.flats_efd_discount,
+            parcel_customer_discount = excluded.parcel_customer_discount,
+            parcel_fee_per_piece     = excluded.parcel_fee_per_piece,
+            notes                    = excluded.notes,
+            updated_at               = CURRENT_TIMESTAMP
+        """,
+        (
+            eff.isoformat(),
+            values["flats_customer_discount"],
+            values["flats_efd_discount"],
+            values["parcel_customer_discount"],
+            values["parcel_fee_per_piece"],
+            notes,
+        ),
+    )
+    return get_pricing_terms(conn, as_of_date=eff.isoformat())
+
+
+def delete_pricing_terms(conn: sqlite3.Connection, effective_date: str) -> bool:
+    """Delete one revision. The baseline revision cannot be deleted."""
+    eff = str(effective_date or "").strip()
+    if eff == FLAT_RATE_BASELINE_DATE:
+        raise ValueError("The baseline pricing-terms revision cannot be deleted")
+    cur = conn.execute("DELETE FROM pricing_terms WHERE effective_date = ?", (eff,))
+    return cur.rowcount > 0
 
 
 def query_ws3_presort_reject_count_for_invoice(

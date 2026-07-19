@@ -126,6 +126,10 @@ def _client():
     import app as app_module
 
     app_module.app.config["TESTING"] = True
+    # Keep the folder watcher and report scheduler off during snapshots so a
+    # background import can't mutate the DB between capture and compare.
+    app_module._watcher_started = True
+    app_module._scheduler_started = True
     return app_module.app.test_client()
 
 

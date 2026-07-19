@@ -48,6 +48,49 @@
     </section>
 
     <section class="panel">
+      <div class="system-actions">
+        <button type="button" class="btn btn-primary" id="btnSavePricingTerms">Save pricing terms</button>
+      </div>
+      <h2 class="system-section-title">Pricing terms (supplier &rarr; EFD &rarr; customer)</h2>
+      <p class="system-hint">
+        Discounts and fees used by profit reports and invoices. Each report uses the revision in effect
+        on the report <strong>end date</strong>; values typed into the dashboard toolbar override these
+        for a single report. Save with a new effective date to record a terms change without losing history.
+      </p>
+      <div class="system-actions system-inline-fields">
+        <label class="field">
+          <span class="field-label">Effective date</span>
+          <input type="date" id="pricingTermsEffectiveDate" />
+        </label>
+        <label class="field">
+          <span class="field-label">Flats: customer discount ($)</span>
+          <input type="text" id="pricingFlatsCustomerDiscount" inputmode="decimal" placeholder="0.10" style="max-width: 7rem" />
+        </label>
+        <label class="field">
+          <span class="field-label">Flats: EFD discount ($)</span>
+          <input type="text" id="pricingFlatsEfdDiscount" inputmode="decimal" placeholder="0.23" style="max-width: 7rem" />
+        </label>
+        <label class="field">
+          <span class="field-label">Parcels: customer discount ($)</span>
+          <input type="text" id="pricingParcelCustomerDiscount" inputmode="decimal" placeholder="0.25" style="max-width: 7rem" />
+        </label>
+        <label class="field">
+          <span class="field-label">Parcel fee to EFD ($/pc)</span>
+          <input type="text" id="pricingParcelFeePerPiece" inputmode="decimal" placeholder="1.25" style="max-width: 7rem" />
+        </label>
+        <label class="field grow">
+          <span class="field-label">Notes</span>
+          <input type="text" id="pricingTermsNotes" placeholder="e.g. renegotiated EFD agreement" />
+        </label>
+      </div>
+      <div class="table-wrap">
+        <div class="table-scroll">
+          <div id="pricingTermsTable"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
       <h2 class="system-section-title">Notice 123 rate case</h2>
       <p class="system-hint">
         Upload a USPS Notice 123 price-change <code>.zip</code>. Files are extracted to

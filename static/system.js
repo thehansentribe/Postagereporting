@@ -384,7 +384,131 @@
     });
   }
 
+  function renderPricingTermsTable(revisions) {
+    const container = $("pricingTermsTable");
+    if (!container) return;
+    if (!revisions || !revisions.length) {
+      container.innerHTML = "<p class='empty-state'>No pricing terms stored yet.</p>";
+      return;
+    }
+    let html =
+      "<table class='data-table'><thead><tr>" +
+      "<th>Effective date</th><th class='num'>Flats: customer disc.</th>" +
+      "<th class='num'>Flats: EFD disc.</th><th class='num'>Parcels: customer disc.</th>" +
+      "<th class='num'>Parcel fee / pc</th><th>Notes</th><th></th>" +
+      "</tr></thead><tbody>";
+    for (const t of revisions) {
+      const canDelete = t.effective_date !== "1900-01-01";
+      html += "<tr>";
+      html += `<td>${escapeHtml(t.effective_date)}</td>`;
+      html += `<td class='num'>${escapeHtml(fmtRateInput(t.flats_customer_discount))}</td>`;
+      html += `<td class='num'>${escapeHtml(fmtRateInput(t.flats_efd_discount))}</td>`;
+      html += `<td class='num'>${escapeHtml(fmtRateInput(t.parcel_customer_discount))}</td>`;
+      html += `<td class='num'>${escapeHtml(fmtRateInput(t.parcel_fee_per_piece))}</td>`;
+      html += `<td>${escapeHtml(t.notes || "")}</td>`;
+      html += `<td>${
+        canDelete
+          ? `<button type='button' class='btn btn-run' data-del-terms='${escapeHtml(t.effective_date)}'>Delete</button>`
+          : ""
+      }</td>`;
+      html += "</tr>";
+    }
+    html += "</tbody></table>";
+    container.innerHTML = html;
+    for (const btn of container.querySelectorAll("button[data-del-terms]")) {
+      btn.addEventListener("click", async () => {
+        const eff = btn.getAttribute("data-del-terms");
+        if (!window.confirm(`Delete pricing terms revision ${eff}?`)) return;
+        showError("");
+        try {
+          const r = await fetch(
+            `/api/system/pricing-terms?effective_date=${encodeURIComponent(eff)}`,
+            { method: "DELETE" }
+          );
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.error || "Delete failed");
+          applyPricingTerms(j);
+          showBanner(`Deleted pricing terms revision ${eff}.`);
+        } catch (e) {
+          showError(String(e.message || e));
+        }
+      });
+    }
+  }
+
+  function applyPricingTerms(j) {
+    const cur = j.current || {};
+    const set = (id, v) => {
+      const el = $(id);
+      if (el) el.value = fmtRateInput(v);
+    };
+    set("pricingFlatsCustomerDiscount", cur.flats_customer_discount);
+    set("pricingFlatsEfdDiscount", cur.flats_efd_discount);
+    set("pricingParcelCustomerDiscount", cur.parcel_customer_discount);
+    set("pricingParcelFeePerPiece", cur.parcel_fee_per_piece);
+    const dateEl = $("pricingTermsEffectiveDate");
+    if (dateEl && !dateEl.value) dateEl.value = new Date().toISOString().slice(0, 10);
+    renderPricingTermsTable(j.revisions || []);
+  }
+
+  async function loadPricingTerms() {
+    const r = await fetch("/api/system/pricing-terms");
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "Failed to load pricing terms");
+    applyPricingTerms(j);
+  }
+
+  async function savePricingTerms() {
+    showError("");
+    const dateEl = $("pricingTermsEffectiveDate");
+    const eff = dateEl ? String(dateEl.value || "").trim() : "";
+    if (!eff) throw new Error("Choose an effective date for these pricing terms.");
+    const fields = {
+      flats_customer_discount: "pricingFlatsCustomerDiscount",
+      flats_efd_discount: "pricingFlatsEfdDiscount",
+      parcel_customer_discount: "pricingParcelCustomerDiscount",
+      parcel_fee_per_piece: "pricingParcelFeePerPiece",
+    };
+    const body = { effective_date: eff };
+    for (const [key, id] of Object.entries(fields)) {
+      const el = $(id);
+      const n = parseMoneyInput(el ? el.value : "");
+      if (n == null || Number.isNaN(n)) {
+        if (el) el.focus();
+        throw new Error("All pricing terms must be numbers.");
+      }
+      if (n < 0) {
+        if (el) el.focus();
+        throw new Error("Pricing terms must be non-negative.");
+      }
+      body[key] = n;
+    }
+    const notesEl = $("pricingTermsNotes");
+    if (notesEl && String(notesEl.value || "").trim()) body.notes = String(notesEl.value).trim();
+    showBanner("Saving pricing terms…");
+    const r = await fetch("/api/system/pricing-terms", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "Save failed");
+    applyPricingTerms(j);
+    showBanner(`Saved pricing terms effective ${eff}.`);
+  }
+
+  const btnSaveTerms = $("btnSavePricingTerms");
+  if (btnSaveTerms) {
+    btnSaveTerms.addEventListener("click", () => {
+      savePricingTerms().catch((e) => {
+        showBanner("");
+        showError(String(e.message || e));
+      });
+    });
+  }
+
   load().catch((e) => showError(String(e.message || e)));
+  loadPricingTerms().catch((e) => showError(String(e.message || e)));
 })();
 
 (function () {
