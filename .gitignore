@@ -36,3 +36,4 @@ postage.db.bak-*
 .restore_pending
 *.pre-restore
 postage-backup-*.zip
+reports/backtest-baseline/
