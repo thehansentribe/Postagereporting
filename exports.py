@@ -909,6 +909,7 @@ def export_profit_report_xlsx(
     flats_discount: float,
     flats_discount_efd: float = 0.23,
     efd_parcel_fee: float = 1.25,
+    parcel_customer_discount: float | None = None,
     profit_account_ids: list[int] | None = None,
 ) -> Path:
     """
@@ -1035,6 +1036,7 @@ def export_profit_report_xlsx(
             set_sheet_title=None,
             profit_account_ids=profit_account_ids,
             price_to_efd_adder=fee_efd,
+            parcel_customer_discount=parcel_customer_discount,
         )
 
         ws = wb.create_sheet("Summary", 0)
@@ -2444,6 +2446,7 @@ def fill_efd_parcel_invoice_worksheet(
     set_sheet_title: str | None = "EFD Parcel Invoice",
     profit_account_ids: list[int] | None = None,
     price_to_efd_adder: float = 1.25,
+    parcel_customer_discount: float | None = None,
 ) -> tuple[str, int, int, int]:
     """
     Write EFD Parcel Invoice layout to an existing worksheet (summary rows 1–6, header row 9, data from row 10).
@@ -2451,8 +2454,16 @@ def fill_efd_parcel_invoice_worksheet(
     Returns ``(title, header_row, data_start_row, last_data_row)`` for cross-sheet formulas.
     Does not ``save`` or ``close`` the connection.
     ``price_to_efd_adder`` is the per-piece dollar adder in column Y (Price to EFD = billing + adder).
+    ``parcel_customer_discount`` is subtracted from retail in column AA (Price To customer
+    = max(0, retail - discount), matching the customer-facing parcel invoice); when None it
+    resolves from the stored pricing terms in effect on ``end_date``.
     """
     adder_lit = _efd_price_to_efd_adder_literal(price_to_efd_adder)
+    if parcel_customer_discount is None:
+        parcel_customer_discount = db.get_pricing_terms(conn, as_of_date=end_date)[
+            "parcel_customer_discount"
+        ]
+    customer_disc = max(0.0, float(parcel_customer_discount or 0.0))
     ga_rates = db.get_ground_advantage_retail_rates(conn)
     pm_by_day: dict[str, tuple] = {}
 
@@ -2541,7 +2552,7 @@ def fill_efd_parcel_invoice_worksheet(
         "billing_amount",
         "Price to EFD",
         "EFD Revenue",
-        "retail_cost",
+        "price_to_customer",
         *_EFD_PARCEL_INVOICE_TAIL_KEYS,
     ]
     for col_1, h in enumerate(headers, 1):
@@ -2587,7 +2598,9 @@ def fill_efd_parcel_invoice_worksheet(
         retail_val = priced.get("retail")
         if retail_val is not None:
             try:
-                retail_val = round(float(retail_val), 2)
+                # Price To customer = retail minus the customer discount
+                # (same rule as the customer-facing parcel invoice grid).
+                retail_val = round(max(0.0, float(retail_val) - customer_disc), 2)
             except (TypeError, ValueError):
                 retail_val = None
 
@@ -2637,10 +2650,11 @@ def export_efd_parcel_invoice_xlsx(
     show_main: bool,
     *,
     efd_parcel_fee: float = 1.25,
+    parcel_customer_discount: float | None = None,
 ) -> tuple[Path, str]:
     """
     EFD Parcel Invoice workbook: summary + line items (same rows as consolidated parcel CSV),
-    fixed columns so billing_amount is column X and retail_cost is column AA.
+    fixed columns so billing_amount is column X and price_to_customer is column AA.
 
     Returns (temp xlsx path, display title used in A1 / filename).
     """
@@ -2661,6 +2675,7 @@ def export_efd_parcel_invoice_xlsx(
             show_main,
             set_sheet_title="EFD Parcel Invoice",
             price_to_efd_adder=fee,
+            parcel_customer_discount=parcel_customer_discount,
         )
         scope = parcel_report_scope_label(parent_number, customer_number)
         fd, tmp = tempfile.mkstemp(

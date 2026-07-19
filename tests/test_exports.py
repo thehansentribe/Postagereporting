@@ -511,11 +511,12 @@ def test_export_efd_parcel_invoice_xlsx_layout_and_formulas(monkeypatch) -> None
         assert ws.cell(9, 24).value == "billing_amount"
         assert ws.cell(9, 25).value == "Price to EFD"
         assert ws.cell(9, 26).value == "EFD Revenue"
-        assert ws.cell(9, 27).value == "retail_cost"
+        assert ws.cell(9, 27).value == "price_to_customer"
         assert ws.cell(10, 24).value == 5.22
         assert ws.cell(10, 25).value == "=X10+1.25"
         assert ws.cell(10, 26).value == "=AA10-Y10"
-        assert ws.cell(10, 27).value == 10.2
+        # Price To customer = retail − stored parcel customer discount (10.2 − 0.25).
+        assert ws.cell(10, 27).value == 9.95
         b2 = ws.cell(2, 2).value
         assert isinstance(b2, str) and b2.startswith("=SUM(X10:")
         assert ws.cell(6, 2).value == "=COUNTA(A10:A10)"

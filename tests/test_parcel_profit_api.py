@@ -90,11 +90,16 @@ def test_api_profit_parcels_formulas(monkeypatch):
         assert j["computed"]["postage_fee"] == pytest.approx(2.50, rel=1e-9)
 
         # Confirmed formulas:
-        # Lineage Revenue = billing_amount - final_postage + postage_fee
-        assert j["computed"]["lineage_revenue"] == pytest.approx(7.00 - 2.00 + 2.50, rel=1e-9)
-        # EFD Profit = fully_paid_postage - billing_amount - postage_fee
-        assert j["computed"]["efd_profit"] == pytest.approx(3.00 - 7.00 - 2.50, rel=1e-9)
+        # Supplier (Lineage) profit = billing_amount - final_postage + postage_fee
+        assert j["computed"]["supplier_profit"] == pytest.approx(7.00 - 2.00 + 2.50, rel=1e-9)
+        assert j["computed"]["lineage_revenue"] == j["computed"]["supplier_profit"]
+        # EFD Profit = customer price total - billing_amount - postage_fee, where
+        # customer price per piece = retail - 0.25 (fallback retail = fully_paid).
+        customer_total = j["computed"]["customer_price_total"]
+        assert customer_total == pytest.approx(3.00 - 2 * 0.25, rel=1e-9)
+        assert j["computed"]["efd_profit"] == pytest.approx(customer_total - 7.00 - 2.50, rel=1e-9)
         assert j["meta"]["efd_parcel_fee"] == pytest.approx(1.25, rel=1e-9)
+        assert j["meta"]["parcel_discount"] == pytest.approx(0.25, rel=1e-9)
 
 
 def test_api_profit_parcels_meta_splits_parcel_fee_and_efd_parcel_fee(monkeypatch):
@@ -211,8 +216,9 @@ def test_api_profit_parcels_single_piece_not_full_rate_still_applies_fee(monkeyp
         assert j["raw"]["parcel_count"] == 1
         assert j["computed"]["single_full_rate_pass_through"] is False
         assert j["computed"]["postage_fee"] == pytest.approx(1.25, rel=1e-9)
-        assert j["computed"]["lineage_revenue"] == pytest.approx(8.00 - 5.00 + 1.25, rel=1e-9)
-        assert j["computed"]["efd_profit"] == pytest.approx(5.00 - 8.00 - 1.25, rel=1e-9)
+        assert j["computed"]["supplier_profit"] == pytest.approx(8.00 - 5.00 + 1.25, rel=1e-9)
+        # Customer price = fallback retail (5.00) − 0.25 stored discount.
+        assert j["computed"]["efd_profit"] == pytest.approx((5.00 - 0.25) - 8.00 - 1.25, rel=1e-9)
 
 
 def test_api_profit_parcels_custom_parcel_fee_and_line_label(monkeypatch):
@@ -473,3 +479,62 @@ def test_api_profit_parcels_post_rejects_too_many_profit_ids(monkeypatch):
         assert r.status_code == 400
         assert "at most 2" in r.get_json().get("error", "")
 
+
+
+def test_api_profit_parcels_customer_price_uses_pm_matrix_minus_discount(monkeypatch):
+    """Customer price per piece = dated PM matrix retail − parcel_discount; explicit knob wins."""
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "parcel_profit_matrix.db"
+        client = _client(monkeypatch, p)
+
+        conn = dbmod.get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO customers (customer_number, customer_name) VALUES (905, 'M')"
+            )
+            conn.execute(
+                "INSERT INTO billing_imports (billing_id, file_name, row_count) VALUES ('b10', 'b.csv', 2)"
+            )
+            conn.execute(
+                """
+                INSERT INTO priority_mail_retail (effective_date, row_type, zone, weight_unit, weight_max, price)
+                VALUES ('2026-01-01', 'matrix', 3, 'lb', 1, 11.65)
+                """
+            )
+            # Two 1-lb zone-3 pieces; retail comes from the matrix, not fully_paid.
+            for piece in range(2):
+                conn.execute(
+                    """
+                    INSERT INTO billing_records (
+                        billing_import_id, custom_account_code, account_name, time_stamp,
+                        weight_oz, usps_mail_class, final_postage, fully_paid_postage,
+                        billing_amount, zone
+                    ) VALUES (1, 905, 'M', '4/1/2026 10:00', 16.0, 'USPS GROUND ADVANTAGE', 6.98, 10.6, 7.46, '3')
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        r = client.get(
+            "/api/profit/parcels?start_date=2026-04-01&end_date=2026-04-30&customer_number=905"
+        )
+        assert r.status_code == 200
+        j = r.get_json()
+        # 2 × (11.65 − 0.25) from the matrix (stored default discount).
+        assert j["computed"]["customer_price_total"] == pytest.approx(2 * 11.40, rel=1e-9)
+        assert j["meta"]["customer_price_fallback_count"] == 0
+        assert j["computed"]["efd_profit"] == pytest.approx(
+            2 * 11.40 - 2 * 7.46 - 2 * 1.25, rel=1e-9
+        )
+        line = next(x for x in j["lines"] if x["label"] == "Price to customer total")
+        assert line["value"] == pytest.approx(22.80, rel=1e-9)
+
+        # Explicit parcel_discount overrides the stored term.
+        r = client.get(
+            "/api/profit/parcels?start_date=2026-04-01&end_date=2026-04-30&customer_number=905&parcel_discount=1.00"
+        )
+        assert r.status_code == 200
+        j = r.get_json()
+        assert j["computed"]["customer_price_total"] == pytest.approx(2 * 10.65, rel=1e-9)
+        assert j["meta"]["terms_source"]["parcel_discount"] == "request"

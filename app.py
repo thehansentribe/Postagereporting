@@ -1291,6 +1291,13 @@ def api_export_profit_report_xlsx():
         )
         if fe_err:
             return jsonify({"error": fe_err}), 400
+        if request.method == "POST":
+            parcel_discount = body.get("parcel_discount")
+            parcel_discount = float(parcel_discount) if parcel_discount is not None else None
+        else:
+            parcel_discount = request.args.get("parcel_discount", type=float)
+        if parcel_discount is not None and parcel_discount < 0:
+            return jsonify({"error": "parcel_discount must be non-negative"}), 400
         out = exports.export_profit_report_xlsx(
             start,
             end,
@@ -1301,6 +1308,7 @@ def api_export_profit_report_xlsx():
             flats_discount=float(discount),
             flats_discount_efd=float(discount_efd),
             efd_parcel_fee=float(fee_efd),
+            parcel_customer_discount=parcel_discount,
             profit_account_ids=profit_ids,
         )
         dt = datetime.strptime(end, "%Y-%m-%d")
@@ -1532,6 +1540,17 @@ def api_profit_parcels():
         if fe_err:
             conn.close()
             return jsonify({"error": fe_err}), 400
+        if request.method == "POST":
+            parcel_discount = body.get("parcel_discount")
+            parcel_discount = float(parcel_discount) if parcel_discount is not None else None
+        else:
+            parcel_discount = request.args.get("parcel_discount", type=float)
+        parcel_discount, parcel_discount_src = _resolve_knob(
+            parcel_discount, terms, "parcel_customer_discount"
+        )
+        if parcel_discount < 0:
+            conn.close()
+            return jsonify({"error": "parcel_discount must be non-negative"}), 400
         raw = db.query_parcel_profit_totals(
             conn,
             start,
@@ -1542,9 +1561,24 @@ def api_profit_parcels():
             show_main=show_main,
             profit_account_ids=profit_ids,
         )
+        customer_price = db.query_parcel_customer_price_totals(
+            conn,
+            start,
+            end,
+            parent_number=pn,
+            customer_number=cn,
+            show_parents=show_parents,
+            show_main=show_main,
+            profit_account_ids=profit_ids,
+            parcel_customer_discount=parcel_discount,
+        )
         conn.close()
 
-        pp = db.parcel_profit_from_raw(raw, parcel_fee_per_piece=float(parcel_fee))
+        pp = db.parcel_profit_from_raw(
+            raw,
+            parcel_fee_per_piece=float(parcel_fee),
+            customer_price_total=customer_price["total_customer_price"],
+        )
 
         return jsonify(
             {
@@ -1554,8 +1588,13 @@ def api_profit_parcels():
                     "profit_accounts": profit_ids,
                     "parcel_fee": float(parcel_fee),
                     "efd_parcel_fee": float(fee_efd),
+                    "parcel_discount": float(parcel_discount),
+                    "customer_price_fallback_count": customer_price["fallback_count"],
                     "terms_effective_date": terms["effective_date"],
-                    "terms_source": {"parcel_fee": parcel_fee_src},
+                    "terms_source": {
+                        "parcel_fee": parcel_fee_src,
+                        "parcel_discount": parcel_discount_src,
+                    },
                 },
                 "raw": raw,
                 "computed": pp["computed"],
@@ -1699,6 +1738,9 @@ def api_export_efd_parcel_invoice_xlsx():
     )
     if fe_err:
         return jsonify({"error": fe_err}), 400
+    parcel_discount = request.args.get("parcel_discount", type=float)
+    if parcel_discount is not None and parcel_discount < 0:
+        return jsonify({"error": "parcel_discount must be non-negative"}), 400
     try:
         out, title = exports.export_efd_parcel_invoice_xlsx(
             start,
@@ -1708,6 +1750,7 @@ def api_export_efd_parcel_invoice_xlsx():
             show_parents=show_parents,
             show_main=show_main,
             efd_parcel_fee=float(fee_efd),
+            parcel_customer_discount=parcel_discount,
         )
         name = exports.efd_parcel_invoice_download_name(
             title, parent_number=pn, customer_number=cn, end_date=end

@@ -432,6 +432,35 @@ CREATE INDEX IF NOT EXISTS idx_ground_advantage_retail_lookup
     ON ground_advantage_retail(row_type, zone, weight_unit, weight_max);
 CREATE INDEX IF NOT EXISTS idx_ground_advantage_retail_effective_date
     ON ground_advantage_retail(effective_date);
+
+CREATE TABLE IF NOT EXISTS pitney_imports (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_name      TEXT NOT NULL,
+    imported_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    row_count      INTEGER,
+    inserted_count INTEGER,
+    skipped_count  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS pitney_transactions (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id            INTEGER REFERENCES pitney_imports(id) ON DELETE SET NULL,
+    transaction_id       TEXT NOT NULL UNIQUE,
+    transaction_type     TEXT NOT NULL, -- Postage Print / Postage Refund / Postage Adjustment (...) / Postage Fund
+    transaction_date     TEXT,          -- ISO date derived from transactionDateTime
+    transaction_datetime TEXT,
+    amount               REAL,
+    tracking_number      TEXT,          -- raw value minus leading backtick
+    tracking_normalized  TEXT,          -- join key vs billing_records.impb_normalized
+    service              TEXT,
+    zone                 TEXT,
+    weight_oz            REAL,
+    status               TEXT,
+    postage_balance      REAL
+);
+CREATE INDEX IF NOT EXISTS idx_pitney_tx_date     ON pitney_transactions(transaction_date);
+CREATE INDEX IF NOT EXISTS idx_pitney_tx_tracking ON pitney_transactions(tracking_normalized);
+CREATE INDEX IF NOT EXISTS idx_pitney_tx_type     ON pitney_transactions(transaction_type);
 """
 
 SCHEDULER_SCHEMA = """
@@ -2500,12 +2529,101 @@ def query_parcel_profit_totals(
     }
 
 
-def parcel_profit_from_raw(raw: dict[str, Any], *, parcel_fee_per_piece: float = 1.25) -> dict[str, Any]:
+def query_parcel_customer_price_totals(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    *,
+    parent_number: int | None,
+    customer_number: int | None,
+    show_parents: bool,
+    show_main: bool,
+    profit_account_ids: list[int] | None = None,
+    parcel_customer_discount: float = 0.25,
+) -> dict[str, Any]:
+    """
+    What EFD bills end customers for parcels in scope: per piece,
+    max(0, retail - parcel_customer_discount), where retail is the dated
+    Priority Mail matrix price (the customer-invoice basis) with
+    ``fully_paid_postage`` as fallback when no matrix cell applies.
+    """
+    disc = max(0.0, float(parcel_customer_discount or 0.0))
+    pm_by_day: dict[str, tuple[dict[tuple[int, int], float], dict[int, list[int]]]] = {}
+
+    def _pm_for(ts_raw: Any) -> tuple[dict[tuple[int, int], float], dict[int, list[int]]]:
+        d_iso = iso_date_from_billing_timestamp(ts_raw)
+        od = d_iso if d_iso is not None else end_date
+        if od not in pm_by_day:
+            pm_by_day[od] = get_priority_mail_retail_rates(conn, as_of_date=od)
+        return pm_by_day[od]
+
+    where_sql, params = _parcel_billing_filters(
+        conn,
+        start_date,
+        end_date,
+        parent_number,
+        customer_number,
+        show_parents,
+        show_main,
+        profit_account_ids,
+    )
+    cur = conn.execute(
+        f"""
+        SELECT br.zone, br.weight_oz, br.fully_paid_postage, br.time_stamp
+        FROM billing_records br
+        LEFT JOIN customers c ON br.custom_account_code = c.customer_number
+        WHERE {where_sql}
+        """,
+        params,
+    )
+    total = 0.0
+    priced_count = 0
+    fallback_count = 0
+    for row in cur:
+        priced = compute_retail_cost_for_piece(
+            conn,
+            weight_oz=row["weight_oz"],
+            zone_raw=row["zone"],
+            fallback_retail=None,
+            pm_rates=_pm_for(row["time_stamp"]),
+        )
+        retail = priced.get("retail")
+        if retail is None:
+            fallback_count += 1
+            fp = row["fully_paid_postage"]
+            if fp is None:
+                continue
+            retail = float(fp)
+        else:
+            priced_count += 1
+        total += max(0.0, float(retail) - disc)
+    return {
+        "total_customer_price": round(total, 2),
+        "priced_count": priced_count,
+        "fallback_count": fallback_count,
+        "parcel_customer_discount": disc,
+    }
+
+
+def parcel_profit_from_raw(
+    raw: dict[str, Any],
+    *,
+    parcel_fee_per_piece: float = 1.25,
+    customer_price_total: float | None = None,
+) -> dict[str, Any]:
     """
     Parcel Profit lines + computed fields from ``query_parcel_profit_totals`` output.
 
+    Two-layer margins:
+      supplier profit (Lineage) = billing - final postage + qty x fee
+        (the supplier invoices EFD billing + fee and pays USPS final postage)
+      EFD profit = customer price total - billing - qty x fee
+        (customer price = retail - customer discount; pass ``customer_price_total``
+        from ``query_parcel_customer_price_totals``. Falls back to the legacy
+        fully-paid-based proxy when not provided.)
+
     Single-piece full-rate: one parcel with billing, final, and fully-paid totals aligned
-    within $0.005 skips the per-piece fee and zeroes Lineage Revenue / EFD Profit.
+    within $0.005 skips the per-piece fee and zeroes both margins.
     """
     parcel_count = int(raw.get("parcel_count") or 0)
     total_final_postage = float(raw.get("total_final_postage") or 0.0)
@@ -2521,12 +2639,15 @@ def parcel_profit_from_raw(raw: dict[str, Any], *, parcel_fee_per_piece: float =
     )
     if single_full_rate:
         postage_fee = 0.0
-        lineage_revenue = 0.0
+        supplier_profit = 0.0
         efd_profit = 0.0
     else:
         postage_fee = round(float(parcel_count) * fee_pp, 2)
-        lineage_revenue = round(total_billing_amount - total_final_postage + postage_fee, 2)
-        efd_profit = round(total_fully_paid_postage - total_billing_amount - postage_fee, 2)
+        supplier_profit = round(total_billing_amount - total_final_postage + postage_fee, 2)
+        if customer_price_total is not None:
+            efd_profit = round(float(customer_price_total) - total_billing_amount - postage_fee, 2)
+        else:
+            efd_profit = round(total_fully_paid_postage - total_billing_amount - postage_fee, 2)
 
     lines: list[dict[str, Any]] = [
         {"line_no": 1, "label": "Parcel count", "kind": "int", "value": parcel_count},
@@ -2549,24 +2670,42 @@ def parcel_profit_from_raw(raw: dict[str, Any], *, parcel_fee_per_piece: float =
             "kind": "money",
             "value": postage_fee,
         },
-        {
-            "line_no": 7,
-            "label": "Lineage Revenue",
-            "kind": "money",
-            "value": lineage_revenue,
-        },
+    ]
+    if customer_price_total is not None:
+        lines.append(
+            {
+                "line_no": 7,
+                "label": "Price to customer total",
+                "kind": "money",
+                "value": round(float(customer_price_total), 2),
+            }
+        )
+    lines.append(
         {
             "line_no": 8,
+            "label": "Supplier (Lineage) Profit",
+            "kind": "money",
+            "value": supplier_profit,
+        }
+    )
+    lines.append(
+        {
+            "line_no": 9,
             "label": "EFD Profit",
             "kind": "money",
             "value": efd_profit,
-        },
-    ]
+        }
+    )
     return {
         "computed": {
             "postage_fee": postage_fee,
-            "lineage_revenue": lineage_revenue,
+            "supplier_profit": supplier_profit,
+            # Deprecated alias (older name for the supplier margin).
+            "lineage_revenue": supplier_profit,
             "efd_profit": efd_profit,
+            "customer_price_total": (
+                round(float(customer_price_total), 2) if customer_price_total is not None else None
+            ),
             "single_full_rate_pass_through": single_full_rate,
         },
         "lines": lines,
