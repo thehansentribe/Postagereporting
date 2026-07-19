@@ -1641,8 +1641,11 @@
     const parts = [];
     if (meta) {
       parts.push(`<span>Retail rate: ${fmtMoney(meta.retail_rate)}</span>`);
-      parts.push(`<span>Flats discount: ${fmtMoney(meta.discount)}</span>`);
-      parts.push(`<span>Sell-to rate: ${fmtMoney(meta.sell_to_rate)}</span>`);
+      parts.push(`<span>Customer discount: ${fmtMoney(meta.discount)}</span>`);
+      if (meta.discount_efd != null && meta.discount_efd !== "") {
+        parts.push(`<span>EFD discount: ${fmtMoney(meta.discount_efd)}</span>`);
+      }
+      parts.push(`<span>Price to customer: ${fmtMoney(meta.sell_to_rate)}</span>`);
       if (meta.profit_accounts && meta.profit_accounts.length) {
         parts.push(
           `<span>Profit accounts: ${meta.profit_accounts.map((x) => fmtId(x)).join(", ")}</span>`
@@ -1658,6 +1661,12 @@
     if (totals) {
       parts.push(`<span>Run days: ${fmtInt(totals.run_days || 0)}</span>`);
       parts.push(`<span>Total pieces: ${fmtInt(totals.total_pieces || 0)}</span>`);
+      if (totals.total_supplier_profit != null) {
+        parts.push(`<span>Supplier (Lineage) profit: ${fmtMoney(totals.total_supplier_profit)}</span>`);
+      }
+      if (totals.total_efd_profit != null) {
+        parts.push(`<span>EFD profit: ${fmtMoney(totals.total_efd_profit)}</span>`);
+      }
       parts.push(`<span>Total profit: ${fmtMoney(totals.total_profit || 0)}</span>`);
     }
     return parts.join("");
@@ -1667,19 +1676,34 @@
     const headers = [
       "Rate Type",
       "Pieces",
+      "Retail / pc",
       "Avg USPS cost / pc",
-      "Sell-to / pc",
-      "Avg profit / pc",
+      "Price to customer / pc",
+      "Price to EFD / pc",
+      "Supplier profit",
+      "EFD profit",
       "Total profit",
     ];
     const keys = [
       "rate_type",
       "total_pieces",
+      "retail_rate",
       "avg_usps_cost_per_piece",
       "sell_to_rate",
-      "avg_profit_per_piece",
+      "avg_price_to_efd",
+      "supplier_profit_total",
+      "efd_profit_total",
       "total_profit",
     ];
+    const moneyKeys = new Set([
+      "retail_rate",
+      "avg_usps_cost_per_piece",
+      "sell_to_rate",
+      "avg_price_to_efd",
+      "supplier_profit_total",
+      "efd_profit_total",
+      "total_profit",
+    ]);
     let h =
       "<table class='data-table'><thead><tr>" +
       headers.map((x, i) => `<th${i === 0 ? "" : " class='num'"}>${escapeHtml(x)}</th>`).join("") +
@@ -1694,9 +1718,7 @@
           const v = r[k];
           let inner = "";
           if (k === "total_pieces") inner = fmtInt(Number(v) || 0);
-          else if (k === "total_profit") inner = fmtMoney(v);
-          else if (k === "avg_usps_cost_per_piece" || k === "sell_to_rate" || k === "avg_profit_per_piece")
-            inner = v == null || v === "" ? "\u2014" : fmtMoney(v);
+          else if (moneyKeys.has(k)) inner = v == null || v === "" ? "\u2014" : fmtMoney(v);
           else inner = v != null ? escapeHtml(String(v)) : "";
           h += `<td${i === 0 ? "" : " class='num'"}>${inner}</td>`;
         }
@@ -1720,8 +1742,11 @@
       "Rejected",
       "Postage Claimed",
       "USPS cost / pc",
-      "Sell-to / pc",
-      "Profit / pc",
+      "Retail / pc",
+      "Price to customer / pc",
+      "Price to EFD / pc",
+      "Supplier profit",
+      "EFD profit",
       "Total profit",
     ];
     const keys = [
@@ -1736,8 +1761,11 @@
       "pcs_rejected",
       "postage_claimed",
       "usps_cost_per_piece",
+      "retail_rate",
       "sell_to_rate",
-      "profit_per_piece",
+      "price_to_efd",
+      "supplier_profit_total",
+      "efd_profit_total",
       "total_profit",
     ];
     let h =
@@ -1755,7 +1783,14 @@
           let inner = "";
           if (k === "num_pieces" || k === "pcs_rejected") inner = fmtInt(Number(v) || 0);
           else if (k === "postage_claimed" || k === "total_profit") inner = fmtMoney(v);
-          else if (k === "usps_cost_per_piece" || k === "sell_to_rate" || k === "profit_per_piece")
+          else if (
+            k === "usps_cost_per_piece" ||
+            k === "retail_rate" ||
+            k === "sell_to_rate" ||
+            k === "price_to_efd" ||
+            k === "supplier_profit_total" ||
+            k === "efd_profit_total"
+          )
             inner = v == null || v === "" ? "\u2014" : fmtMoney(v);
           else inner = v != null ? escapeHtml(String(v)) : "";
           h += `<td${i < 7 ? "" : " class='num'"}>${inner}</td>`;

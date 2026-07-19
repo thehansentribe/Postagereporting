@@ -46,6 +46,28 @@ NetSort **WS3_FCFL_CustomerMailDetail** presort reports (`.xls`/`.xlsx`) are imp
 
 On the **Import Summary** tab, parcel totals and tables use each piece’s **`Time Stamp`** (mailing date), not the file’s import time. Set the summary date range to include those piece dates to see parcel breakdowns.
 
+## Cost & profit reporting
+
+The **Profit Report** tab reports both pricing layers — supplier (Lineage) → EFD → end customer:
+
+- **Flats (WS3):** retail comes from the dated flats tariff (`flat_rate_costs`, kept current by
+  Notice 123 rate-case imports) for each run's mail date. The customer pays retail − customer
+  discount; EFD pays retail − EFD discount; supplier profit = price-to-EFD − USPS claimed cost.
+  "Single Piece" rows pass through at cost.
+- **Parcels:** the customer pays Priority Mail matrix retail − parcel discount (the same basis as
+  the customer-facing parcel invoice); the supplier invoices EFD billing amount + per-package fee
+  and pays USPS final postage. Both margins appear in the Parcel Profit block and the EFD Parcel
+  Invoice ("price_to_customer" column).
+- **Pricing terms** (customer/EFD discounts, parcel fee) are stored with effective dates on the
+  **System** page; reports use the revision in effect on the report end date, and values typed in
+  the toolbar override them for a single report.
+- **Pitney Detail Transactions** (`…Pitney Detail Transactions.xlsx`, see
+  [docs/pitney-transactions-import.md](docs/pitney-transactions-import.md)) reconcile actual
+  Pitney billing against parcels by tracking number and true up supplier parcel profit for
+  refunds and under/overpaid adjustments.
+- `scripts/backtest_reports.py --capture / --compare` snapshots all report outputs against the
+  live database and diffs them after code changes (regression guard).
+
 ## Tests
 
 ```bash
